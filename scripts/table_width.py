@@ -225,6 +225,12 @@ def _report(tbl, idx):
     # tcW vs gridCol: only worth flagging when the gap is visible.
     # Rounding from cm→dxa is ±1; a real mismatch (e.g. equal-split grid vs
     # explicit widths) is off by hundreds.
+    #
+    # A cell with gridSpan=N covers N grid columns and its tcW is the sum of
+    # theirs, so comparing it against a single grid column is meaningless --
+    # that produces a false "mismatch" on any table with merged cells, and
+    # following the advice would corrupt the grid. Compare only spanning-1
+    # cells, and advance the column cursor by the span.
     TOL = 20   # dxa ≈ 0.35 mm — far below anything a reader would notice
     first = rows[0] if rows else None
     layout_fixed = (layout is not None and layout.get(wtag("type")) == "fixed")
@@ -232,16 +238,24 @@ def _report(tbl, idx):
     if first is not None:
         ci = 0
         for tc in _row_cells(first):
+            span = _cell_span(tc)
             tcPr = tc.find(wtag("tcPr"))
             tcW = tcPr.find(wtag("tcW")) if tcPr is not None else None
             have = tcW.get(wtag("w")) if tcW is not None else None
-            want = ws[ci] if ci < len(ws) else None
-            if have and want and abs(int(have) - int(want)) > TOL:
-                mismatch = True
-                dh, dw = int(have), int(want)
-                print(f"  ! col {ci + 1}: tcW={dh} ({dh / 1440 * 2.54:.2f} cm)"
-                      f" != gridCol={dw} ({dw / 1440 * 2.54:.2f} cm)")
-            ci += 1
+            if span == 1:
+                want = ws[ci] if ci < len(ws) else None
+                if have and want and abs(int(have) - int(want)) > TOL:
+                    mismatch = True
+                    dh, dw = int(have), int(want)
+                    print(f"  ! col {ci + 1}: tcW={dh} ({dh / 1440 * 2.54:.2f} cm)"
+                          f" != gridCol={dw} ({dw / 1440 * 2.54:.2f} cm)")
+            else:
+                covered = ws[ci:ci + span]
+                total = sum(w for w in covered if w)
+                note = "" if have is None else f", tcW={int(have)}"
+                print(f"  . col {ci + 1}-{ci + span}: merged cell"
+                      f" (gridSpan={span}, grid total={total}{note})")
+            ci += span
     if mismatch and layout_fixed:
         print("  ! tblLayout=fixed ignores tcW — columns render from gridCol only."
               "  Run 'sync' to copy tcW into the grid.")

@@ -51,35 +51,55 @@ def replace_in_paragraph(para, old: str, new: str) -> int:
     """Replace `old` with `new` in a paragraph, preserving run formatting.
 
     Strategy: first replace occurrences fully contained in a single run
-    (formatting fully preserved). If the needle spans multiple runs, the
-    matched runs are collapsed: the replacement inherits the formatting of
-    the run where the match starts. Returns number of replacements made.
+    (formatting fully preserved). Then handle needles that span runs; those runs
+    are collapsed and the replacement inherits the formatting of the run where
+    the match starts.
+
+    Returns the number of replacements made.
+
+    The total is budgeted from the occurrence count in the *original* text. That
+    matters when `new` contains `old` ("cat" -> "catcat", or a template token
+    whose value is the token itself): rewriting creates fresh matches, so any
+    loop driven by "does the needle still appear?" never terminates. Budgeting
+    up front makes the operation finite and idempotent in intent.
     """
     if not old or old not in para.text:
         return 0
+
+    original_count = para.text.count(old)
     count = 0
-    # Pass 1: within-run replacements.
+
+    # Pass 1: replacements fully inside a single run.
     for run in para.runs:
         if old in run.text:
-            count += run.text.count(old)
+            hits = run.text.count(old)
             run.text = run.text.replace(old, new)
-    # Pass 2: cross-run occurrences.
-    while old in para.text:
+            count += hits
+
+    # Pass 2: occurrences split across run boundaries.
+    budget = original_count - count
+    while budget > 0:
+        budget -= 1
         runs = para.runs
-        # Map paragraph text offsets to (run_index, offset_in_run).
         full = "".join(r.text for r in runs)
         start = full.find(old)
         if start < 0:
             break
         end = start + len(old)
+        # If this match sits wholly inside one run, Pass 1 would have taken it.
+        # Skip ahead rather than re-collapsing the same text forever.
         pos = 0
-        spans = []  # (run_idx, cut_start, cut_end) portions inside the match
+        spans = []
         for i, r in enumerate(runs):
             r_start, r_end = pos, pos + len(r.text)
             if r_end > start and r_start < end:
                 spans.append((i, max(start, r_start) - r_start,
                               min(end, r_end) - r_start))
             pos = r_end
+        single = len(spans) == 1
+        if single:
+            # Should not happen after Pass 1, but guard against a rewrite loop.
+            break
         first = True
         for i, cs, ce in spans:
             t = runs[i].text
@@ -89,4 +109,5 @@ def replace_in_paragraph(para, old: str, new: str) -> int:
             else:
                 runs[i].text = t[:cs] + t[ce:]
         count += 1
+
     return count

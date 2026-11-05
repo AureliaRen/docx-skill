@@ -15,7 +15,9 @@ import argparse, json, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from docx_utils import *
-SKILL = Path(__file__).resolve().parents[2]
+from docx_pack import unpack as _unpack_opc, pack as _pack_opc
+# Repository root: scripts/ -> repo root is one level up.
+SKILL = Path(__file__).resolve().parents[1]
 
 _RPR_MAP = {"rFonts":"font","b":"bold","bCs":"boldCs","i":"italic","iCs":"italicCs",
             "u":"underline","color":"color","sz":"size","szCs":"sizeCs",
@@ -75,7 +77,7 @@ def _run_node(script: str, output: str) -> None:
 def _extract(docx: Path) -> dict:
     with tempfile.TemporaryDirectory() as td:
         up = Path(td) / "u"
-        _run(str(SKILL / "scripts/office/unpack.py"), str(docx), str(up))
+        _unpack_opc(docx, up)
         tpl: dict = {"page":{}, "defaults":{}, "styles":{}}
 
         sx = up / "word" / "styles.xml"
@@ -292,14 +294,10 @@ def _style_heading_js(name: str, style_info: dict) -> str:
 def _apply_existing(tpl: dict, docx: Path, fix_formulas: bool = False) -> None:
     with tempfile.TemporaryDirectory() as td:
         up = Path(td) / "u"
-        _run(str(SKILL / "scripts/office/unpack.py"), str(docx), str(up))
+        _unpack_opc(docx, up)
         _patch_styles(up, tpl)
         _patch_page(up, tpl)
-        cmd = [str(SKILL / "scripts/office/pack.py"), str(up), str(docx),
-               "--original", str(docx), "--validate", "false"]
-        if fix_formulas:
-            cmd.append("--fix-formulas")
-        _run(*cmd)
+        _pack_opc(up, docx, original=docx)
 
 
 def _patch_styles(up: Path, tpl: dict) -> None:
@@ -422,9 +420,10 @@ def main():
     e = sp.add_parser("extract"); e.add_argument("template"); e.add_argument("-o","--output")
     a = sp.add_parser("apply"); a.add_argument("template"); a.add_argument("-o","--output")
     a.add_argument("--to")
-    a.add_argument("--no-fix-formulas", action="store_false", dest="fix_formulas",
-                   default=True,
-                   help="Skip automatic _/^ marker conversion (enabled by default)")
+    a.add_argument("--fix-formulas", action="store_true", dest="fix_formulas",
+                   default=False,
+                   help="After writing, convert linear formulas into native Office "
+                        "Math (runs docx_mathify.py on the result)")
     args = p.parse_args()
     if args.cmd == "extract":
         src = Path(args.template)
@@ -440,6 +439,8 @@ def main():
             if not target.exists(): print(f"error: {target} not found", file=sys.stderr); sys.exit(1)
             _apply_existing(tpl, target, fix_formulas=args.fix_formulas)
             print(f"Applied template → {target}")
+            if args.fix_formulas:
+                _convert_formulas(target)
         else:
             out = args.output or "output.docx"
             script = _gen_js(tpl)
@@ -448,20 +449,22 @@ def main():
             out_path = Path(out).resolve()
             try:
                 _run_node(spath, str(out_path))
-                # If --fix-formulas, unpack → fix → repack the newly created docx
-                if args.fix_formulas:
-                    with tempfile.TemporaryDirectory() as td:
-                        up = Path(td) / "u"
-                        _run(str(SKILL / "scripts/office/unpack.py"), str(out_path), str(up))
-                        from fix_formulas import fix_formulas as run_fix
-                        modified = run_fix(up)
-                        if modified:
-                            print(f"  fix_formulas: repaired {modified} run(s)")
-                        _run(str(SKILL / "scripts/office/pack.py"), str(up), str(out_path),
-                             "--original", str(out_path), "--validate", "false")
                 print(f"Created → {out_path}")
             finally:
                 Path(spath).unlink(missing_ok=True)
+            if args.fix_formulas:
+                _convert_formulas(out_path)
+
+
+def _convert_formulas(docx_path: Path) -> None:
+    """Run the real formula chain over ``docx_path`` in place."""
+    from docx_mathify import main as mathify_main
+    argv = sys.argv
+    try:
+        sys.argv = ["docx_mathify.py", str(docx_path), "--inplace"]
+        mathify_main()
+    finally:
+        sys.argv = argv
 
 if __name__ == "__main__":
     main()

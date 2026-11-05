@@ -46,8 +46,9 @@ Anchoring works by locating the target text in the document and wrapping it in
 `<w:commentRangeStart>` / `<w:commentRangeEnd>` plus a `<w:commentReference>` run.
 Consequences worth knowing:
 
-- The target must appear exactly once. Ambiguous text fails rather than guessing
-  which occurrence you meant.
+- Anchoring takes the **first** match. If the target text appears more than once,
+  the comment lands on the first occurrence in document order — there is no
+  ambiguity error. Pass a longer, more specific string when that matters.
 - If the text is split across several runs (common when formatting changes
   mid-phrase), the matcher has to span runs. That is why editing a document after
   adding a comment, then editing it again, can shift anchors.

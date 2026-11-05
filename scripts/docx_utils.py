@@ -83,11 +83,17 @@ def write(tree: ET.ElementTree, path: str | Path) -> None:
 # ---- shared utilities ------------------------------------------------------
 
 def insert_near(body: ET.Element, marker: str | None, position: str,
-                *paras: ET.Element) -> None:
+                *paras: ET.Element) -> bool:
     """Insert *paras* near the paragraph whose text contains *marker*.
 
-    Searches inside ``<w:body>`` and all ``<w:tc>`` elements.  Falls back to
-    inserting before ``<w:sectPr>``."""
+    Searches inside ``<w:body>`` and all ``<w:tc>`` elements. Falls back to
+    inserting before ``<w:sectPr>``.
+
+    Returns True when the marker was found and the paragraphs landed next to it,
+    False when the fallback was used. Callers that were told to anchor on a
+    marker should treat False as an error rather than silently accepting a
+    formula that ended up at the end of the document.
+    """
     if marker:
         containers = [body] + list(body.iter(wtag("tc")))
         for container in containers:
@@ -99,12 +105,13 @@ def insert_near(body: ET.Element, marker: str | None, position: str,
                     at = i + 1 if position == "after" else i
                     for j, p in enumerate(paras):
                         container.insert(at + j, p)
-                    return
+                    return True
     # fallback
     children = list(body)
     idx = next((i for i, c in enumerate(children) if c.tag == wtag("sectPr")), len(children))
     for j, p in enumerate(paras):
         body.insert(idx + j, p)
+    return False
 
 
 def next_bm_id(root: ET.Element) -> int:
