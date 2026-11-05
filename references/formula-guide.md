@@ -80,9 +80,9 @@ Two details worth knowing:
 
 - The **italic** of math variables is controlled by `<m:sty>`, not by the font.
   Changing the font family does not flatten the italic.
-- Runs inside `m:fPr` / `m:sSubPr` and similar property blocks hold zero-width
-  markers. They stay on Cambria Math because they are invisible — nothing in the
-  rendered page is affected.
+- Injection is complete: every `<m:r>` in every generated formula gets the
+  `w:rPr/w:rFonts` block, including runs nested inside `m:f`/`m:rad`/`m:nary`
+  argument containers. There is no residue on Cambria Math in the visible text.
 
 ## What the span detector refuses to convert
 

@@ -79,8 +79,11 @@ def _extract_eqnum(seg: dict) -> tuple[str, str] | None:
 _TAG_RE = re.compile(r"\\tag\*?\{([^{}]*)\}")
 _LABEL_RE = re.compile(r"\\label\{([^{}]*)\}")
 _REF_CMD_RE = re.compile(r"\\(eqref|ref|label|tag)\{([^{}]*)\}")
+# Anchored at the environment, but tolerant of a leading fragment such as
+# "A = " before \begin{align}: the caller passes a whole formula, and the
+# environment is often only the tail of it.
 _ALIGN_RE = re.compile(
-    r"^\s*\\begin\{(align|alignat|eqnarray|gather)\}(.*)\\end\{\1\}\s*$", re.S)
+    r"\\begin\{(align|alignat|eqnarray|gather)(\*?)\}(.*)\\end\{\1\2\}", re.S)
 
 
 def _env_ranges(text: str) -> list[tuple[int, int]]:
@@ -164,12 +167,17 @@ def _split_env_rows(body: str) -> list[str]:
 
 
 def _parse_align(latex: str) -> list[dict] | None:
-    r"""`\begin{align} a &= b \tag{1} \\ c &= d \end{align}` → 行结构。"""
-    m = _ALIGN_RE.match(latex)
+    r"""`\begin{align} a &= b \tag{1} \\ c &= d \end{align}` → 行结构。
+
+    ``search``, not ``match``: a formula often carries a leading fragment such
+    as ``A = `` before the environment, and only the environment itself is of
+    interest here.
+    """
+    m = _ALIGN_RE.search(latex)
     if not m:
         return None
     rows: list[dict] = []
-    for raw in _split_env_rows(m.group(2)):
+    for raw in _split_env_rows(m.group(3)):
         tag = label = None
         tm = _TAG_RE.search(raw)
         if tm:
@@ -747,6 +755,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"输出: {out}")
     for f in stats["failed"][:10]:
         print("  FAIL", f["latex"], "->", f["error"][:120])
+    if stats["failed"]:
+        # Some formulas could not be converted. The document is still written
+        # (partial conversion is useful), but the caller must be able to tell:
+        # a silent 0 would hide broken equations in a delivered file.
+        print(f"error: {len(stats['failed'])} formula(s) failed to convert",
+              file=sys.stderr)
+        return 3
     return 0
 
 

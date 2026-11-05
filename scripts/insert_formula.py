@@ -119,9 +119,19 @@ def main(argv: list[str] | None = None) -> int:
         print("error: <w:body> not found", file=sys.stderr)
         return 1
 
+    if args.after and args.before:
+        print("error: --after and --before are mutually exclusive", file=sys.stderr)
+        return 1
+
     marker = args.after or args.before
     position = "after" if args.after else "before"
-    insert_near(body, marker, position, para)
+    anchored = insert_near(body, marker, position, para)
+    if marker and not anchored:
+        # Do not silently drop the formula at the end of the document: the
+        # caller asked for a specific anchor, and a misplaced equation is harder
+        # to notice than a failed command.
+        print(f"error: marker not found: {marker!r}", file=sys.stderr)
+        return 1
 
     write(tree, doc_xml)
     fix_root(doc_xml)

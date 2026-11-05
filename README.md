@@ -37,7 +37,10 @@ Optional extras:
 | Feature | Extra requirement |
 |---|---|
 | Formula conversion | `latex2mathml` + a local Microsoft Office (for `MML2OMML.XSL`) |
-| `.doc` → `.docx` conversion | LibreOffice (`soffice` on `PATH`) |
+| Template apply (creating a doc from a template) | Node.js with the `docx` package |
+
+Legacy `.doc` (binary) files are not supported — save as `.docx` first, or use
+LibreOffice externally.
 
 ## Use
 

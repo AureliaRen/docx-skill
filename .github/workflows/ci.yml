@@ -32,6 +32,19 @@ jobs:
       - name: Syntax check every script
         run: python -m compileall -q scripts tests
 
+      - name: requirements.txt must be pure ASCII
+        # pip reads this file with the system locale encoding. An em dash or any
+        # other non-ASCII byte breaks `pip install -r` on a CJK Windows (cp936)
+        # while passing on ubuntu (UTF-8) and windows-latest (cp1252) -- a bug
+        # the matrix cannot otherwise catch.
+        shell: bash
+        run: |
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' requirements.txt; then
+            echo "::error file=requirements.txt::non-ASCII byte found; pip will fail on cp936"
+            exit 1
+          fi
+          echo "requirements.txt is ASCII-only"
+
       - name: Every CLI answers --help
         shell: bash
         run: |
@@ -39,7 +52,7 @@ jobs:
           fail=0
           for f in scripts/*.py; do
             case "$(basename "$f")" in
-              _*|docx_common.py|docx_utils.py|encoding_fix.py|linear_to_latex.py|math_omml.py) continue ;;
+              _*|docx_common.py|docx_utils.py|encoding_fix.py|linear_to_latex.py|math_omml.py|docx_pack.py) continue ;;
             esac
             echo "--- $f"
             python "$f" --help > /dev/null || { echo "FAILED: $f"; fail=1; }

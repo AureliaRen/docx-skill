@@ -178,7 +178,8 @@ def add_comment_xml(doc, runs, text, author, initials) -> str:
                                   encoding="UTF-8", standalone=True)
         part.__class__ = type("CommentsXmlPart", (Part,),
                               {"blob": property(lambda self: _blob(self))})
-    now = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # datetime.UTC is 3.11+; timezone.utc works on every supported version.
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     comment = etree.SubElement(root, q("comment"))
     comment.set(q("id"), cid)
     comment.set(q("author"), author)
@@ -241,7 +242,8 @@ def main() -> int:
     p.add_argument("--target", required=True,
                    help="anchor: first occurrence of this text")
     p.add_argument("--text", required=True, help="comment body")
-    p.add_argument("--author", default="Hermes")
+    p.add_argument("--author", default="docx-skill",
+                   help="comment author shown in Word (default: docx-skill)")
     p.add_argument("--initials", default="")
     p.add_argument("--xml", action="store_true",
                    help="force the XML fallback (skip native API)")
