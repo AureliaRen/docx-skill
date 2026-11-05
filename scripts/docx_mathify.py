@@ -667,8 +667,13 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
                  f"引用域：{stats.get('refs', 0)}　失败：{len(stats['failed'])}", "",
                  "| # | 段落 | 原线性写法 | 生成的 LaTeX | 编号 |", "|---|---|---|---|---|"]
         for i, r in enumerate(rows, 1):
-            lines.append(f"| {i} | {r['p']} | `{r['linear'].replace('|', r'\|')}` "
-                         f"| `{r['latex'].replace('|', r'\|')}` | {r.get('num', '')} |")
+            # Escape pipes before interpolating: a backslash inside an f-string
+            # expression needs Python 3.12 (PEP 701), and this package supports
+            # 3.10+, so the replacement happens outside the f-string.
+            lin = r["linear"].replace("|", "\\|")
+            lat = r["latex"].replace("|", "\\|")
+            lines.append(f"| {i} | {r['p']} | `{lin}` "
+                         f"| `{lat}` | {r.get('num', '')} |")
         if stats["script_fixes"]:
             lines += ["", "## 已自动修正的源排版错误（上下标把后面的正常字符一起包了进去）", "",
                       "| 段落 | 修正前 | 修正后 |", "|---|---|---|"]

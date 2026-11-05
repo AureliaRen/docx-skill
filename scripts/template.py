@@ -193,18 +193,23 @@ def _gen_js(tpl: dict) -> str:
     import_line += " HeadingLevel," if need_heading_level else ""
     import_line += "\n    PageOrientation, PageNumber } = require('docx');"
 
+    # ", ".join() with an embedded backslash cannot live inside an f-string
+    # expression before Python 3.12 (PEP 701); compute it first.
+    styles_block = ",\n".join(styles_js)
+    placeholders_block = ",\n".join(placeholders)
+
     return f"""{import_line}
 const fs = require('fs');
 const DF = {font_js};
 const doc = new Document({{
   styles: {{ default: {{ document: {{ run: {{ font: DF, size: {ds}, color: "000000" }} }} }},
     paragraphStyles: [
-{",\n".join(styles_js)}
+{styles_block}
     ] }},
   sections: [{{ properties: {{ page: {{ size: {{ width: {w}, height: {h} }},
     margin: {{ top: {mg.get('top',1440)}, right: {mg.get('right',1440)}, bottom: {mg.get('bottom',1440)}, left: {mg.get('left',1440)} }} }} }},
     children: [
-{",\n".join(placeholders)}
+{placeholders_block}
     ] }}]
 }});
 Packer.toBuffer(doc).then(b => fs.writeFileSync(process.argv[2], b));"""
