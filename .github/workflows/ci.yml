@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Syntax check every script
+        run: python -m compileall -q scripts tests
+
+      - name: Every CLI answers --help
+        shell: bash
+        run: |
+          set -e
+          fail=0
+          for f in scripts/*.py; do
+            case "$(basename "$f")" in
+              _*|docx_common.py|docx_utils.py|encoding_fix.py|linear_to_latex.py|math_omml.py) continue ;;
+            esac
+            echo "--- $f"
+            python "$f" --help > /dev/null || { echo "FAILED: $f"; fail=1; }
+          done
+          exit $fail
+
+      - name: Run tests
+        # Formula round-trip tests need MML2OMML.XSL from a local Office install,
+        # which the hosted runners do not have. Those tests skip themselves when
+        # the stylesheet is absent; everything else must pass.
+        run: python -m pytest tests/ -v

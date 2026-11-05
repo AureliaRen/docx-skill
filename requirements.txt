@@ -1,0 +1,8 @@
+# Core requirements — needed by every script.
+python-docx>=1.1.0
+lxml>=5.0.0
+
+# Formula conversion (docx_mathify.py / insert_formula.py).
+# Pure Python, no compiled deps. OMML generation additionally needs
+# Microsoft's MML2OMML.XSL from a local Office install at runtime.
+latex2mathml>=3.77.0

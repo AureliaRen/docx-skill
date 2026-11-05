@@ -1,0 +1,12 @@
+{
+  "blocks": [
+    {"type": "heading", "text": "Formula conversion demo", "level": 1},
+    {"type": "paragraph", "text": "Run docx_mathify.py on this file to turn each line below into native Office Math."},
+    {"type": "paragraph", "text": "Ohm's law: U=IR"},
+    {"type": "paragraph", "text": "Kirchhoff current law: \u03a3I=0"},
+    {"type": "paragraph", "text": "Frequency: f=50Hz"},
+    {"type": "paragraph", "text": "Inductor current continuity: i_{L}(0^{+}) = i_{L}(0^{-})"},
+    {"type": "paragraph", "text": "Hand-written matrix: A = [a, b; c, d]"},
+    {"type": "paragraph", "text": "Left alone on purpose: the range [0, 1] and the call f(x, y)."}
+  ]
+}

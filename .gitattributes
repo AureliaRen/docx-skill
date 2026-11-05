@@ -1,0 +1,16 @@
+# Normalize line endings so the repo stays consistent across platforms.
+* text=auto eol=lf
+
+# Windows-only helpers keep CRLF-free too; Python doesn't care.
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.txt  text eol=lf
+
+# Binary documents should never be converted.
+*.docx binary
+*.doc  binary
+*.pdf  binary
+*.png  binary
+*.jpg  binary
