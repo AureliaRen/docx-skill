@@ -1,0 +1,28 @@
+{
+  "blocks": [
+    {"type": "heading", "text": "Test Report", "level": 1},
+    {"type": "paragraph", "text": "A minimal document exercising the common block types."},
+    {"type": "heading", "text": "1. Rich text", "level": 2},
+    {"type": "paragraph", "runs": [
+      {"text": "Regular, "},
+      {"text": "bold", "bold": true},
+      {"text": ", "},
+      {"text": "italic", "italic": true},
+      {"text": ", "},
+      {"text": "underlined", "underline": true},
+      {"text": "."}
+    ]},
+    {"type": "heading", "text": "2. Lists", "level": 2},
+    {"type": "bullet_list", "items": ["first item", "second item", "third item"]},
+    {"type": "numbered_list", "items": ["step one", "step two"]},
+    {"type": "heading", "text": "3. Table", "level": 2},
+    {"type": "table",
+     "header": ["Quantity", "Symbol", "Value"],
+     "rows": [
+       ["Voltage", "U", "220 V"],
+       ["Current", "I", "5 A"],
+       ["Resistance", "R", "44 ohm"]
+     ]},
+    {"type": "page_break"}
+  ]
+}
