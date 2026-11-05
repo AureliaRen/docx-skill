@@ -32,6 +32,27 @@ jobs:
       - name: Syntax check every script
         run: python -m compileall -q scripts tests
 
+      - name: Reject syntax newer than the minimum supported Python
+        # compileall uses the interpreter at hand, so on 3.12 a PEP 701
+        # f-string (backslash inside an expression) compiles fine and only
+        # breaks on 3.10. Parse with feature_version pinned to the floor
+        # instead, so the whole matrix agrees.
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = 0
+          files = sorted(pathlib.Path("scripts").glob("*.py")) + sorted(pathlib.Path("tests").glob("*.py"))
+          for p in files:
+              try:
+                  ast.parse(p.read_text(encoding="utf-8"), filename=str(p), feature_version=(3, 10))
+              except SyntaxError as e:
+                  print(f"::error file={p},line={e.lineno}::{e.msg}")
+                  bad += 1
+          print(f"checked {len(files)} files, failures={bad}")
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: requirements.txt must be pure ASCII
         # pip reads this file with the system locale encoding. An em dash or any
         # other non-ASCII byte breaks `pip install -r` on a CJK Windows (cp936)
