@@ -24,6 +24,14 @@ Two things it does that are hard to find elsewhere:
 
 ## Install
 
+**For agents** (Claude Code, Cursor, Codex, Copilot, Gemini CLI and 20+ others):
+
+```bash
+npx skills add AureliaRen/docx-skill
+```
+
+**For humans:**
+
 ```bash
 git clone https://github.com/AureliaRen/docx-skill.git
 cd docx-skill
