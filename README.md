@@ -22,6 +22,37 @@ Two things it does that are hard to find elsewhere:
   `tblLayout` / `gridCol` / `tcW` interaction that makes column widths appear to
   be ignored.
 
+And two more, added after an audit against a real 20-page thesis:
+
+- **Real Word auto-numbering.** Writes `<w:abstractNum>` / `<w:num>` / `<w:numPr>`
+  instead of applying the numeral-less `List Number` style, so `[1] … [14]`
+  actually renders.
+- **Cross-references that survive.** `SEQ` caption counters plus `REF` pointers
+  with cached results, so `如图3所示` is correct the moment the file opens — and
+  `renumber` puts it right again after an edit shifts the numbering.
+
+## Formulas are not all the same thing
+
+A converter that turns everything it recognises into an equation object gets the
+easy cases wrong. This one sorts each recognised span into three tiers:
+
+| What the span is | What you get | Example |
+|---|---|---|
+| Structural — fractions, roots, integrals, sums, matrices, delimiters | an OMML equation object | `x^2/16+y^2/9=1`, `v=s/t` |
+| Scripts only, no structure | a plain run carrying `w:vertAlign`, i.e. the superscript Word itself makes with `Ctrl+Shift+=` | `a=9.8m/s2`, `10^-7` |
+| Neither — one `=`, one letter, a number and maybe a unit | plain text | `s=10km`, `t=2h`, `m=5kg` |
+
+The third tier exists because an equation object is a cost when nothing needs
+two-dimensional layout: one character takes a formula editor to change, a copy
+into another program reshapes, and the line box grows. The trade is that a
+quantity symbol there is no longer math italic — `s` in `s=10km` comes out
+upright. That is deliberate. When you want the italic, write the span with a
+script or set `vert_align` in a `docx_create` spec.
+
+Both lower tiers sit behind switches in `docx_mathify.py` — `NO_LAYOUT_NEEDED`
+for the third, `MIXED_SUPERSCRIPT` as the master switch covering the second and
+third. See [SKILL.md](SKILL.md#three-output-tiers).
+
 ## Install
 
 **For agents** (Claude Code, Cursor, Codex, Copilot, Gemini CLI and 20+ others):

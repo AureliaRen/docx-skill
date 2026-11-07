@@ -81,6 +81,12 @@ _SUPER = {"\u2070": "0", "\u00b9": "1", "\u00b2": "2", "\u00b3": "3",
 _SUB = {"\u2080": "0", "\u2081": "1", "\u2082": "2", "\u2083": "3",
         "\u2084": "4", "\u2085": "5", "\u2086": "6", "\u2087": "7",
         "\u2088": "8", "\u2089": "9", "\u208a": "+", "\u208b": "-"}
+# 连续上下标必须整体成组。`⁻` 与 `⁷` 是**同一个指数**的两半（负号 + 数字），
+# 逐字符各发一个 `^{-}` / `^{7}` 会得到 `10^{-}^{7}` —— 空上标组后紧跟第二个
+# 上标，是非法 LaTeX，OMML 要么丢弃一半要么把 `7` 排成正文。所以先把连在一起的
+# 上下标各自收成一个 run 再翻译。字符类里没有正则元字符，无需转义。
+_SUPER_RUN_RE = re.compile("[" + "".join(_SUPER) + "]+")
+_SUB_RUN_RE = re.compile("[" + "".join(_SUB) + "]+")
 
 MATH_EXTRA = (set("+-−–×÷·⋅/|()[]{}^_ .,*'!;")
               | OP_CHARS | STRONG
@@ -96,6 +102,7 @@ UNIT_LIST = sorted([
     "J/(mol·K)", "J/(kg·K)", "W/(m·K)", "J/mol",
     "kVA", "kvar", "kW", "kWh", "k\u03a9", "M\u03a9", "m\u03a9",
     "km/s", "m/s", "cm/s", "mm/s",
+    "hPa", "kPa", "MPa", "GPa", "Pa",          # 压力：`p=101kPa` 这类不带斜杠的写法
     "\u03bcF", "pF", "nF", "mH", "\u03bcH", "kHz", "MHz", "Hz",
     "rad/s", "VA", "var", "mA", "\u03bcA", "kV", "mV", "ms", "\u03bcs", "ns",
     "\u03a9", "F", "H", "W", "V", "A", "s", "J", "T", "Wb",
@@ -114,6 +121,122 @@ POW_UNIT_RE = re.compile(
     rf"(\^\{{[-\u2212+]?\d+\}})\s*((?:{_UNIT_ALT})(?:\s*[·⋅]\s*(?:{_UNIT_ALT}))*)"
     rf"(?![_^{{A-Za-z0-9])"
 )
+
+# ---------------------------------------------------------------- 单位词表
+# `/` 在量纲串里读作「每」（kg/m³ = 千克每立方米），只有在「量符号」之间才是分数线。
+# 光判「两边是不是单位符号」是不够的 —— p=F/A、ρ=m/V、s/t 里两边也全是合法单位符号，
+# 却是真分式。所以判定必须再带一层上下文锚点，规则见 _dimensionify()：
+#
+#   量纲串 := 数字? 单位组 ( '/' 单位组 )*         ← 至少一个 '/'
+#   单位组 := 单位因子 ( ('·'|'⋅'|'*') 单位因子 )* | '(' 单位组 ')'
+#   单位因子 := 单位符号 ('^' 整数 | 字面上标)?
+#   单位符号 := UNITS 成员 | SI 词头 + UNITS 成员
+#
+# 成立条件（两条锚点任取其一）：
+#   A. 数字锚点：串紧挨着一个数字/数字幂（`1.2kg/m³`、`3.0×10^{8} m/s²`）→ 测量值读法；
+#   B. 显式登记：整条规范化后命中 COMPOUND_UNITS，并且左右是干净边界
+#      （`mol/L`、`r/min` 单独出现可以；`E = V/m` 不行 —— 前面是 '='，读作真分式）。
+# 都不满足时一律当分式，`v=s/t`、`p=F/A`、`ρ=m/V` 因此毫发无伤。
+
+_UNIT_SEP = "\u00b7\u22c5\u2219*"          # 单位连乘号：· ⋅ ∙ *
+# Inside a parenthesised unit group the ASCII full stop is also a product sign:
+# `J/(mol.K)` is how a Chinese engineering document types `J/(mol·K)`.  It is
+# deliberately *not* added to `_UNIT_SEP`: that set feeds `_CHAIN_MARKERS`, and
+# a bare `.` there would turn `kg.m` into a dimension string on its own.  Here
+# a full stop can only separate two unit factors inside `( )`, where a decimal
+# point cannot appear.
+_GROUP_SEP = _UNIT_SEP + "."
+_WS_CHARS = " \t\u00a0"
+
+SI_PREFIXES = frozenset([
+    "da", "Y", "Z", "E", "P", "T", "G", "M", "k", "h", "d",
+    "c", "m", "u", "\u03bc", "\u00b5", "n", "p", "f", "a", "z", "y",
+])
+
+# 单位词表：能独立作为一个「单位因子」出现的符号（含常用词头形式）。
+# ★ 刻意不收的单字母：t（吨 / 时间符号）、d（天 / 微分符号）、c、a、e、M、U、Q、R、X。
+#   它们在物理式子里当量符号的概率远高于当单位 —— `v=s/t` 必须保持真分式，就靠不收 t。
+UNITS = frozenset([
+    # 基本单位
+    "m", "s", "A", "K", "mol", "cd", "kg",
+    # 质量
+    "g", "mg", "\u03bcg", "\u00b5g", "ug", "ng", "pg",
+    # 长度
+    "cm", "mm", "dm", "km", "\u03bcm", "\u00b5m", "um", "nm", "pm", "fm",
+    # 时间（t / d 见上，刻意不收）
+    "ms", "\u03bcs", "\u00b5s", "us", "ns", "ps", "fs", "min", "h",
+    # 物质的量 / 体积
+    "kmol", "mmol", "\u03bcmol", "\u00b5mol", "umol",
+    "L", "l", "mL", "ml", "\u03bcL", "\u00b5L", "uL", "dL", "cL", "hL",
+    # 力 / 压力
+    "N", "kN", "mN", "\u03bcN", "\u00b5N",
+    "Pa", "hPa", "kPa", "MPa", "GPa", "bar", "mbar", "atm", "mmHg",
+    # 能量 / 功率 / 热量
+    "J", "kJ", "MJ", "GJ", "mJ",
+    "W", "kW", "MW", "GW", "mW", "\u03bcW", "\u00b5W",
+    "Wh", "kWh", "MWh", "eV", "keV", "MeV", "GeV", "cal", "kcal",
+    # 电 / 磁
+    "V", "kV", "mV", "\u03bcV", "\u00b5V", "nV",
+    "A", "mA", "\u03bcA", "\u00b5A", "uA", "kA", "nA",
+    "F", "\u03bcF", "\u00b5F", "uF", "nF", "pF",
+    "H", "mH", "\u03bcH", "\u00b5H", "uH", "nH",
+    "C", "mC", "\u03bcC", "\u00b5C", "Ah", "mAh",
+    "T", "mT", "\u03bcT", "nT", "Wb", "S", "Gs", "dB",
+    "Hz", "kHz", "MHz", "GHz", "THz",
+    "\u03a9", "\u2126", "k\u03a9", "M\u03a9", "m\u03a9",
+    "VA", "kVA", "MVA", "var", "kvar",
+    # 光 / 辐射 / 角 / 其他
+    "lm", "lx", "Bq", "Gy", "Sv", "kat",
+    "rad", "sr", "r", "rpm", "kn", "\u00c5", "Da",
+])
+
+# 显式登记的量纲串（规范化后比较：去空白、字面上标 → ^n、⋅/∗ → ·）。
+# 只对「没有数字锚点」的场合生效，让正文里单摆着的 `mol/L`、`r/min` 也能认出来。
+COMPOUND_UNITS = frozenset([
+    "m/s", "m/s^2", "m/s^3", "km/s", "cm/s", "mm/s", "km/h", "m/h", "m/min",
+    "rad/s", "rad/min", "r/min", "r/s", "rpm",
+    "mol/L", "mmol/L", "umol/L", "mol/m^3", "mol/s", "mol/min",
+    "g/mol", "kg/mol", "g/mL", "g/L", "kg/L", "mg/L", "mg/m^3", "g/cm^3",
+    "kg/m^3", "kg/dm^3", "kg/L",
+    "J/mol", "kJ/mol", "MJ/mol", "J/(mol\u00b7K)", "J/(kg\u00b7K)",
+    "kJ/(kg\u00b7K)", "kJ/(mol\u00b7K)", "J/(m\u00b7K)",
+    "W/m^2", "W/(m\u00b7K)", "W/(m^2\u00b7K)", "kW/m^2", "mW/cm^2",
+    "A/m^2", "mA/cm^2", "A/cm^2", "A/mm^2",
+    "A\u00b7h", "Ah", "mA\u00b7h", "mA\u00b7h/g", "kW\u00b7h", "kWh",
+    "W\u00b7h", "V\u00b7A", "kVA",
+    "N/m", "N\u00b7m", "N/m^2", "kN/m", "kN\u00b7m", "N/(m\u00b7s)",
+    "V/m", "kV/m", "V/cm", "V/mm",
+    "C/kg", "C/m^2", "C/m^3", "C/(kg\u00b7K)",
+    "\u03a9\u00b7m", "\u03a9\u00b7cm", "\u03a9/cm", "S/m", "S/cm",
+    "Pa\u00b7s", "mPa\u00b7s", "Pa/m",
+    "L/min", "L/s", "L/h", "mL/min", "mL/s",
+    "mol/(L\u00b7s)", "mol/(m^3\u00b7s)",
+    "kg\u00b7m/s^2", "kg\u00b7m^2/s^2", "kg\u00b7m^2/s^3",
+    "kg\u00b7m^2/(s^3\u00b7A)",
+    "kcal/mol", "kcal/(kg\u00b7K)", "cal/(g\u00b7K)",
+    "m^2/s", "m^2/s^2", "m^3/s", "m^3/min", "cm^3/s",
+    "Wb/m^2", "kJ/mol", "mol/L",
+])
+
+# 单位符号 → LaTeX 命令（只处理会与 LaTeX/分词打架的两个希腊字形）
+_UNIT_TEX = {
+    "\u03a9": r"\Omega", "\u2126": r"\Omega",
+    "\u03bc": r"\mu", "\u00b5": r"\mu",
+}
+
+
+def _sym_tex(sym: str) -> str:
+    """单位符号 → LaTeX；命令后紧跟 ASCII 字母时补一个空格，免得粘成 \\mum。"""
+    out = []
+    for i, ch in enumerate(sym):
+        cmd = _UNIT_TEX.get(ch)
+        if cmd is None:
+            out.append(ch)
+            continue
+        nxt = sym[i + 1:i + 2]
+        out.append(cmd + (" " if nxt.isascii() and nxt.isalpha() else ""))
+    return "".join(out)
+
 
 # 关系符两边都要有「非运算符」的东西（挡掉 b=、=R、Uoc →，但允许 =∫、=Δ）
 _BOTH_SIDES = re.compile(
@@ -258,6 +381,22 @@ def atoms_to_linear(atoms: list[dict], start: int, end: int) -> str:
 
 # ---------------------------------------------------------------- 线性串 → LaTeX
 _LETTER_CMD = re.compile(r"^\\[A-Za-z]+$")
+
+# 裸 `^` / `_` 后面该吞进多少：**可选正负号 + 连续数字（含小数）**，或**单个字母**。
+#
+# 旧实现是 `\^([^\s{])` —— 只吃 1 个字符。于是 `10^-7` 被切成 `10^{-}7`：
+# `-` 进了上标、`7` 留在正文，两者基线不同，Word 里看着像「中间多了个空格」。
+# 这是主人报的原始 bug（HANDOFF-NEXT §2.1 根因 A）。
+#
+# 关键约束：`a^2b` 必须仍是 `a^{2}b`，不能变成 `a^{2b}`。所以这里**只吃
+# 纯数字 token 或纯单字母**，绝不跨到下一个字母：
+#   `10^-7` → 数字分支吃 `-7`      → `10^{-7}`
+#   `10^+3` → 数字分支吃 `+3`      → `10^{+3}`
+#   `a^2b`  → 数字分支吃 `2`（(?:\.\d+)? 不匹配 b） → `a^{2}b`
+#   `x^n`   → 字母分支吃 `n`       → `x^{n}`
+#   `x^{-7}`→ 已是 `{`，两个分支都不匹配 → 原样保留，不二次包裹
+# 减号同时接受 U+2212（真减号），源文档两种都有。
+SCRIPT_TOKEN = r"[-+\u2212]?\d+(?:\.\d+)?|[-+\u2212]?[A-Za-z]"
 # 命令后的「可读空格」哨兵：分词时忽略（这样 \partial z 仍算邻接因子），
 # 最终输出时再换成真正的空格（否则 \partialx 会被吃成一个命令）。
 SP = "\x01"
@@ -267,6 +406,12 @@ def _escape_unicode(s: str) -> str:
     for comb, cmd in COMBINING.items():
         s = re.sub(r"(\\[A-Za-z]+|[A-Za-z0-9\)\]}])" + re.escape(comb),
                    lambda m, c=cmd: "\\" + c + "{" + m.group(1) + "}", s)
+    # 连续上下标先合并成 run（`⁻⁷` → `^{-7}`），再逐字符处理余下的单个字符。
+    # 不合并的话 `10⁻⁷` 会拆成 `10^{-}^{7}`（非法 LaTeX），见 _SUPER_RUN_RE 处的说明。
+    s = _SUPER_RUN_RE.sub(
+        lambda m: "^{" + "".join(_SUPER[c] for c in m.group(0)) + "}", s)
+    s = _SUB_RUN_RE.sub(
+        lambda m: "_{" + "".join(_SUB[c] for c in m.group(0)) + "}", s)
     out = []
     for ch in s:
         if ch in _SUPER:
@@ -319,6 +464,28 @@ def _match_group(s: str, i: int, open_ch: str = "{", close_ch: str = "}") -> int
     return len(s)
 
 
+def _protect_cmd(s: str, name: str, protect) -> str:
+    r"""把 `\name{...}`（花括号可嵌套）整段交给 protect 换成占位符。
+
+    与写死的 `\\text\{[^{}]*\}` 不同，这里按花括号配对扫描，所以
+    `\mathrm{kg/m^{3}}` 这种带内层幂次的整段也能被原样托管。
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    need = "\\" + name
+    while i < n:
+        if s[i] == "\\" and s.startswith(need, i):
+            end_cmd = i + len(need)
+            if end_cmd < n and s[end_cmd] == "{":
+                end = _match_group(s, end_cmd)
+                out.append(protect(s[i:end]))
+                i = end
+                continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def _sqrtify(s: str) -> str:
     """`√(...)` → `\\sqrt{...}`（括号可嵌套：√(1 + (y′)²)）。"""
     out: list[str] = []
@@ -351,7 +518,18 @@ def _sqrtify(s: str) -> str:
 
 _CMD_RE = re.compile(r"\\[A-Za-z]+")
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?[A-Za-z]?")
-_OP_SPLIT = set("+=<>±∓,;|/÷")
+# 整串就是一个化学式：元素符号（首字母大写）后跟可选数字，至少两段，且不含
+# 运算符/括号/反斜杠。`H2O`、`CO2`、`H2SO4`、`C6H12O6`、`Na2CO3` 命中；
+# `v0`、`R1=10`、`m1v1+m2v2` 不命中（含运算符或全小写）。
+_CHEM_FORMULA_RE = re.compile(
+    r"^(?:[A-Z][a-z]?\d*){2,}$")
+
+# 乘号也是运算符：`1/2×1/2` 的分母必须止于 `2`，否则整串被吞进 \frac 的分母
+# （旧实现把 `×` 当普通 atom，得到 \frac{\frac{1}{2\times 1}}{2}）。
+# `×`/`·`/`⋅` 在 _fracify 之前已被 _escape_unicode 改写成命令（\times 等），
+# 所以这两个命令名也必须在分词时被当成 op，否则修不到实际代码路径。
+_OP_SPLIT = set("+=<>±∓,;|/÷×·⋅*")
+_OP_CMD_NAMES = {"\\times", "\\cdot", "\\ast", "\\div"}   # 乘除法的命令形态
 
 
 def _split_atoms(s: str) -> list[tuple[str, str]]:
@@ -380,6 +558,12 @@ def _split_atoms(s: str) -> list[tuple[str, str]]:
                 i += 1
                 continue
             j = m.end()
+            if m.group(0) in _OP_CMD_NAMES and j < n and s[j] != "{":
+                # \times 这类命令是运算符，不能当成邻接因子（否则 / 的分母会
+                # 越过它继续右吃，`1/2\times 1/2` 变成嵌套分式）
+                out.append(("op", m.group(0)))
+                i = j
+                continue
             if j < n and s[j] == "{":
                 k = _match_group(s, j)
                 out.append(("atom", s[i:k]))
@@ -500,13 +684,304 @@ def _fracify(s: str) -> str:
                 rr += 1
                 R += toks[rr][1]
             L, R = _strip_parens(L), _strip_parens(R)
+            # 操作数两端可能挂命令后的空格哨兵（`\times` 之后就是这种），落进
+            # \frac 的花括号会变成多余空格。只削两端：中间那个哨兵是命令与
+            # 后续字符的分隔（`\omega L` 去掉就粘成未定义的 \omegaL）。
+            L = L.strip(" " + SP)
+            R = R.strip(" " + SP)
             toks[ll:rr + 1] = [("atom", r"\frac{" + L + "}{" + R + "}")]
             changed = True
             break
     return "".join(t for _, t in toks)
 
 
+# ------------------------------------------------------- 量纲串判定（`/` = 每）
+def _read_exponent(s: str, i: int) -> tuple[int, str] | None:
+    """s[i] 起读幂次，返回 (结束下标, 指数文本)；不是幂次返回 None。
+
+    三种写法都吃：LaTeX 式 `^{3}` / `^3`、字面 Unicode 上标 `³` / `⁻³`，
+    以及**紧贴单位符号的裸整数** `kg/m3` / `m/s2`。
+
+    最后一种不是规范写法，但它是人真正打字的样子——`³` 在多数输入法里
+    打不出来，而 `kg/m3` 在工程文档、教辅、试卷里随处可见。它由调用方
+    `_parse_unit_item` 控制是否开启：只有当这个整数**确实是一段量纲串的
+    幂次**时才当幂次读，见那里的说明。
+    """
+    if i >= len(s):
+        return None
+    if s[i] == "^":
+        j = i + 1
+        if j < len(s) and s[j] == "{":
+            k = _match_group(s, j)
+            body = s[j + 1:k - 1].strip()
+        else:
+            m = re.match(r"[-\u2212+]?\d+", s[j:])
+            if not m:
+                return None
+            body = m.group(0)
+            k = j + m.end()
+        body = body.replace("\u2212", "-")
+        if not re.fullmatch(r"[-+]?\d+", body):
+            return None
+        return k, body
+    j = i
+    buf: list[str] = []
+    while j < len(s) and s[j] in _SUPER:
+        buf.append(_SUPER[s[j]])
+        j += 1
+    if not buf:
+        return None
+    return j, "".join(buf)
+
+
+# A bare ASCII digit run right after a unit symbol, e.g. the ``3`` of ``kg/m3``.
+# Bounded so that ``m3`` in ``m30`` (a typo or an unrelated token) still reads
+# as an exponent, but a longer number does not get chopped arbitrarily.
+_BARE_EXP_RE = re.compile(r"[-\u2212]?[1-9]\d?")
+
+
+def _unit_symbol_at(s: str, i: int) -> int:
+    """s[i:] 起的最长「单位符号」长度（UNITS 成员，或 SI 词头 + UNITS 成员）。"""
+    best = 0
+    for u in _UNITS_BY_LEN:
+        if s.startswith(u, i):
+            best = len(u)
+            break
+    for p in _PREFIXES_BY_LEN:
+        if not s.startswith(p, i):
+            continue
+        j = i + len(p)
+        if j == i:
+            continue
+        for u in _UNITS_BY_LEN:
+            if s.startswith(u, j):
+                best = max(best, j + len(u) - i)
+                break
+    return best
+
+
+def _skip_ws(s: str, i: int) -> int:
+    while i < len(s) and s[i] in _WS_CHARS:
+        i += 1
+    return i
+
+
+def _parse_unit_item(s: str, i: int) -> tuple[int, str, bool] | None:
+    """s[i:] 起的一个「单位因子」：单位符号 + 可选幂次。(结束, LaTeX, 有幂次)。"""
+    n = _unit_symbol_at(s, i)
+    if not n:
+        return None
+    sym = s[i:i + n]
+    j = i + n
+    e = _read_exponent(s, j)
+    if e is None:
+        # Bare ASCII exponent: ``kg/m3``, ``m/s2``. Accepted only when the
+        # digits are not glued to a following alphanumeric, so ``m30x`` or
+        # ``kg/m3s`` do not silently become ``m^{30}`` / ``m^{3}s``.
+        m = _BARE_EXP_RE.match(s, j)
+        if m and (m.end() >= len(s) or not s[m.end()].isalnum()):
+            return m.end(), _sym_tex(sym) + "^{" + m.group(0).replace("\u2212", "-") + "}", True
+        return j, _sym_tex(sym), False
+    k, exp = e
+    return k, _sym_tex(sym) + "^{" + exp + "}", True
+
+
+def _parse_unit_group(s: str, i: int, sep: str = _UNIT_SEP) -> tuple[int, str, bool] | None:
+    """s[i:] 起的一个「单位组」（可带括号、可含 · 连乘）。
+
+    *sep* is the set of product signs accepted at this nesting level;
+    ``_parse_unit_group`` passes ``_GROUP_SEP`` inside parentheses so that
+    ``J/(mol.K)`` reads as a dimension string while a bare ``kg.m`` does not.
+    """
+    if i < len(s) and s[i] == "(":
+        inner = _parse_unit_group(s, i + 1, _GROUP_SEP)
+        if inner is None:
+            return None
+        j, tex, has_exp = inner
+        k = _skip_ws(s, j)
+        if k >= len(s) or s[k] != ")":
+            return None
+        end = k + 1
+        e = _read_exponent(s, end)
+        if e is not None:
+            end, exp = e
+            return end, "(" + tex + ")^{" + exp + "}", True
+        return end, "(" + tex + ")", has_exp
+    item = _parse_unit_item(s, i)
+    if item is None:
+        return None
+    j, tex, has_exp = item
+    parts = [tex]
+    while True:
+        k = _skip_ws(s, j)
+        if k >= len(s) or s[k] not in sep:
+            break
+        nxt = _parse_unit_item(s, _skip_ws(s, k + 1))
+        if nxt is None:
+            break
+        j, nxt_tex, nxt_exp = nxt
+        sep_ch = s[k]
+        # keep `.` as a literal dot, render the real product signs as \cdot
+        parts.append(("." if sep_ch == "." else r"\cdot ") + nxt_tex)
+        has_exp = has_exp or nxt_exp
+    return j, "".join(parts), has_exp
+
+
+# 数字锚点：串前面紧挨着一个数字 / 一个数字指数的右花括号 / 一个右括号 /
+# 一段字面 Unicode 上标数字（`3×10⁸m/s` 里那个 `⁸`）。
+# 最后一种和 `^{8}` 是同一件事的两种写法：它们都说明「左边这个数是数值的幂」，
+# 因此右边的单位串读作测量值而不是分式。`_find_dimension_spans` 跑在
+# `_escape_unicode` 之前，源文档里 `⁸` 还是字面形态，两种形态都要认——否则
+# `x⁸m/s` 与 `x^{8}m/s` 会给出不同结果，而 ASCII/Unicode 两种拼写必须一致
+# （见 tests/test_units_ascii.py 的同名约定）。
+# 字符类只收数字：`⁺`/`⁻` 单独出现时不能当锚点（没有数值可锚），`ⁿ`/`ⁱ`
+# 是字母上标，同样不是数值。`10⁻⁷` 里 `⁻` 后面还跟着 `⁷`，run 从 `⁷` 起算即可。
+# 第 1 组捕获「数字与量纲串之间的空白」——这段空白要一起吃掉，
+# 否则 `8.31 J/(mol·K)` 会留下一个旧实现没有的空格（既有用例锁的是无空格形态）。
+_SUPER_DIGITS = "".join(c for c in _SUPER if _SUPER[c].isdigit())
+_ANCHOR_RE = re.compile(
+    r"(?:\)|\^\{\s*[-\u2212+]?\d+\s*\}|[" + re.escape(_SUPER_DIGITS) + r"]+|\d)(\s*)$")
+# 量纲串尾部不能紧跟这些字符（否则只是更长 token 的一段）
+_TAIL_BLOCK_RE = re.compile(r"[_^{A-Za-z0-9]")
+# 无数字锚点时，左边界不许是这些字符（`E = V/m` 的 `=`、`p=F/A` 的 `=` 都在内）
+_LEFT_BLOCK = set("=+-*/^_<>'\u00b1\u2213\u00d7\u00f7\u00b7\u22c5\u2219,;|)}]")
+# 一条链至少要有一个「分隔标记」：分数线或连乘号
+_CHAIN_MARKERS = "/" + _UNIT_SEP
+
+
+def _normalize_chain(text: str) -> str:
+    """规范化用于与 COMPOUND_UNITS 比对：去空白、字面上标 → ^n、⋅/∗ → ·。"""
+    out: list[str] = []
+    for ch in text:
+        if ch in _WS_CHARS:
+            continue
+        if ch in _SUPER:
+            out.append("^" + _SUPER[ch])
+        elif ch == "\u2212":
+            out.append("-")
+        elif ch in "\u22c5\u2219*":
+            out.append("\u00b7")
+        else:
+            out.append(ch)
+    return re.sub(r"\^\{([^}]*)\}", r"^\1", "".join(out))
+
+
+def _left_boundary_ok(s: str, start: int) -> bool:
+    """量纲串左边是不是干净边界（前一个非空白字符不是运算符/字母数字/右括号）。"""
+    p = start - 1
+    while p >= 0 and s[p] in _WS_CHARS:
+        p -= 1
+    if p < 0:
+        return True
+    ch = s[p]
+    return not (ch.isalnum() or ch in _LEFT_BLOCK)
+
+
+def _anchor_span_start(s: str, start: int, end: int) -> int | None:
+    """量纲串的成立条件（见文件头规则说明）；成立时返回含左侧空白的起始下标。"""
+    if end < len(s) and _TAIL_BLOCK_RE.match(s[end]):
+        return None
+    m = _ANCHOR_RE.search(s[:start])
+    if m:
+        return m.start(1)
+    if not _left_boundary_ok(s, start):
+        return None
+    if _normalize_chain(s[start:end]) in COMPOUND_UNITS:
+        return start
+    return None
+
+
+def _find_dimension_spans(s: str) -> list[tuple[int, int, str, str]]:
+    """→ [(替换起点, 替换终点, 渲染好的 LaTeX, 原文片段)]，按出现顺序、互不重叠。
+
+    替换起点可能落在量纲串左侧的空白上（数字与单位之间那个空格）。
+    """
+    spans: list[tuple[int, int, str, str]] = []
+    i, n = 0, len(s)
+    while i < n:
+        got = _parse_unit_group(s, i)
+        if got is None:
+            i += 1
+            continue
+        end, tex, has_exp = got
+        ok = True
+        while True:
+            k = _skip_ws(s, end)
+            if k >= n or s[k] != "/":
+                break
+            nxt = _parse_unit_group(s, _skip_ws(s, k + 1))
+            if nxt is None:
+                ok = False
+                break
+            end, nxt_tex, nxt_exp = nxt
+            tex = tex + "/" + nxt_tex
+            has_exp = has_exp or nxt_exp
+        raw = s[i:end]
+        if not ok or not any(c in raw for c in _CHAIN_MARKERS):
+            i += 1
+            continue
+        span_start = _anchor_span_start(s, i, end)
+        if span_start is None:
+            i += 1
+            continue
+        chain = _tidy_chain(raw)
+        if has_exp:
+            rendered = r"\,\mathrm{" + tex + "}"
+        else:
+            rendered = r"\,\text{" + chain + "}"
+        spans.append((span_start, end, rendered, chain))
+        i = end
+    return spans
+
+
+def _tidy_chain(text: str) -> str:
+    """去掉 `/` 与连乘号两侧的空格，便于直接落进 \\text{}。"""
+    text = re.sub(r"\s*/\s*", "/", text)
+    return re.sub(r"\s*([\u00b7\u22c5\u2219])\s*", r"\1", text)
+
+
+def is_dimension_string(text: str) -> bool:
+    """整段 `text` 是不是量纲串（`/` 读作「每」）。供测试与报告判定。
+
+    >>> is_dimension_string("kg/m\u00b3"), is_dimension_string("v=s/t")
+    (True, False)
+    """
+    spans = _find_dimension_spans(text)
+    return bool(spans) and spans[0][0] == 0 and spans[-1][1] == len(text)
+
+
+def unit_slash_chains(linear: str) -> list[str]:
+    """linear 串里被判为量纲串的原文片段（按出现顺序）。"""
+    return [raw for _s, _e, _r, raw in _find_dimension_spans(linear)]
+
+
+def _dimensionify(s: str) -> str:
+    r"""把量纲串整段摘出来，挡住后面的分式改写。
+
+    无幂次 → `\,\text{kg/m}`（与既有 UNIT_RE 的形态一致，`\text{}` 里塞不了花括号）；
+    有幂次 → `\,\mathrm{m/s^{2}}`（幂次要落成真 OMML 上标）。
+    """
+    spans = _find_dimension_spans(s)
+    if not spans:
+        return s
+    out: list[str] = []
+    pos = 0
+    for span_start, end, rendered, _raw in spans:
+        out.append(s[pos:span_start])
+        out.append(rendered)
+        pos = end
+    out.append(s[pos:])
+    return "".join(out)
+
+
+_UNITS_BY_LEN = sorted(UNITS, key=len, reverse=True)
+_PREFIXES_BY_LEN = sorted(SI_PREFIXES, key=len, reverse=True)
+
+
 def _unitify(s: str) -> str:
+    # 0) 含 `/` 的量纲串先整体识别 —— 单位串里的 `/` 是「每」，不是分数线。
+    #    必须先于分式改写，且必须先于下面两条白名单正则（否则 kg 会被切走）。
+    s = _dimensionify(s)
     s = UNIT_RE.sub(lambda m: r"\,\text{" + m.group(1) + "}", s)
     # 幂次后的单位（10^{-6}F / 3.0×10^{8} m/s）——} 后面接数字脚本时仍按单位处理
     s = POW_UNIT_RE.sub(
@@ -568,7 +1043,126 @@ def _matrixify(s: str) -> str:
     return "".join(out)
 
 
-def linear_to_latex(s: str) -> str:
+def _subscriptify(s: str) -> str:
+    r"""`v0` → `v_{0}`：变量名后面紧跟的**单个数字**通常是下标。
+
+    物理卷里 `v₀`、`R₁`、`U₁`、`m₂` 天天出现，而源文档几乎只会写成
+    `v0` / `R1` / `m2`（真下标 run 才走 `_run_script` 那条路）。不补这一步，
+    `v0` 会原样输出成两个同高字符，看起来像 v 乘以 0，物理含义全错。
+
+    判据刻意保守，因为**化学式与函数名都在同一条代码路径上**：
+
+    * **小写**单字母 + 单个数字 → 转（`v0`、`m1v1`、`x0`、`a1`、`u2`）。
+      物理/数学的变量几乎都是小写，这条覆盖绝大部分需求。
+    * **大写**单字母 + 单个数字 → 只在数字后是运算符/边界时转（`R1=10`、
+      `U1=`、`T1=`），从而**放过化学式**：`H2SO4` 的 `H2` 后面是 `S`、
+      `CO2` 的 `O` 前是 `C`，都不动 —— 化学式在 spec 里本来就写成真下标
+      （`H_{2}O`），不该被这里二次改写。
+    * 字母前不能是字母/数字之外的命令成分：`\log2x`、`\lg2`、`\sin2x`
+      经 `_funcify` 后已带反斜杠，前置断言把它们排除。
+    * `e`/`E` 一律不动（`e2` 多为科学记数、`E1` 多为编号）。
+    * **整串是化学式就不动**（`H2O`、`CO2`、`H2SO4`、`C6H12O6`）。化学式在 spec
+      里本来就写成真下标（`H_{2}O`），走到这里的是漏写的；与其猜哪个数字是下标，
+      不如整串放过，让人去补 —— 猜错（`C6H12O_{6}`）比不转更难发现。
+    * **紧跟在字母后面的不转**（`IR1`、`I1R1`）：`IR₁` 与 `I·R1` 有歧义，
+      要靠人写 `I_{1}R_{1}` 才明确。这条保守规则宁可不动，也不猜。
+
+    幂次（`v0^2`）由后置的 `^` 规则处理，这里只碰底数。
+    """
+    if _CHEM_FORMULA_RE.match(s.replace(" ", "")):
+        return s
+    # 小写：前不接字母/反斜杠命令；数字后不再跟数字
+    s = re.sub(r"(?<![\\A-Za-z])(?<![\\A-Za-z]\\{)([a-df-z])(\d)(?!\d)",
+               r"\1_{\2}", s)
+    # 大写：额外要求数字后是运算符或边界，放过 H2SO4 / CO2 这类化学式片段
+    s = re.sub(r"(?<![\\A-Za-z])(?<![\\A-Za-z]\\{)([A-DF-Z])(\d)(?!\d)"
+               r"(?=[\s=+\-−*/×·,;)}\]|]|$)",
+               r"\1_{\2}", s)
+    return s
+
+
+# ---------------------------------------------------------------- 中文角标
+# `S甲` / `P甲=P乙` / `v甲>v乙` 里的「甲乙」是下角标（主人 2026-11-06 反馈）。
+# 但**绝不能默认开**：正文里 `m与`、`m高`、`t时`、`图甲`、`表乙` 长得一模一样，
+# 自动猜会把正文打成下标。所以做成显式开关，默认 False —— 与 HANDOFF-NEXT §3.3
+# 的首选方案（spec 里显式标注 vert_align）天然对齐：那条路产出真
+# `w:vertAlign="subscript"` run；这条只服务「线性串里已经写成 `S甲`」的场景。
+CN_SUBSCRIPT = False
+
+# 汉字黑名单：紧跟在字母后面时**几乎必然是正文连接词/量词/方位词**，不是角标。
+# 来源：HANDOFF-NEXT §3.3 给的那串 + 本轮实测补充的虚词与程度副词。
+# 判据是「这个字接在变量后面读起来像不像一句中文」—— 像，就不转。
+CN_SUBSCRIPT_BLACKLIST = frozenset(
+    # —— HANDOFF §3.3 原表 ——
+    "与和的时高长宽为是中内外上下后前处点段图表式题解答则若当已未"
+    # —— 连接词 / 介词 / 助词 ——
+    "比及或且即于由从向对把被让使令得地着过们这那其之所"
+    # —— 连词 / 副词 / 语气 ——
+    "以因如虽但却而又也都还就才只更最很太极再又并同"
+    # —— 常见谓语 / 判断词（`S是`、`S有`、`S为`） ——
+    "有在无不可会要应需能"
+    # —— 常见量名词（`S值`、`S数`、`S量` 多半是正文） ——
+    "值数量度数率差比积合"
+)
+
+
+def _cn_subscriptify(s: str) -> str:
+    r"""`X汉` → `X_{汉}`：单个 ASCII 字母 + 单个汉字 → 中文下角标。
+
+    前置断言 `(?<![A-Za-z0-9\\])` 保证「汉字前是一个**独立的** ASCII 字母」。
+    四种必须放过的形态，都被断言挡住：
+
+    * `ab甲` —— 字母是更长单词的一部分（前面还是字母）；
+    * `28M战术` —— 字母是型号/单位代号的一部分：**多位数字**紧跟单个字母
+      是 `28M`、`4G`、`100W` 这类编号，不是「28 乘 M」；
+    * `\alpha甲` —— 命令尾字母。
+
+    而 `2v乙` 要转：**单个数字**紧跟字母是系数（`2v`、`3x`），中文里
+    「2v乙」读作 2 倍 v_乙。所以数字那一档只排除 2 位以上（`(?<!\d)` 之外
+    再用 `(?<!\d\d)`，并把「单个数字 + 字母」显式放行）。
+
+    汉字走 `CN_SUBSCRIPT_BLACKLIST` 之外才转。
+
+    例：`S甲` → `S_{甲}`；`P甲=P乙` → `P_{甲}=P_{乙}`；`v甲=2v乙` →
+        `v_{甲}=2v_{乙}`；`m与` / `m高` / `t时` / `图甲` / `28M战术` 不动。
+    """
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if (ch.isascii() and ch.isalpha() and i + 1 < n
+                and "\u4e00" <= s[i + 1] <= "\u9fff"
+                and s[i + 1] not in CN_SUBSCRIPT_BLACKLIST):
+            prev = s[i - 1] if i else ""
+            # Reject `ab甲` (word tail) and `\alpha甲` (command tail).
+            if prev and (prev.isascii() and (prev.isalpha() or prev == "\\")):
+                out.append(ch)
+                i += 1
+                continue
+            # Reject `28M战术` / `4G通信`: a digit run before a *capital* letter
+            # is a model/unit designation (28M, 4G, 5K, 3D), never a
+            # coefficient, because a coefficient in Chinese physics prose is
+            # lowercase (`2v乙`, `3x甲`).  Two or more digits block either case.
+            if prev.isdigit():
+                j = i - 1
+                ndig = 0
+                while j >= 0 and s[j].isdigit():
+                    ndig += 1
+                    j -= 1
+                if ndig >= 2 or ch.isupper():
+                    out.append(ch)
+                    i += 1
+                    continue
+            out.append(ch + "_{" + s[i + 1] + "}")
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def linear_to_latex(s: str, cn_subscript: bool | None = None) -> str:
     # 0) latex2mathml 对 align/gather 会**自动插入行编号** (1)(2)（LaTeX 语义），
     #    没有 \tag 的多行环境一律换成星号版本（不编号）；aligned 同样映射到 align*。
     #    有 \tag 的由 docx_mathify 走「对齐编号表格」，不经过这里。
@@ -586,11 +1180,14 @@ def linear_to_latex(s: str) -> str:
     # 2) 保护 \text{...}，避免单位里的字母被当成分式/命令
     protected: list[str] = []
 
-    def _protect(m):
-        protected.append(m.group(0))
-        return f"\x00{len(protected) - 1}\x00"
+    def _protect_text(txt: str) -> str:
+        protected.append(txt)
+        return "\x00" + str(len(protected) - 1) + "\x00"
 
-    s = re.sub(r"\\text\{[^{}]*\}", _protect, s)
+    s = re.sub(r"\\text\{[^{}]*\}", lambda m: _protect_text(m.group(0)), s)
+    # 2b) \mathrm{...}（量纲串的输出形态）整段当不透明块：别让 _funcify 把里面的
+    #     min 改写成 \min，也别让 _fracify 伸进显式正体组。花括号按配对扫描。
+    s = _protect_cmd(s, "mathrm", _protect_text)
     # 3) Unicode → 命令
     s = _escape_unicode(s)
     # 4) 保护 \begin{...}...\end{...}（矩阵/分段/多行环境：内容已是合法 LaTeX，
@@ -605,14 +1202,22 @@ def linear_to_latex(s: str) -> str:
     # 5) 根号、函数名、分式
     s = _sqrtify(s)
     s = _funcify(s)
+    # 函数名此时已带反斜杠（\lg、\log），_subscriptify 的前置断言会把它们排除，
+    # 所以 `v0`→`v_{0}` 生效而 `\lg2`/`\log2x` 不受影响。
+    s = _subscriptify(s)
     s = _fracify(s)
+    # 5b) 中文下角标（`S甲`）。**默认关**：显式开关或模块级 CN_SUBSCRIPT 才生效。
+    #     放在占位符还原之前 —— `\text{…}`/`\mathrm{…}`/环境还都是 \x00N\x00 占位符，
+    #     正文里的「字母+汉字」（`m与`、`图甲`）不会被打成下标。
+    if CN_SUBSCRIPT if cn_subscript is None else cn_subscript:
+        s = _cn_subscriptify(s)
     # 6) 还原占位符
     s = re.sub(r"\x00(\d+)\x00", lambda m: protected[int(m.group(1))], s)
     s = re.sub(r"\x02(\d+)\x02", lambda m: envs[int(m.group(1))], s)
     s = s.replace(SP, " ")                 # 命令后的可读空格（此时才落成真空格）
     s = re.sub(r" {2,}", " ", s).strip()
-    s = re.sub(r"\^([^\s{])", r"^{\1}", s)
-    s = re.sub(r"_([^\s{])", r"_{\1}", s)
+    s = re.sub(r"\^(" + SCRIPT_TOKEN + ")", r"^{\1}", s)
+    s = re.sub(r"_(" + SCRIPT_TOKEN + ")", r"_{\1}", s)
     # 收尾：去掉 { } ( ) ^ _ , 之前的空格（LaTeX 不需要，且影响可读性）
     s = re.sub(r"\s+(?=[{}()^_,])", "", s)
     return s.strip()
