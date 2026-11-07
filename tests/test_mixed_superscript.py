@@ -33,25 +33,10 @@ import docx_mathify as M  # noqa: E402
 import linear_to_latex as L  # noqa: E402
 
 
-def _omml_available() -> bool:
-    """本机有没有 LaTeX→OMML 的最后一环（latex2mathml + MML2OMML.XSL）。
-
-    Hosted CI runners have neither Office nor the stylesheet, so every test that
-    asserts "this fragment became ``m:oMath``" has to skip there — otherwise the
-    suite is green only on a developer machine with Word installed.  That is a
-    false green light, and it hid a real failure once.
-    """
-    try:
-        import math_omml
-        math_omml.find_xslt()
-    except Exception:
-        return False
-    return True
-
-
-needs_omml = pytest.mark.skipif(
-    not _omml_available(),
-    reason="needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)")
+# OMML 可用性判定收在 `tests/_omml.py` 一处（REVIEW-CODE-R4 应修 5）。
+# 这里曾经有一份**漏查 latex2mathml** 的本地副本，导致同一份代码在不同机器
+# 上的跳过条件分叉：只缺 latex2mathml 时会一处 skip、一处 fail。
+from _omml import needs_omml  # noqa: E402
 
 
 # ---------------------------------------------------------------- 判据：正例

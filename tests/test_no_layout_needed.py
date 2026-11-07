@@ -39,20 +39,9 @@ import linear_to_latex as L  # noqa: E402
 
 
 # ------------------------------------------------------- OMML 是否可用（CI 无 Office）
-def _omml_available() -> bool:
-    try:
-        import math_omml
-        math_omml.find_xslt()
-        import latex2mathml  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
-needs_omml = pytest.mark.skipif(
-    not _omml_available(),
-    reason="needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)",
-)
+# 判定收在 `tests/_omml.py` 一处（REVIEW-CODE-R4 应修 5），四个测试文件共用，
+# 避免「谁改一份忘改另一份」导致跳过条件静默分叉。
+from _omml import needs_omml  # noqa: E402
 
 
 # ---------------------------------------------------------------- 判据：该降级
@@ -290,29 +279,60 @@ def test_end_to_end_multiplication_equation_stays_omml(tmp_path):
     assert "<m:oMath" in xml, "`F=ma` 被误降级了"
 
 
-@needs_omml
-def test_end_to_end_mixed_document_keeps_both_forms(tmp_path):
-    r"""一份文档里两种形态并存：简单等式落文字，真分式留 OMML。"""
+def test_end_to_end_mixed_document_keeps_text_form(tmp_path):
+    r"""★ 一份文档里两种形态并存 —— **非 OMML 的那一半，任何机器都要跑**。
+
+    REVIEW-CODE-R4 应修 4：这条原来和 OMML 断言写在同一个 `@needs_omml` 测试里，
+    于是 CI 上「`s=10km` 进了 `w:t`」与「`plain_no_layout == 1`」被一起跳过 ——
+    而那两条正是本轮回归的**本体**。跳掉它们，等于 CI 对这个改动完全瞎。
+    现在拆开：这两个断言不带标记，CI 必跑。
+    """
     src, out = _build(tmp_path, ["s=10km", "x^2/16+y^2/9=1"])
     stats = M.mathify(src, out, None, None)
 
     xml = _doc_xml(out)
-    assert "s=10km" in xml
+    assert "s=10km" in xml, "简单等式没进普通文字（回归！）"
+    assert stats["plain_no_layout"] == 1, \
+        f"免排版降级计数不对：{stats['plain_no_layout']}（应为 1）"
+
+
+@needs_omml
+def test_end_to_end_mixed_document_keeps_both_forms(tmp_path):
+    r"""同上的 **OMML 那一半**：真分式必须还是公式对象。
+
+    只有「`<m:oMath>` 存在」这类断言依赖 Office，所以只有它们带标记。
+    """
+    src, out = _build(tmp_path, ["s=10km", "x^2/16+y^2/9=1"])
+    M.mathify(src, out, None, None)
+
+    xml = _doc_xml(out)
     assert "<m:oMath" in xml, "真分式必须还是 OMML"
     assert "<m:f>" in xml
-    assert stats["plain_no_layout"] == 1
 
 
-def test_end_to_end_switch_off_restores_omml(tmp_path, monkeypatch):
-    r"""开关关掉后同一份输入必须重新产 OMML —— 回退路径要真的能回退。"""
+def test_end_to_end_switch_off_stops_downgrading(tmp_path, monkeypatch):
+    r"""★ 开关关掉后**不再降级** —— 这一半不依赖 OMML，必须一直跑。
+
+    REVIEW-CODE-R4 应修 4：原来的写法把 `pytest.skip` 放在 `mathify()` 之后、
+    两条断言之前，于是 `stats['plain_no_layout'] == 0` 在 CI 上不执行。
+    那正是「回退路径真的能回退」的核心证据，不能跳。
+    """
     monkeypatch.setattr(M, "NO_LAYOUT_NEEDED", False)
     src, out = _build(tmp_path, ["s=10km"])
     stats = M.mathify(src, out, None, None)
 
-    if not _omml_available():
-        pytest.skip("needs latex2mathml + Microsoft MML2OMML.XSL")
+    assert stats["plain_no_layout"] == 0, \
+        "开关关掉后仍降级了 —— 回退路径失效"
+
+
+@needs_omml
+def test_end_to_end_switch_off_restores_omml(tmp_path, monkeypatch):
+    r"""开关关掉的 **OMML 那一半**：同一份输入重新产公式对象。"""
+    monkeypatch.setattr(M, "NO_LAYOUT_NEEDED", False)
+    src, out = _build(tmp_path, ["s=10km"])
+    M.mathify(src, out, None, None)
+
     assert "<m:oMath" in _doc_xml(out)
-    assert stats["plain_no_layout"] == 0
 
 
 # ---------------------------------------------------------------- 报告
