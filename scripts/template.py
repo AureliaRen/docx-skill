@@ -98,8 +98,31 @@ def _extract(docx: Path) -> dict:
                 pp = _parse_ppr(s.find(wtag("pPr")))
                 if rp: entry["run"] = rp
                 if pp: entry["paragraph"] = pp
-                if bo := s.get(wtag("basedOn"),""): entry["basedOn"] = bo
+                # w:basedOn is a CHILD ELEMENT (<w:basedOn w:val="1"/>), not an
+                # attribute. Reading it with s.get() always returned None, so
+                # every extracted style looked parentless and, on re-apply,
+                # lost the inheritance chain (a 12pt body style came back at
+                # Word's 10pt default).
+                bo_el = s.find(wtag("basedOn"))
+                if bo_el is not None:
+                    bo = bo_el.get(wtag("val"), "")
+                    if bo:
+                        entry["basedOn"] = bo
                 tpl["styles"][name] = entry
+
+            # styleIds are document-local (source `1` is usually Normal, the
+            # target's `1` may be nothing at all), so record the basedOn
+            # *name* as well; _add_style falls back to it when the raw id
+            # cannot be found in the target document.
+            ids_to_names = {
+                s.get(wtag("styleId"), ""): nm.get(wtag("val"), "")
+                for s in tree.getroot().iter(wtag("style"))
+                if (nm := s.find(wtag("name"))) is not None
+            }
+            for entry in tpl["styles"].values():
+                bo = entry.get("basedOn")
+                if bo and bo in ids_to_names:
+                    entry["basedOnName"] = ids_to_names[bo]
 
         dx = up / "word" / "document.xml"
         if dx.exists():
@@ -308,7 +331,7 @@ def _apply_existing(tpl: dict, docx: Path, fix_formulas: bool = False) -> None:
 def _patch_styles(up: Path, tpl: dict) -> None:
     sx = up / "word" / "styles.xml"
     if not sx.exists(): return
-    regw(); tree = parse(sx); root = tree.getroot()
+    register_all(); tree = parse(sx); root = tree.getroot()
 
     if (dr := tpl.get("defaults",{}).get("run")):
         dd = root.find(wtag("docDefaults"))
@@ -367,7 +390,15 @@ def _merge_rpr(rpr: ET.Element, props: dict) -> None:
 
 
 def _merge_ppr(ppr: ET.Element, props: dict) -> None:
-    for key, tag in [("spacing","spacing"),("align","jc"),("outlineLevel","outlineLvl")]:
+    """Write paragraph properties back, including indent.
+
+    ``extract`` records ``indent`` (first-line indent, the single most visible
+    property of a Chinese body-text style) but the old whitelist here only knew
+    spacing/align/outlineLevel, so every indented paragraph silently came back
+    flush-left.
+    """
+    for key, tag in [("spacing", "spacing"), ("align", "jc"),
+                     ("outlineLevel", "outlineLvl"), ("indent", "ind")]:
         if key in props:
             old = ppr.find(wtag(tag))
             if old is not None: ppr.remove(old)
@@ -376,25 +407,71 @@ def _merge_ppr(ppr: ET.Element, props: dict) -> None:
             if isinstance(v, dict):
                 for kk, vv in v.items(): e.set(wtag(kk), str(vv))
             else: e.set(wtag("val"), str(v))
+    # CT_PPr requires a fixed child order; Word rejects a part that violates it.
+    order = ["numPr", "spacing", "ind", "jc", "outlineLvl"]
+    rank = {wtag(o): i for i, o in enumerate(order)}
+    kids = sorted(list(ppr), key=lambda el: rank.get(el.tag, len(order)))
+    if [el.tag for el in kids] != [el.tag for el in ppr]:
+        for el in list(ppr):
+            ppr.remove(el)
+        for el in kids:
+            ppr.append(el)
+
+
+def _resolve_parent(root: ET.Element, s: dict) -> str:
+    """Resolve ``basedOn`` against the target document.
+
+    The extracted ``styleId`` is only meaningful inside the source document
+    (where ``1`` happens to be Normal). Copying that id into an unrelated
+    document produces a dangling parent, and the style silently falls back to
+    Word's defaults. Prefer an id that really exists in the target, then the
+    recorded parent *name*, then "Normal".
+    """
+    ids = {st.get(wtag("styleId"), "") for st in root.iter(wtag("style"))}
+    bo = s.get("basedOn", "")
+    if bo and bo in ids:
+        return bo
+    bo_name = s.get("basedOnName", "")
+    if bo_name:
+        for st in root.iter(wtag("style")):
+            nm = st.find(wtag("name"))
+            if nm is not None and nm.get(wtag("val")) == bo_name:
+                return st.get(wtag("styleId"), "")
+    return "Normal" if "Normal" in {st.get(wtag("styleId")) for st in root.iter(wtag("style"))} else bo
 
 
 def _add_style(root: ET.Element, name: str, s: dict) -> None:
-    """Add a new style element to styles.xml."""
-    stype = s.get("type","paragraph")
-    sid = s.get("styleId","")
+    """Add a new style element to styles.xml.
+
+    Children are created in CT_Style document order (name, basedOn, next,
+    qFormat, pPr, rPr).  ``w:basedOn`` is an element with a ``w:val`` child
+    attribute — writing it with ``elem.set()`` produced an attribute Word
+    ignores, which silently cut the style's inheritance from Normal.
+    """
+    stype = s.get("type", "paragraph")
+    sid = s.get("styleId", "")
     elem = ET.SubElement(root, wtag("style"))
     elem.set(wtag("type"), stype)
-    if sid: elem.set(wtag("styleId"), sid)
-    if "customStyle" in s: elem.set(wtag("customStyle"), "1")
-    nm = ET.SubElement(elem, wtag("name")); nm.set(wtag("val"), name)
-    if bo := s.get("basedOn",""):
-        elem.set(wtag("basedOn"), bo)
-    if "run" in s:
-        rpr = ET.SubElement(elem, wtag("rPr"))
-        _merge_rpr(rpr, s["run"])
+    if sid:
+        elem.set(wtag("styleId"), sid)
+    if s.get("customStyle"):
+        elem.set(wtag("customStyle"), "1")
+    nm = ET.SubElement(elem, wtag("name"))
+    nm.set(wtag("val"), name)
+    parent = _resolve_parent(root, s)
+    if parent:
+        b = ET.SubElement(elem, wtag("basedOn"))
+        b.set(wtag("val"), parent)
+    if nx := s.get("next", ""):
+        n = ET.SubElement(elem, wtag("next"))
+        n.set(wtag("val"), nx)
+    ET.SubElement(elem, wtag("qFormat"))
     if "paragraph" in s:
         ppr = ET.SubElement(elem, wtag("pPr"))
         _merge_ppr(ppr, s["paragraph"])
+    if "run" in s:
+        rpr = ET.SubElement(elem, wtag("rPr"))
+        _merge_rpr(rpr, s["run"])
 
 
 def _patch_page(up: Path, tpl: dict) -> None:
@@ -402,7 +479,7 @@ def _patch_page(up: Path, tpl: dict) -> None:
     if not pg: return
     dx = up / "word" / "document.xml"
     if not dx.exists(): return
-    regw(); tree = parse(dx); root = tree.getroot()
+    register_all(); tree = parse(dx); root = tree.getroot()
     sect = root.find(f"{wtag('body')}/{wtag('sectPr')}")
     if sect is None: return
     for json_key, tag, xml_attr in [("width","pgSz","w"),("height","pgSz","h"),

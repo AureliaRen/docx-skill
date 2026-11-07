@@ -30,7 +30,9 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Syntax check every script
-        run: python -m compileall -q scripts tests
+        # tools/ is part of the shipped surface (word_accept.py is the acceptance
+        # harness), so it gets the same floor as scripts/ and tests/.
+        run: python -m compileall -q scripts tests tools
 
       - name: Reject syntax newer than the minimum supported Python
         # compileall uses the interpreter at hand, so on 3.12 a PEP 701
@@ -42,7 +44,9 @@ jobs:
           python - <<'PY'
           import ast, pathlib, sys
           bad = 0
-          files = sorted(pathlib.Path("scripts").glob("*.py")) + sorted(pathlib.Path("tests").glob("*.py"))
+          files = []
+          for d in ("scripts", "tests", "tools"):
+              files += sorted(pathlib.Path(d).glob("*.py"))
           for p in files:
               try:
                   ast.parse(p.read_text(encoding="utf-8"), filename=str(p), feature_version=(3, 10))

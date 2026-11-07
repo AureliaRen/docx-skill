@@ -77,7 +77,60 @@ def parse(path: str | Path) -> ET.ElementTree:
 
 
 def write(tree: ET.ElementTree, path: str | Path) -> None:
+    """Serialize *tree* with correct OOXML prefixes and a valid root tag.
+
+    ElementTree drops declarations for namespaces no element happens to use,
+    while leaving attributes such as ``mc:Ignorable="w14 wp14"`` intact. Word
+    rejects a part whose ``mc:Ignorable`` names an undeclared prefix, so every
+    touched part is repaired after serialization.
+    """
+    register_all()
     tree.write(str(path), xml_declaration=True, encoding="UTF-8")
+    fix_root_any(Path(path))
+
+
+def fix_root_any(path: Path) -> None:
+    """Repair the root element of any OOXML part (document, styles, header...).
+
+    ``fix_root`` only knows how to rewrite ``<w:document>``; this generalisation
+    works for ``<w:styles>``, ``<w:ftr>``, ``<w:hdr>`` and friends, which the
+    template/comment/revision scripts also serialize.  It restores every
+    declaration in ``NS``, keeps any extra ones the part already had, and
+    rewrites ``mc:Ignorable`` to list only prefixes that are now declared.
+    """
+    raw = path.read_text(encoding="utf-8")
+    start = raw.find("<", raw.find("?>") + 2 if "?>" in raw else 0)
+    if start == -1:
+        return
+    end = raw.find(">", start)
+    if end == -1:
+        return
+    root_tag = raw[start:end + 1]
+    if root_tag.endswith("/>") or "xmlns" in root_tag and "<w:" not in root_tag:
+        pass
+    existing_ns = dict(_XMLNS_RE.findall(root_tag))
+
+    merged = dict(existing_ns)
+    for prefix, uri in NS.items():
+        merged[prefix] = uri
+
+    ignorable = " ".join(k for k in merged if k not in ("w", "r", "mc"))
+
+    # Drop every xmlns declaration we are about to re-emit, then append the
+    # full set, so nothing is declared twice.
+    stripped = _XMLNS_RE.sub("", root_tag)
+    stripped = _re.sub(r'\s+', " ", stripped)
+    stripped = _re.sub(r'\s+mc:Ignorable="[^"]*"', "", stripped)
+    stripped = _re.sub(r'\s+>', ">", stripped)
+    head = stripped[:-1].rstrip()
+    if head.endswith("/"):
+        head = head[:-1].rstrip()
+    new_root = (head + " "
+                + " ".join(f'xmlns:{k}="{v}"' for k, v in merged.items())
+                + f' mc:Ignorable="{ignorable}">')
+
+    body = raw[end + 1:]
+    path.write_text(new_root + body, encoding="utf-8")
 
 
 # ---- shared utilities ------------------------------------------------------
