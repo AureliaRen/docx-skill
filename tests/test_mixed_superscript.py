@@ -33,6 +33,27 @@ import docx_mathify as M  # noqa: E402
 import linear_to_latex as L  # noqa: E402
 
 
+def _omml_available() -> bool:
+    """本机有没有 LaTeX→OMML 的最后一环（latex2mathml + MML2OMML.XSL）。
+
+    Hosted CI runners have neither Office nor the stylesheet, so every test that
+    asserts "this fragment became ``m:oMath``" has to skip there — otherwise the
+    suite is green only on a developer machine with Word installed.  That is a
+    false green light, and it hid a real failure once.
+    """
+    try:
+        import math_omml
+        math_omml.find_xslt()
+    except Exception:
+        return False
+    return True
+
+
+needs_omml = pytest.mark.skipif(
+    not _omml_available(),
+    reason="needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)")
+
+
 # ---------------------------------------------------------------- 判据：正例
 @pytest.mark.parametrize("latex", [
     r"a^{2}",
@@ -252,6 +273,7 @@ def test_end_to_end_superscript_becomes_a_real_script(tmp_path):
     assert "-7" in xml
 
 
+@needs_omml
 def test_end_to_end_fraction_still_produces_omml(tmp_path):
     r"""真分式必须仍然走 OMML —— 混合策略不能把 `\frac` 吃掉。"""
     import zipfile
@@ -261,6 +283,7 @@ def test_end_to_end_fraction_still_produces_omml(tmp_path):
     assert "<m:f>" in xml, "分式结构丢了"
 
 
+@needs_omml
 def test_end_to_end_mixed_document_has_both(tmp_path):
     r"""一份文档里两种形态并存：这是「混合策略」的本体。"""
     import zipfile

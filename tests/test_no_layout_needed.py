@@ -327,9 +327,14 @@ def test_report_lists_downgraded_spans(tmp_path):
     assert "plain_quantity" in txt
     assert "`s=10km`" in txt
     assert "免排版降级：1" in txt
-    # 未被降级的不能出现在这一节里
+    # 未被降级的不能出现在「降级明细表」里。
+    # 注意不能对整段 tail 做子串断言：`F=ma` 转换失败时会被写进同一份报告末尾的
+    # 「## 转换失败（已保留原文）」小节（无 Office/XSL 的 CI 上必然如此），
+    # 那不是「出现在降级清单里」。所以只截到下一个二级标题为止。
     head, _, tail = txt.partition("## 免排版降级")
-    assert "F=ma" not in tail, "`F=ma` 不该出现在降级清单里"
+    section = tail.split("\n## ", 1)[0]
+    assert "`s=10km`" in section
+    assert "F=ma" not in section, "`F=ma` 不该出现在降级清单里"
 
 
 def test_report_omits_the_section_when_nothing_is_downgraded(tmp_path):
