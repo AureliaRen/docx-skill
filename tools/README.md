@@ -42,6 +42,7 @@ python tools/word_accept.py <in.docx> [--pdf OUT.pdf] [--png DIR] [--json OUT.js
 
 ```powershell
 # 典型调用（Wave 2 照抄）
+# $py = 你的 Python 3.10+ 解释器（需装 python-docx / pywin32 / PyMuPDF）
 $py = (Get-Command python).Source
 & $py tools/word_accept.py out/exam.docx --pdf out/exam.pdf --png out/exam_png `
      --json out/exam.json --expect-sections 3 --expect-bookmarks 151
