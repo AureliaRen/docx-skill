@@ -50,6 +50,9 @@ CONTRACT_KEYS = {
     "page_numbers", "page_numbers_source", "pdf", "pngs", "errors",
     "hard_errors", "warnings",
     "sources", "xref_summary", "xml", "word", "expectations",
+    # page-number truth layer (T3)
+    "page_number_formats", "page_number_restarts", "section_specs",
+    "paragraph_pages", "paragraph_pages_source", "toc_audit",
 }
 
 MODULE_SRC = (TOOLS / "word_accept.py").read_text(encoding="utf-8")
@@ -657,3 +660,470 @@ def test_render_summary_never_raises(plain):
     text = wa.render_summary(bad_rep)
     assert "ERROR" in text
     assert "ok=False" in text
+
+
+# ===========================================================================
+# page-number truth layer (T3)
+# ===========================================================================
+# The distinction these tests exist for, measured on
+# ``work/subjects/math/paper.docx`` (a 5-section paper whose last section is
+# ``lowerRoman start=1``):
+#
+#   physical page 7  ->  WD_ACTIVE_END_PAGE          = 7
+#   the same page    ->  WD_ACTIVE_END_ADJUSTED_PAGE = 2   -> glyph "ii"
+#   last section     ->  physical 8 / adjusted 1     -> glyph "i"
+#   the PDF's footer band for page 8 reads "- i -"
+#
+# So "page 7" and "i" are both true statements about *different* pages, and the
+# only way to keep them apart is to record which measurement produced which
+# number.  Everything below pins down one half of that.
+
+def set_pgnum(section, fmt=None, start=None):
+    """Write ``<w:pgNumType>`` on a section's ``sectPr``, *replacing* any old one.
+
+    Replacement rather than append is the point: ``Document.add_section()``
+    clones the running ``sectPr``, so appending leaves two ``pgNumType``
+    elements and Word silently obeys only the last (measured on Word 16: a
+    section holding ``lowerRoman start=1`` then ``upperRoman start=5`` reads
+    ``V``).  The duplicate case is exercised separately, on purpose.
+    """
+    for old in section._sectPr.findall(qn("w:pgNumType")):
+        section._sectPr.remove(old)
+    el = OxmlElement("w:pgNumType")
+    if fmt is not None:
+        el.set(qn("w:fmt"), fmt)
+    if start is not None:
+        el.set(qn("w:start"), start)
+    section._sectPr.append(el)
+    return el
+
+
+def test_wd_active_end_adjusted_page_constant():
+    """1 and 3 are different questions with the same name in passing."""
+    assert wa.WD_ACTIVE_END_ADJUSTED_PAGE == 1
+    assert wa.WD_ACTIVE_END_PAGE == 3
+    assert wa.WD_ACTIVE_END_ADJUSTED_PAGE != wa.WD_ACTIVE_END_PAGE
+
+
+def test_section_specs_reads_pgnumtype(tmp_path):
+    """Each section's raw fmt/start, in document order, straight from the XML."""
+    doc = Document()
+    doc.add_paragraph("cover")
+    s1 = doc.sections[0]
+    doc.add_section()
+    s2 = doc.sections[1]
+    set_pgnum(s2, "lowerRoman", "1")
+    doc.add_paragraph("front matter")
+    doc.add_section()
+    s3 = doc.sections[2]
+    set_pgnum(s3, "decimal")            # fmt only: continues, does not restart
+    doc.add_paragraph("body")
+
+    rep = wa.probe_xml(save(doc, tmp_path))
+    specs = rep["section_specs"]
+    assert rep["sections_xml"] == 3
+    assert [s["index"] for s in specs] == [1, 2, 3]
+    assert [(s["fmt"], s["start"]) for s in specs] == [
+        (None, None), ("lowerRoman", "1"), ("decimal", None)]
+    # ``start`` stays the raw string so "absent" and "explicit 1" differ
+    assert specs[1]["start"] == "1"
+    assert specs[2]["start"] is None
+    assert rep["page_number_formats"] == ["lowerRoman", "decimal"]
+    # only an explicit start is a restart
+    assert rep["page_number_restarts"] == [
+        {"section": 2, "start": "1", "fmt": "lowerRoman"}]
+
+
+def test_section_specs_carry_paragraph_spans(tmp_path):
+    """``first_para_index`` / ``last_para_index`` make 段落→节 answerable.
+
+    A ``sectPr`` lives on the last paragraph of the section it closes — for
+    ``Document.add_section()`` that is the empty paragraph it inserts, which is
+    still body text of that section.  So spans are inclusive at both ends and
+    must tile the body without gaps or overlaps.
+    """
+    doc = Document()
+    for i in range(3):
+        doc.add_paragraph("cover %d" % i)      # 0,1,2
+    doc.add_section()                          # empty paragraph 3 carries sectPr
+    for i in range(2):
+        doc.add_paragraph("body %d" % i)       # 4,5
+    doc.add_section()                          # empty paragraph 6 carries sectPr
+    doc.add_paragraph("appendix")              # 7
+
+    rep = wa.probe_xml(save(doc, tmp_path))
+    specs = rep["section_specs"]
+    spans = [(s["first_para_index"], s["last_para_index"]) for s in specs]
+    assert spans == [(0, 3), (4, 6), (7, 7)]
+    assert rep["paragraphs_body_direct"] == 8
+    # contiguous coverage of the whole body, in order, no gaps and no overlap
+    assert [a for a, _ in spans] == [0] + [b + 1 for _, b in spans[:-1]]
+    assert spans[-1][1] == rep["paragraphs_body_direct"] - 1
+
+
+def test_section_specs_survive_a_document_without_pgnumtype(plain):
+    rep = wa.probe_xml(plain)
+    assert rep["sections_xml"] == 1
+    spec = rep["section_specs"][0]
+    assert (spec["fmt"], spec["start"], spec["pgNumType_count"]) == (None, None, 0)
+    assert spec["index"] == 1
+    assert spec["first_para_index"] == 0
+    assert spec["last_para_index"] == rep["paragraphs_body_direct"] - 1
+    assert spec["last_para_index_xml"] == rep["paragraphs_xml"] - 1
+    assert rep["page_number_formats"] == []
+    assert rep["page_number_restarts"] == []
+
+
+def test_duplicate_pgnumtype_is_reported_and_last_one_wins(tmp_path):
+    """Word obeys the *last* ``pgNumType``; the duplicate is a warning, not a fix.
+
+    This is the shape ``python-docx`` produces when a caller appends instead of
+    replacing after ``add_section()`` cloned the sectPr.  Measured on Word 16: a
+    section holding ``lowerRoman start=1`` then ``upperRoman start=5`` prints
+    ``V`` — the earlier element is dead, so reading it would report the wrong
+    alphabet.
+    """
+    doc = Document()
+    doc.add_paragraph("cover")
+    doc.add_section()
+    sec = doc.sections[1]
+    first = OxmlElement("w:pgNumType")
+    first.set(qn("w:fmt"), "lowerRoman")
+    first.set(qn("w:start"), "1")
+    sec._sectPr.append(first)
+    second = OxmlElement("w:pgNumType")
+    second.set(qn("w:fmt"), "upperRoman")
+    second.set(qn("w:start"), "5")
+    sec._sectPr.append(second)
+    doc.add_paragraph("body")
+
+    rep = wa.probe_xml(save(doc, tmp_path))
+    spec = rep["section_specs"][1]
+    assert (spec["fmt"], spec["start"]) == ("upperRoman", "5")
+    assert spec["pgNumType_count"] == 2
+    assert any("more than one w:pgNumType" in w for w in rep["xml_warnings"])
+
+
+def test_page_glyph_uses_the_section_counter_alphabet():
+    """A displayed number is a *number*; a reader sees a *glyph*.
+
+    ``3`` under ``lowerRoman`` is ``iii`` — the reported evidence is exactly this
+    conversion, so it is pinned with the real counter values rather than mocked.
+    """
+    assert wa.page_glyph("lowerRoman", 3) == "iii"
+    assert wa.page_glyph("upperRoman", 4) == "IV"
+    assert wa.page_glyph("lowerLetter", 1) == "a"
+    assert wa.page_glyph("upperLetter", 27) == "AA"
+    assert wa.page_glyph("decimalZero", 7) == "07"
+    assert wa.page_glyph("decimal", 7) == "7"
+    assert wa.page_glyph(None, 5) == "5"       # no pgNumType: plain decimal
+    assert wa.page_glyph("lowerRoman", 1) == "i"
+
+
+def test_page_glyph_degrades_without_docx_section(monkeypatch):
+    """``scripts/docx_section`` is another agent's file — losing it must not throw.
+
+    ``page_glyph`` is called from the Word layer, which must never raise; the
+    documented fallback is "the number as text", and that is what this asserts.
+    """
+    monkeypatch.setattr(wa, "_section_module", lambda: None)
+    assert wa.page_glyph("lowerRoman", 3) == "3"
+    assert wa.page_glyph(None, 12) == "12"
+    assert wa.page_glyph("decimal", "7") == "7"
+    assert wa.page_glyph("decimal", None) == ""
+
+
+def test_roman_token_parsing():
+    """TOC tokens are Roman as often as decimal; ``ii`` must sort after ``i``."""
+    assert wa._token_number("i") == 1
+    assert wa._token_number("iii") == 3
+    assert wa._token_number("iv") == 4
+    assert wa._token_number("xi") == 11
+    assert wa._token_number("12") == 12
+    assert wa._token_number("0") == 0
+    assert wa._token_number("abc") is None
+    assert wa._token_number(None) is None
+    assert wa._token_number("") is None
+
+
+def test_toc_audit_counts_levelled_entries(tmp_path):
+    doc = Document()
+    add_style(doc.styles.element, "9", "toc 1")
+    add_style(doc.styles.element, "10", "toc 2")
+    for style_id, label, page in (("9", "第一章", "1"), ("9", "第二章", "5"),
+                                  ("10", "1.1 节", "2")):
+        p = doc.add_paragraph()
+        set_pstyle(p, style_id)
+        p.add_run(label).add_tab()
+        p.add_run(page)
+    doc.add_paragraph("正文无样式")
+
+    ta = wa.probe_xml(save(doc, tmp_path))["toc_audit"]
+    assert ta["entries"] == 3
+    assert ta["entries_toc_style"] == 3
+    assert ta["styles"] == ["toc 1", "toc 2"]
+    assert ta["levels"] == [1, 2]
+    assert ta["page_tokens"] == ["1", "5", "2"]
+    assert ta["page_parse_failures"] == []
+    assert ta["source"] == "toc"
+
+
+def test_toc_audit_flags_non_monotonic_pages(tmp_path):
+    doc = Document()
+    add_style(doc.styles.element, "9", "toc 1")
+    for label, page in (("甲", "1"), ("乙", "7"), ("丙", "3")):
+        p = doc.add_paragraph()
+        set_pstyle(p, "9")
+        p.add_run(label).add_tab()
+        p.add_run(page)
+    ta = wa.probe_xml(save(doc, tmp_path))["toc_audit"]
+    assert ta["page_tokens"] == ["1", "7", "3"]
+    assert ta["monotonic"] is False
+
+
+def test_toc_audit_monotonic_handles_roman(tmp_path):
+    """``i, ii, iii`` increases; as text it would not.  Convert before comparing."""
+    doc = Document()
+    add_style(doc.styles.element, "9", "toc 1")
+    for label, page in (("摘要", "i"), ("Abstract", "ii"), ("目录", "iii")):
+        p = doc.add_paragraph()
+        set_pstyle(p, "9")
+        p.add_run(label).add_tab()
+        p.add_run(page)
+    ta = wa.probe_xml(save(doc, tmp_path))["toc_audit"]
+    assert ta["page_tokens"] == ["i", "ii", "iii"]
+    assert ta["monotonic"] is True
+    assert ta["monotonic_partial"] is False
+
+
+def test_toc_audit_records_entries_without_a_page_number(tmp_path):
+    """An entry that renders but carries no number is a broken TOC, not an empty one."""
+    doc = Document()
+    add_style(doc.styles.element, "9", "toc 1")
+    p = doc.add_paragraph()
+    set_pstyle(p, "9")
+    p.add_run("没有页码的一行")
+    q_ = doc.add_paragraph()
+    set_pstyle(q_, "9")
+    q_.add_run("有页码").add_tab()
+    q_.add_run("4")
+
+    ta = wa.probe_xml(save(doc, tmp_path))["toc_audit"]
+    assert ta["entries"] == 2
+    assert ta["page_tokens"] == ["4"]
+    assert len(ta["page_parse_failures"]) == 1
+    assert ta["page_parse_failures"][0]["text"].startswith("没有页码")
+    assert ta["source"] == "toc"          # the TOC exists; only one row is unreadable
+
+
+def test_toc_audit_reports_absence_as_computed(plain):
+    ta = wa.probe_xml(plain)["toc_audit"]
+    assert ta["entries"] == 0
+    assert ta["page_tokens"] == []
+    assert ta["monotonic"] is True        # vacuously; entries=0 says why
+    assert ta["source"] == "computed"
+
+
+def test_paragraph_pages_absent_without_a_request(plain):
+    """No request and no Word -> no rows, and no invented page numbers."""
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(plain), "--word", "off"]))
+    assert rep["paragraph_pages"] == []
+    assert rep["paragraph_pages_source"] == "none"
+    assert rep["sources"]["paragraph_pages"] == "none"
+
+
+def test_paragraph_pages_computed_fallback_is_labelled(tmp_path):
+    """Without Word the rows exist for structure only, and say so on every row.
+
+    This is the guard against the failure this layer was built to stop: a
+    "computed" number being handed to a reader as the page a paragraph is on.
+
+    Body layout here is ``0 cover`` / ``1 (sectPr)`` / ``2 front`` /
+    ``3 (sectPr)`` / ``4 body``; ``--page-probe`` counts Word paragraphs, which
+    are 1-based, so 1, 3, 5 name those three paragraphs in order.
+
+    The third section sets ``decimal`` explicitly.  It has to: a bare
+    ``add_section()`` *clones* the previous ``sectPr``, so section 3 would
+    otherwise inherit ``lowerRoman`` and this test would be asserting Word's
+    inheritance rather than the formatter's behaviour.
+    """
+    doc = Document()
+    doc.add_paragraph("cover")
+    doc.add_section()
+    set_pgnum(doc.sections[1], "lowerRoman", "1")
+    doc.add_paragraph("front")
+    doc.add_section()
+    set_pgnum(doc.sections[2], "decimal")
+    doc.add_paragraph("body")
+    path = save(doc, tmp_path)
+
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(path), "--word", "off", "--page-probe", "1,3,5"]))
+    assert rep["paragraph_pages_source"] == "computed"
+    assert rep["sources"]["paragraph_pages"] == "computed"
+    rows = rep["paragraph_pages"]
+    assert [r["index"] for r in rows] == [1, 3, 5]
+    assert all(r["source"] == "computed" for r in rows)
+    assert all(r["exact"] is False for r in rows)
+    assert all(r["physical"] is None for r in rows)   # nothing measured
+    assert all(r["index_space"] == "xml" for r in rows)
+    # section assignment is real even when the page is not
+    assert [r["section"] for r in rows] == [1, 2, 3]
+    assert [r["page_format"] for r in rows] == [None, "lowerRoman", "decimal"]
+    # the glyph comes from that section's fmt, from the section's start number
+    assert rows[1]["displayed_number"] == 1
+    assert rows[1]["displayed_text"] == "i"
+    assert rows[2]["displayed_text"] == "1"
+    assert any("computed" in w for w in rep["warnings"])
+
+
+def test_paragraph_pages_unknown_index_is_not_a_page(tmp_path):
+    """An index outside the body gets ``None``, never a neighbouring page."""
+    doc = Document()
+    doc.add_paragraph("only")
+    path = save(doc, tmp_path, "one.docx")
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(path), "--word", "off", "--page-probe", "1,99"]))
+    by_index = {r["index"]: r for r in rep["paragraph_pages"]}
+    assert by_index[1]["section"] == 1
+    assert by_index[1]["displayed_text"] == "1"
+    assert by_index[99]["section"] is None
+    assert by_index[99]["displayed_number"] is None
+    assert by_index[99]["displayed_text"] is None
+    assert by_index[99]["basis"] == "unknown-section"
+
+
+def test_estimated_paragraph_pages_shape():
+    """The helper is usable direct, and its warning names the trap.
+
+    ``indices`` here follow the same 1-based convention as ``--page-probe``:
+    ``1`` is the first paragraph of section 1, ``5`` a paragraph of section 2.
+    """
+    specs = [
+        {"index": 1, "first_para_index": 0, "last_para_index": 2,
+         "first_para_index_xml": 0, "last_para_index_xml": 2,
+         "fmt": None, "start": None},
+        {"index": 2, "first_para_index": 3, "last_para_index": 9,
+         "first_para_index_xml": 3, "last_para_index_xml": 9,
+         "fmt": "upperRoman", "start": "1"},
+    ]
+    est = wa.estimated_paragraph_pages(specs, [{"index": 2, "last_page": 7}],
+                                       [1, 5, 9])
+    assert est["source"] == "computed"
+    assert "computed 不得当作交付页码" in est["warning"]
+    assert [r["section"] for r in est["rows"]] == [1, 2, 2]
+    assert est["rows"][0]["displayed_text"] == "1"
+    assert est["rows"][1]["page_format"] == "upperRoman"
+    assert est["rows"][1]["displayed_text"] == "I"
+    assert est["rows"][1]["section_last_page"] == 7
+    assert all(r["exact"] is False and r["physical"] is None
+               for r in est["rows"])
+
+
+def test_table_rows_warn_about_the_index_space(tmp_path):
+    """XML ordinal != Word paragraph index once a table exists.
+
+    Measured on ``work/subjects/math/paper.docx``: XML ordinal 95 maps to section
+    5 while Word's ``Paragraphs(96)`` is in section 4 — one table is enough to
+    shift everything after it.  So the estimate says which index space it is in
+    and the report warns when that space can drift.
+    """
+    doc = Document()
+    doc.add_paragraph("有表格")
+    t = doc.add_table(rows=2, cols=1)
+    t.cell(0, 0).text = "c0"
+    t.cell(1, 0).text = "c1"
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(save(doc, tmp_path)), "--word", "off", "--page-probe", "1"]))
+    assert rep["paragraph_pages_source"] == "computed"
+    assert rep["paragraph_pages"][0]["index_space"] == "xml"
+    assert any("table row" in w for w in rep["warnings"])
+
+
+def test_page_probe_cli_parsing():
+    parser = wa.build_parser()
+    args = parser.parse_args(["x.docx", "--page-probe", "1, 9,9, 43"])
+    assert args.page_probe_indices == [1, 9, 43]     # deduped, order kept
+
+    args2 = parser.parse_args(["x.docx"])
+    assert args2.page_probe_indices is None
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["x.docx", "--page-probe", "3,abc"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["x.docx", "--page-probe", "0"])
+
+
+def test_paragraph_pages_with_word_are_marked_word(plain, monkeypatch):
+    """When Word answers, ``source`` flips to ``word`` and both numbers are kept.
+
+    Word is stubbed at the ``probe_word`` boundary, because CI has no Office: what
+    is asserted is the *merge contract* — a layer that returns readings must not
+    be relabelled as an estimate, and ``physical`` and ``displayed_number`` must
+    both survive into the report.
+    """
+    def fake_word(docx, **kw):
+        assert kw.get("page_probe_indices") == [1]
+        return {
+            "word_ok": True, "skipped": False, "skipped_reason": None,
+            "errors": [], "warnings": [], "pages": 8, "paragraphs": 8,
+            "sections": 1, "bookmarks": 0, "bookmarks_total": 0,
+            "inline_shapes": 0, "floating_shapes": 0, "fields": 0,
+            "hyperlinks": 0, "tables": 0, "bookmark_names": [],
+            "bookmark_names_all": [], "hyperlink_targets": [], "field_list": [],
+            "page_numbers": [], "page_numbers_source": "none",
+            "section_details": [{"index": 1, "last_page": 7,
+                                 "last_page_displayed_number": 2,
+                                 "last_page_displayed_text": "ii",
+                                 "page_format": "lowerRoman"}],
+            "paragraph_pages": [{"index": 1, "physical": 7,
+                                 "displayed_number": 2, "displayed_text": "ii",
+                                 "section": 1, "page_format": "lowerRoman"}],
+            "paragraph_pages_source": "word",
+            "pdf": None, "pngs": [], "pdf_pages": None, "pdf_page_footers": [],
+            "word_version": "16.0",
+        }
+
+    monkeypatch.setattr(wa, "probe_word", fake_word)
+    wa.reset_word_cache()
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(plain), "--word", "on", "--page-probe", "1"]))
+    assert rep["paragraph_pages_source"] == "word"
+    assert rep["sources"]["paragraph_pages"] == "word"
+    row = rep["paragraph_pages"][0]
+    assert row["physical"] == 7          # sheet ordinal
+    assert row["displayed_number"] == 2  # the number the footer shows
+    assert row["displayed_text"] == "ii"
+    assert not any("computed" in w for w in rep["warnings"])
+    assert rep["section_details"][0]["last_page_displayed_text"] == "ii"
+
+
+def test_report_keeps_page_truth_keys_when_word_is_off(plain):
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(plain), "--word", "off"]))
+    assert rep["page_number_formats"] == []
+    assert rep["page_number_restarts"] == []
+    assert len(rep["section_specs"]) == 1
+    assert rep["toc_audit"]["source"] == "computed"
+    assert rep["xml"]["toc_audit"]["entries"] == 0
+
+
+def test_render_summary_shows_page_format_and_restarts(tmp_path):
+    """The human summary must state the numbering scheme, not only the counts.
+
+    "pages=8" hides the fact that sections print 1,2,3 then i — the line a
+    reader needs is the fmt list plus where the counter restarts.
+    """
+    doc = Document()
+    doc.add_paragraph("cover")
+    doc.add_section()
+    set_pgnum(doc.sections[1], "lowerRoman", "1")
+    doc.add_paragraph("front")
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(save(doc, tmp_path)), "--word", "off"]))
+    text = wa.render_summary(rep)
+    assert "page format" in text
+    assert "lowerRoman" in text
+    assert "restarts at" in text
+    assert "[word_accept]" in text

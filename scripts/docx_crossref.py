@@ -99,7 +99,7 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
-from docx_utils import PPR_ORDER, insert_ordered, next_bm_id
+from docx_utils import PPR_ORDER, insert_ordered, is_cjk, next_bm_id
 
 XMLSPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
@@ -345,25 +345,244 @@ def all_bookmarks(doc) -> set:
 # that a table of figures can link to: a ``_Ref<number>`` bookmark covering the
 # whole caption, side by side with whatever bookmark the caller asked for.
 _REF_NUM = re.compile(r"_Ref(\d+)\Z")
+_REF_RESERVED_ATTR = "_docx_crossref_ref_reserved"
+
+
+def _reserved_set(doc, attr: str) -> set:
+    """The set of names already handed out but not yet written into *doc*.
+
+    Kept on the document object so a caller can mint a whole batch before
+    inserting any of them.  Without it, ``next_*_name`` reads only the bookmarks
+    that are already in the XML and returns the same name twice -- which is
+    exactly the duplicate this module now refuses to write
+    (work/REVIEW-ADVERSARIAL-R6.md 应修-2).  A reloaded document simply starts
+    with an empty set, which is correct: nothing was minted for it yet.
+    """
+    reserved = getattr(doc, attr, None)
+    if not isinstance(reserved, set):
+        reserved = set()
+        try:
+            setattr(doc, attr, reserved)
+        except Exception:                                  # pragma: no cover
+            reserved = set()
+    return reserved
+
+
+def _mint(doc, pattern, head: str, attr: str, pad: int = 0,
+          reserve: bool = True) -> str:
+    """Shared minting loop: next free ``head<number>``.
+
+    ``pad`` zero-pads the number to that width (``0`` = no padding).  The TOC
+    family pads to four digits so the generated anchors sort lexicographically;
+    the ``_Ref`` family does not, because its names are already in the wild as
+    ``_Ref1``/``_Ref2`` and changing the shape would break existing documents
+    and their tests.
+
+    ``reserve`` controls the batch guarantee.  ``True`` remembers the name so
+    the next call cannot hand out the same one -- necessary for a caller that
+    mints a batch before writing any of them.  ``False`` is the plain "next free
+    name given what is in the document right now" reading, which is what a
+    caller wants when it writes each name immediately: two successive calls then
+    answer the same question and get the same answer.
+    """
+    used = all_bookmarks(doc)
+    reserved = _reserved_set(doc, attr) if reserve else set()
+
+    top = 0
+    for name in used | reserved:
+        m = pattern.match(name or "")
+        if m:
+            top = max(top, int(m.group(1)))
+
+    n = top + 1
+    while True:
+        tail = ("%0*d" % (pad, n)) if pad else str(n)
+        # Keep the whole name inside the cap even for an absurdly long prefix,
+        # so a caller-supplied prefix cannot smuggle in a 41-character name.
+        room = BOOKMARK_MAX_LEN - len(tail)
+        candidate = (head[:room] if len(head) > room else head) + tail
+        if candidate not in used and candidate not in reserved:
+            break
+        n += 1
+    if reserve:
+        reserved.add(candidate)
+    return candidate
+
+
+def minted_ref_names(doc, count: int) -> list:
+    """``count`` distinct ``_Ref`` names for a batch insert.
+
+    Use this instead of calling :func:`next_ref_name` in a loop when the names
+    are collected first and written afterwards: same underlying counter, with
+    the batch guarantee switched on so no two names can repeat.
+    """
+    return [_mint(doc, _REF_NUM, "_Ref", _REF_RESERVED_ATTR) for _ in range(count)]
 
 
 def next_ref_name(doc) -> str:
-    """A fresh ``_Ref<number>`` name, unique across the document.
+    """The next free ``_Ref<number>`` name, unique against what *doc* holds.
 
     The counter continues from the highest ``_Ref`` already present, so a
-    document that already carries Word-generated ones never collides with
-    them, and repeated runs keep marching upwards instead of reusing a name.
+    document that already carries Word-generated ones never collides with them,
+    and repeated runs keep marching upwards instead of reusing a name.
+
+    Deliberately *not* reserving: a name is only taken once it is in the
+    document, so asking twice without writing anything gets the same answer.
+    Call :func:`minted_ref_names` for the batch case.
+    """
+    return _mint(doc, _REF_NUM, "_Ref", _REF_RESERVED_ATTR, reserve=False)
+
+
+# ---- bookmark-name guards ---------------------------------------------------
+#
+# Measured on Word 16.0 and LibreOffice 26.8.2.2 (``work/T3-REPORT.md`` §3.1-§3.4):
+# all three defects below are **silent**, and none of them is visible in the XML
+# we write — the damage only appears after Word or LO saves the file, so the
+# check has to happen at generation time:
+#
+#   duplicates (§3.1)  Word *merges* them: ``ShowHidden`` reports 9 bookmarks for
+#                      10 starts and the surviving Start is the later one, so a
+#                      table-of-contents entry jumps to the wrong chapter.  LO
+#                      *renames* the second one to ``<name>_副本_1``, so every
+#                      ``PAGEREF`` written against the original name goes dead.
+#   spaces (§3.2)      both applications replace a space with ``_`` on save, so
+#                      ``REF _Ref图 1 \h`` is read as "REF _Ref图" plus a literal
+#                      1 and the field breaks.
+#   length (§3.3)      both truncate the name to 40 characters.
+#
+# The guard therefore lives here, next to the code that mints names.
+BOOKMARK_MAX_LEN = 40
+
+# Legal characters: **everything except the control characters Word itself
+# rejects**.  An allow-list of ``[A-Za-z0-9_]`` + CJK was tried first and was
+# wrong -- it rejected names Word accepts verbatim and resolves correctly.
+# Measured (Word 16.0, open + save + read back, then ``Fields.Update()`` on a
+# ``REF`` pointing at each): 21 of 22 sampled names survived byte-identical and
+# resolved, including ``图(1)``, ``图（1）``, ``图1：说明``, ``图[1]``, ``图【1】``,
+# ``第〇章``, full-width ``Ａ``, ``图·1``, ``图—1``, ``图+1``, ``图%1``,
+# ``图@1``, ``图#1``, ``图*1``, ``图♀1``, ``图°1``.  Only two classes really are
+# rewritten, and those are the two checks below:
+#   * whitespace is silently turned into ``_`` (T3 §3.2);
+#   * anything past 40 characters is silently truncated (T3 §3.3).
+# So the character test is a **black list** of control characters, which is what
+# ``ST_String`` actually forbids.  See work/REVIEW-ADVERSARIAL-R6.md 阻塞-1.
+_NAME_FORBIDDEN = frozenset(chr(c) for c in range(0x00, 0x20)) | {"\x7f"}
+_TOC_RESERVED_ATTR = "_docx_crossref_toc_reserved"
+
+
+def _bookmark_char_ok(ch: str) -> bool:
+    """True for characters Word keeps in a bookmark name.
+
+    Only control characters are rejected: everything printable (ASCII, CJK,
+    punctuation, full-width forms) survives a Word and a LibreOffice round trip
+    byte for byte, so treating it as illegal would block working names.
+    """
+    return ch not in _NAME_FORBIDDEN
+
+
+def validate_bookmark_name(name, *, max_len: int = BOOKMARK_MAX_LEN) -> list[str]:
+    """Return the problems that make *name* unsafe as a bookmark name.
+
+    An empty list means the name is safe.  Every problem reported here is one
+    that Word and/or LibreOffice fix up **silently** (``work/T3-REPORT.md``
+    §3.1-§3.3), which is why it has to be caught before the file is written:
+    the XML is accepted either way, and the broken ``REF``/``PAGEREF`` fields
+    only show up in the reader's hands.
+    """
+    if not isinstance(name, str):
+        return [f"name must be a string, got {type(name).__name__}"]
+    if not name:
+        return ["name is empty"]
+
+    problems: list[str] = []
+
+    bad_space = sorted({c for c in name if c.isspace()})
+    if bad_space:
+        shown = ", ".join(f"U+{ord(c):04X}" for c in bad_space)
+        problems.append(
+            f"name contains whitespace ({shown}); Word and LibreOffice both "
+            f"silently rewrite it to '_' on save (T3 §3.2)")
+
+    if len(name) > max_len:
+        problems.append(
+            f"name is {len(name)} characters, over the {max_len} limit; Word "
+            f"and LibreOffice both silently truncate to {max_len} (T3 §3.3)")
+
+    bad_chars = sorted({c for c in name
+                        if not c.isspace() and not _bookmark_char_ok(c)})
+    if bad_chars:
+        shown = ", ".join(
+            f"{c!r} (U+{ord(c):04X})" if c.isprintable() else f"U+{ord(c):04X}"
+            for c in bad_chars)
+        problems.append(
+            f"name contains control characters, which ST_String forbids: "
+            f"{shown}")
+
+    return problems
+
+
+def validate_bookmark_uniqueness(doc) -> dict:
+    """Count the bookmark names in *doc* and report any that repeat.
+
+    Duplicates are the one defect no XML audit can see: Word merges them on
+    open (the later Start wins, so a TOC entry jumps to the wrong chapter) and
+    LibreOffice renames the second one ``<name>_副本_1`` (so every field written
+    against the original name dies).  Both are silent — ``work/T3-REPORT.md``
+    §3.1 — so ``ok`` is False the moment any name repeats.
+
+    Returns ``{"duplicates": [...], "count": n, "unique": m, "ok": bool}``:
+    *count* counts every named ``bookmarkStart``, *unique* the distinct names.
+    """
+    seen: dict = {}
+    for b in doc.element.body.iter(qn("w:bookmarkStart")):
+        name = b.get(qn("w:name"))
+        if name:
+            seen[name] = seen.get(name, 0) + 1
+    duplicates = sorted(n for n, k in seen.items() if k > 1)
+    return {"duplicates": duplicates,
+            "count": sum(seen.values()),
+            "unique": len(seen),
+            "ok": not duplicates}
+
+
+def next_toc_name(doc, prefix: str = "_Toc") -> str:
+    """A fresh ``_Toc0001``-shaped bookmark name, padded to four digits.
+
+    The shape is what keeps a TOC anchor legal without further thinking: no
+    whitespace, ASCII only, and short enough for the 40-character cap that Word
+    and LibreOffice both impose (``work/T3-REPORT.md`` §3.2-§3.3) — and the
+    four-digit zero padding gives 9999 anchors that sort lexicographically,
+    which is handy when a TOC field lists them.
+
+    Names already present in *doc* are skipped, so a re-run never collides.
+    Names this function *handed out* but that have not been written into the
+    document yet are remembered on the document object and skipped too, so a
+    loop that mints a batch of names before inserting any of them cannot emit
+    the same name twice.
     """
     used = all_bookmarks(doc)
-    top = 0
-    for name in used:
-        m = _REF_NUM.match(name or "")
-        if m:
-            top = max(top, int(m.group(1)))
-    n = top + 1
-    while f"_Ref{n}" in used:
-        n += 1
-    return f"_Ref{n}"
+
+    reserved = getattr(doc, _TOC_RESERVED_ATTR, None)
+    if not isinstance(reserved, set):                      # first call, or a
+        reserved = set()                                   # reloaded document
+        try:
+            setattr(doc, _TOC_RESERVED_ATTR, reserved)
+        except Exception:                                  # pragma: no cover
+            reserved = set()
+
+    # A caller-supplied prefix has to be sanitised, not just checked: Word
+    # rewrites whitespace to ``_`` on save, so a name containing a space would
+    # change identity between the file we write and the file the reader opens,
+    # and any field written against the original string would die.  Control
+    # characters are replaced for the same reason (``ST_String`` forbids them).
+    head = "".join(
+        "_" if (c.isspace() or not _bookmark_char_ok(c)) else c
+        for c in (prefix or ""))
+    if not head:
+        head = "_Toc"
+
+    pattern = re.compile(re.escape(head) + r"(\d+)\Z")
+    return _mint(doc, pattern, head, _TOC_RESERVED_ATTR, pad=4)
 
 
 def set_paragraph_style(p, style_id: str):
@@ -931,7 +1150,23 @@ def check_crossref_anchors(doc) -> dict:
     *dangling* one is a silent defect: the cached result is all the reader ever
     sees and the click goes nowhere. Call this once the whole document exists.
 
-    Returns ``{"resolved": n, "missing": [...], "known": [...]}``.
+    Returns ``{"resolved": n, "targets": n, "missing": [...], "known": [...],
+    "invalid_names": [...], "duplicate_names": [...]}``.
+
+    ``invalid_names`` and ``duplicate_names`` are **hard failures**: both
+    describe defects Word and LibreOffice repair silently on save, so the
+    document looks fine in the XML yet opens with broken fields.  A caller
+    should treat a non-empty value of either as a build error, exactly as it
+    treats a non-empty ``missing`` — a duplicate name makes Word merge the two
+    bookmarks (a table-of-contents entry then jumps to the wrong chapter) and
+    makes LibreOffice rename the second one ``_副本_1`` (every ``PAGEREF``
+    against the original name dies); a name with a space gets its space turned
+    into ``_`` by both, and anything over 40 characters is truncated by both.
+    See ``work/T3-REPORT.md`` §3.1-§3.3.
+
+    ``invalid_names`` entries are ``{"name": ..., "problems": [...]}``, one per
+    offending bookmark *occurrence* (so the same bad name appearing twice is
+    reported twice), in document order.
     """
     body = doc.element.body
     names = all_bookmarks(doc)
@@ -944,10 +1179,22 @@ def check_crossref_anchors(doc) -> dict:
         anchor = h.get(qn("w:anchor"))
         if anchor:
             targets.append(anchor)
+
+    invalid_names: list[dict] = []
+    for b in body.iter(qn("w:bookmarkStart")):
+        name = b.get(qn("w:name"))
+        if not name:
+            continue
+        problems = validate_bookmark_name(name)
+        if problems:
+            invalid_names.append({"name": name, "problems": problems})
+
     missing = sorted({t for t in targets if t not in names})
     return {"resolved": sum(1 for t in targets if t in names),
             "targets": len(targets), "missing": missing,
-            "known": sorted(names)}
+            "known": sorted(names),
+            "invalid_names": invalid_names,
+            "duplicate_names": validate_bookmark_uniqueness(doc)["duplicates"]}
 
 
 def cmd_bookmark(doc, args) -> dict:

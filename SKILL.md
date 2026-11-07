@@ -86,6 +86,8 @@ round-trip that changes nothing produces an equivalent archive.
 | Insert a cross-reference | `python scripts/docx_crossref.py ref in.docx --index 70 --target 图_1 --prefix "如图" --suffix 所示` |
 | Refresh all field results | `python scripts/docx_crossref.py renumber in.docx -o out.docx` |
 | List bookmarks / fields | `python scripts/docx_crossref.py list in.docx` |
+| Write a static table of contents | `python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7` |
+| Measure the displayed page of paragraphs | `python tools/word_accept.py in.docx --page-probe 1,9,43 --json out.json` |
 
 ## Creating a document
 
@@ -103,7 +105,60 @@ round-trip that changes nothing produces an equivalent archive.
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold` |
 | `image` | `path`, optional `width_mm` |
 | `page_break` | — |
-| `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures |
+| `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures. **A field**: Word must update it (F9) before any entry exists |
+
+`styles[]` entries take `font`, `font_east_asia`, `size_pt`, `bold`, `italic`,
+`color`, `base`, and `outline_level` — the last one writes
+`<w:pPr><w:outlineLvl>` so Word treats the style as a heading. Without it a
+template's own `卷标题` / `ChapterTitle` is *body text* to Word no matter how it
+looks: the navigation pane is empty and `TOC \o` collects nothing.
+
+```json
+{"styles": [
+  {"name": "卷标题", "base": "Normal", "font": "黑体", "size_pt": 16,
+   "bold": true, "outline_level": 1}
+]}
+```
+
+`outline_level` is 1-based (`1` → `w:outlineLvl val="0"`). `0` means "explicitly
+body text" (`val="9"`), for a style that must never be collected.
+
+## A static table of contents
+
+`toc` above is a **field**: the entries do not exist until someone presses F9,
+and a hand-written cache inside the field is discarded the moment they do. When
+the file must be right on open — a deliverable, a PDF conversion, a diff — write
+the entries as real paragraphs with `scripts/docx_toc.py` instead.
+
+```
+python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
+```
+
+```python
+import docx_toc as toc
+report = toc.build_static_toc(doc, levels=(1, 2, 3), pages=["1", "3", "7"],
+                              title="目　录")
+# report: entries / levels / styles / tab_pos_mm / tab_pos_source
+#         dropped_entries / dropped_titles / adopted / section_index / inserted_at
+```
+
+Each entry is `title<TAB>page` in style `toc 1/2/3`, with a right tab stop at the
+text-block width and a dot leader. The width comes from
+`docx_create.content_width_mm(section)` — never hard-code it, because the six
+test volumes genuinely differ (170 mm vs 160 mm).
+
+**Page numbers have to be measured, not guessed.** `pages=None` leaves the slot
+empty; fill it from `word_accept.py --page-probe`, which reports
+`paragraph_pages[].displayed_text` — the number the reader sees, taken from
+`Information(WD_ACTIVE_END_ADJUSTED_PAGE)`. That is *not* the physical page
+order: a `lowerRoman start=1` section prints `i` on what is physically page 8.
+See `references/toc.md` for the two-pass recipe and the full trap list.
+
+Rebuilding is safe and idempotent: every entry carries a `_DocxTocEntry…`
+bookmark, and `drop_existing_toc` removes only what *this module* wrote — a
+table of contents the user brought along with the built-in `toc 1` style is left
+alone unless `adopt_unmarked=True` is passed.
+
 
 `numbered_list` really numbers now. The previous version applied Word's
 `List Number` *style*, which carries no `numPr`, so the paragraphs rendered with
@@ -142,6 +197,7 @@ Two scripts own these features:
 
 - `docx_numbering.py` — `list` / `define` / `apply` / `detach` / `restart`
 - `docx_crossref.py` — `caption` / `ref` / `bookmark` / `renumber` / `list`
+- `docx_toc.py` — static TOC: `build_static_toc` / `collect_outline` / `drop_existing_toc`
 
 Word numbering is a two-level indirection that no other script here exposed:
 `<w:abstractNum>` defines the format (``lvlText`` like `[%1]`), `<w:num>` is a

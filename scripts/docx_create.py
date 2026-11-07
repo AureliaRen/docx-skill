@@ -13,7 +13,8 @@ Spec (JSON object):
   "footer": "text shown in page footer",
   "footer_page_numbers": true,
   "styles": [{"name": "MyStyle", "base": "Normal", "font": "Arial",
-              "size_pt": 12, "bold": true, "color": "1F4E79"}],
+              "size_pt": 12, "bold": true, "color": "1F4E79",
+              "outline_level": 2}],
   "blocks": [
     {"type": "heading", "text": "Title", "level": 1},
     {"type": "paragraph", "style": "MyStyle", "runs": [
@@ -61,6 +62,18 @@ Paragraph format keys — accepted by every block that produces paragraphs
 
 ``numbered_list`` additionally takes ``bookmark_prefix`` — item *k* gets the
 bookmark ``<prefix><k>``, which is what a body reference points at.
+
+``styles[]`` entries take ``outline_level`` (1-based, ``1``..``9``) — it writes
+``<w:pPr><w:outlineLvl w:val="level-1"/>`` on the *style*, which is what makes a
+template's own ``卷标题`` behave like ``Heading 1`` for the navigation pane and
+the TOC field.  ``outline_level: 0`` writes Word's body-text marker ``9``
+(explicitly *not* collected), and omitting the key writes nothing.
+``docx_read.heading_level`` reads the same number back.
+
+``ensure_toc_styles(doc)`` defines Word's built-in ``toc 1/2/3`` (based on
+``Normal``, 1.5-line spacing, per-level character indent); ``content_width_mm(
+section)`` is the text-block width, which is where a right-aligned TOC tab stop
+belongs.
 
 ``crossref`` passes ``superscript`` (bool), ``vert_align``
 (``normal``/``superscript``/``subscript``) and ``hyperlink`` (bool, default
@@ -171,6 +184,29 @@ def apply_page(doc, page: dict) -> None:
     apply_page_to_section(doc.sections[0], page)
 
 
+def content_width_mm(section) -> float:
+    """Text-block ("type area") width of *section*, in millimetres.
+
+    A right-aligned tab stop for a TOC page number has to sit exactly on the
+    right edge of the text block.  That edge is ``page width - left - right``,
+    and **not** a house number: the maths volume is A4 with 20 mm margins
+    (170 mm) while the other five are A4 with 30/20 (160 mm).  Hard-coding
+    either value misplaces every dotted leader on the other page geometry.
+
+    Margins are stored in twips, so a 20 mm margin reads back as 20.0015 mm;
+    the result is rounded to 0.01 mm because nobody — and no layout engine —
+    distinguishes 170.0036 from 170.00.
+    """
+    width = section.page_width
+    if width is None:
+        raise ValueError("section has no page width; set page_size/page width")
+    total = float(width.mm)
+    for margin in (section.left_margin, section.right_margin):
+        if margin is not None:
+            total -= float(margin.mm)
+    return round(total, 2)
+
+
 def _set_style_fonts(style, latin: str, east_asia: str | None) -> None:
     """Bind latin / CJK font slots in one ``w:rFonts``.
 
@@ -198,6 +234,67 @@ def _set_style_fonts(style, latin: str, east_asia: str | None) -> None:
         rf.set(qn("w:" + attr), value)
 
 
+# A paragraph's outline level is what Word's "Heading 1..9" styles carry and
+# what the navigation pane / TOC field collect.  A template's own ``卷标题``
+# would otherwise be plain text to Word: the document looks right and the TOC
+# comes out empty, with nothing in the XML to show why.  ``w:outlineLvl`` is
+# **0-based** (built-in Heading 1 stores ``val="0"``) while a spec author counts
+# from 1, so the mapping happens once, here.
+OUTLINE_BODY_VAL = "9"          # Word's own "not an outline level" marker
+
+
+def _outline_lvl_val(outline_level) -> str:
+    """``outline_level`` spec value → ``w:outlineLvl/@w:val``.
+
+    ``1``..``9`` are 1-based outline levels (level 1 → ``"0"``).  ``0`` is the
+    explicit *body text* level: Word writes ``9`` for "Body Text" and
+    ``docx_read.heading_level`` maps 9+ back to ``None``, so ``0`` is how a
+    spec says "this style must never be collected", which is different from
+    omitting the key.
+    """
+    try:
+        level = int(outline_level)
+    except (TypeError, ValueError):
+        raise ValueError("outline_level must be an int 0..9, got %r"
+                         % (outline_level,))
+    if isinstance(outline_level, float) and outline_level != level:
+        raise ValueError("outline_level must be a whole number, got %r"
+                         % (outline_level,))
+    if isinstance(outline_level, str):
+        raise ValueError("outline_level must be numeric, got %r"
+                         % (outline_level,))
+    if level == 0:
+        return OUTLINE_BODY_VAL
+    if 1 <= level <= 9:
+        return str(level - 1)
+    raise ValueError("outline_level out of range: %r (0 = body, 1..9 = level)"
+                     % (outline_level,))
+
+
+def _apply_style_outline_level(style, outline_level) -> str:
+    """Write ``<w:pPr><w:outlineLvl w:val="…"/>`` on a *style*, schema-ordered.
+
+    ``CT_PPr`` is an ``xsd:sequence``: ``outlineLvl`` sits after
+    ``jc``/``textDirection``/``textAlignment``/``textboxTightWrap`` and before
+    ``divId``.  Appending it at the end of ``w:pPr`` — the obvious thing to do
+    — puts it after ``rPr``/``sectPr``, where **Word silently drops it**, and
+    the style then looks correct in the XML while behaving as body text.  The
+    successor chain below is the same one :func:`_apply_bottom_border` uses for
+    the predecessor side of that sequence.
+    """
+    val = _outline_lvl_val(outline_level)
+    pPr = style.element.get_or_add_pPr()
+    existing = pPr.find(qn("w:outlineLvl"))
+    if existing is not None:
+        existing.set(qn("w:val"), val)
+        return val
+    el = OxmlElement("w:outlineLvl")
+    el.set(qn("w:val"), val)
+    pPr.insert_element_before(el, "w:divId", "w:cnfStyle", "w:rPr",
+                              "w:sectPr", "w:pPrChange")
+    return val
+
+
 def add_styles(doc, styles: list) -> None:
     for s in styles:
         style = doc.styles.add_style(s["name"], WD_STYLE_TYPE.PARAGRAPH)
@@ -218,6 +315,118 @@ def add_styles(doc, styles: list) -> None:
             font.italic = s["italic"]
         if s.get("color"):
             font.color.rgb = RGBColor.from_string(s["color"])
+        # ``0`` is meaningful (explicit body level), so this is ``is not None``
+        # rather than a truthiness test.
+        if s.get("outline_level") is not None:
+            _apply_style_outline_level(style, s["outline_level"])
+
+
+# Word ships ``toc 1``..``toc 9`` as *built-in* styles.  A document created by
+# python-docx does not contain them until something asks, and Word's "Update
+# field" then formats the generated lines with whatever latent definition it
+# has — which on a Chinese template is not the 1.5-line, indented look the
+# volume wants.  Defining them up front puts the look in the file itself.
+TOC_STYLE_PREFIX = "toc "
+TOC_UI_PRIORITY = 39            # same value Word uses for the built-in family
+TOC_LINE_TWIPS = 360            # 1.5 lines, ``w:spacing/@w:line``
+TOC_LINE_RULE = "auto"
+
+
+def _toc_indent_for(level: int, indent_chars) -> float:
+    """``indent_chars[level - 1]``, tolerant of a short tuple and of ``None``."""
+    if not indent_chars:
+        return 0.0
+    index = max(int(level) - 1, 0)
+    if index >= len(indent_chars):
+        index = len(indent_chars) - 1
+    value = indent_chars[index]
+    return 0.0 if value is None else float(value)
+
+
+def ensure_toc_styles(doc, levels=(1, 2, 3),
+                      indent_chars=(0, 2, 4)) -> dict:
+    """Create — or complete — Word's built-in ``toc 1/2/3`` paragraph styles.
+
+    ``docx_toc`` only needs the *id* so Word recognises the family; a printed
+    volume needs the whole definition: based on ``Normal`` (so the template's
+    body font and size flow through), ``next = Normal`` (pressing Enter at the
+    end of a TOC line starts body text, not another TOC line), Word's
+    ``uiPriority`` 39 plus ``unhideWhenUsed``/``qFormat`` so the styles behave
+    like the built-ins in the gallery, and a per-level left indent written as
+    **both** ``w:left`` (twips) and ``w:leftChars`` (what the ruler shows and
+    what survives a font-size change).
+
+    The indents follow the reference volume: level 1 flush, level 2 = 2
+    characters, level 3 = 4 characters — i.e. ``toc 2`` gets
+    ``leftChars="200"`` and ``toc 3`` ``leftChars="400"``.
+
+    Idempotent by construction: ``Styles.add_style`` raises on a name that
+    already exists, so an existing style is *updated in place* instead.  That
+    also means a document that already carries Word's own ``toc 1`` (a
+    template, or a second call) keeps its identity — no duplicate style, no
+    second ``w:style`` with the same name, which Word reports as a broken file.
+
+    Returns a report dict (``levels``/``styles``/``style_ids``/
+    ``indent_chars``/``created``/``updated``).
+    """
+    report = {"levels": [], "styles": [], "style_ids": [],
+              "indent_chars": [], "created": [], "updated": []}
+    normal = None
+    try:
+        normal = doc.styles["Normal"]
+    except KeyError:
+        pass
+
+    for level in levels:
+        level = int(level)
+        if level < 1:
+            raise ValueError("toc level must be >= 1, got %r" % (level,))
+        name = TOC_STYLE_PREFIX + str(level)
+        chars = _toc_indent_for(level, indent_chars)
+
+        try:
+            style = doc.styles[name]
+            created = False
+        except KeyError:
+            style = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+            created = True
+
+        element = style.element
+        # `toc1`/`toc2`/`toc3` and no `w:customStyle`: python-docx mints
+        # ``customStyle="1"`` for every style it adds, and Word then shows the
+        # TOC lines as a custom style rather than as its own.
+        element.set(qn("w:styleId"), "toc%d" % level)
+        custom = qn("w:customStyle")
+        if element.get(custom) is not None:
+            del element.attrib[custom]
+
+        if normal is not None:
+            style.base_style = normal
+            style.next_paragraph_style = normal
+
+        element.get_or_add_uiPriority().val = TOC_UI_PRIORITY
+        element.get_or_add_unhideWhenUsed()
+        element.get_or_add_qFormat()
+
+        pf = style.paragraph_format
+        pf.line_spacing = TOC_LINE_TWIPS / 240.0
+        pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+        # Word measures a "character" at the run's own point size; use the
+        # document-wide body default so the twips twin and the Chars twin stay
+        # consistent (a mismatch is what makes Word "repair" the indent).
+        twips = int(round(chars * DEFAULT_CHAR_PT * 20))
+        pf.left_indent = Twips(twips)
+        pPr = element.get_or_add_pPr()
+        ind = pPr.find(qn("w:ind"))
+        if ind is not None:
+            ind.set(qn("w:leftChars"), str(int(round(chars * 100))))
+
+        report["levels"].append(level)
+        report["styles"].append(name)
+        report["style_ids"].append("toc%d" % level)
+        report["indent_chars"].append(chars)
+        (report["created"] if created else report["updated"]).append(name)
+    return report
 
 
 # Word's built-in ``caption`` style ships with ``<w:color w:val="4F81BD"
@@ -889,6 +1098,22 @@ def main() -> int:
                           "error": "dangling cross-reference targets",
                           "missing": dangling["missing"],
                           "known_bookmarks": dangling["known"][:12]},
+                         ensure_ascii=False))
+        return 1
+    if dangling["invalid_names"] or dangling["duplicate_names"]:
+        # Word merges duplicate bookmarks -- the survivor is the *later* one, so
+        # a table-of-contents entry jumps to the wrong chapter while the layout
+        # still looks right.  LibreOffice instead renames the second one
+        # (``_副本_1``), which kills every PAGEREF that used the original name.
+        # Both applications also rewrite a space in a bookmark name to ``_`` and
+        # truncate past 40 characters, identically.  All of these are silent:
+        # the XML layer looks fine and no application reports anything, so the
+        # only place to catch them is here, before the file is written.
+        # Measured evidence: work/T3-REPORT.md sections 3.1-3.3.
+        print(json.dumps({"ok": False, "output": None,
+                          "error": "invalid or duplicate bookmark names",
+                          "invalid_names": dangling["invalid_names"],
+                          "duplicate_names": dangling["duplicate_names"]},
                          ensure_ascii=False))
         return 1
     doc.save(args.output)
