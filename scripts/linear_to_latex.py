@@ -117,8 +117,22 @@ UNIT_RE = re.compile(
 )
 
 # 幂次后面的单位（10^{-6}F、3.0×10^{8} m/s）：前面是脚本 }} 但内容是数字，仍算单位
+#
+# ★ 两种拼写必须给出同一个结果，否则 `3×10⁸m/s` 与 `3×10^{8}m/s` 会分叉：
+#   * 花括号形态 `^{8}` —— 文档里本来就写成 LaTeX 的；
+#   * **字面 Unicode 上标** `⁸` / `⁻⁷` —— agent 直接从物理题里拷出来的常见形态。
+#   `_unitify` 跑在 `_escape_unicode` **之前**，所以此刻源串里还是字面形态；
+#   只认 `^{n}` 会让字面写法漏掉这一步，单位被当变量排出斜体（`10^{8}s` 而非
+#   `10^{8}\,\text{s}`）。这正是 R4 §3.2「幂次后单位」修复只修一半的残留。
+#   字面字符类只收**数字**（⁰¹²³⁴⁵⁶⁷⁸⁹）：`⁺`/`⁻` 本身不是数值锚点。
+#   ★ 从 `_SUPER` **派生**而不是手抄（REVIEW-CODE-R5 F-2）：下面 `_ANCHOR_RE`
+#   用的是同一份 `_SUPER_DIGITS`。手抄两份的话，将来 `_SUPER` 增删数字键时
+#   幂次锚点与单位锚点会静默分叉 —— 两个判据给出不同结果，正是本轮 parity
+#   修复要消灭的那类缺陷。`_SUPER` 定义在本文件更上方（MATH_EXTRA 之前）。
+_SUPER_DIGITS = "".join(c for c in _SUPER if _SUPER[c].isdigit())
 POW_UNIT_RE = re.compile(
-    rf"(\^\{{[-\u2212+]?\d+\}})\s*((?:{_UNIT_ALT})(?:\s*[·⋅]\s*(?:{_UNIT_ALT}))*)"
+    rf"(\^\{{[-\u2212+]?\d+\}}|[{re.escape(_SUPER_DIGITS)}]+)"
+    rf"\s*((?:{_UNIT_ALT})(?:\s*[·⋅]\s*(?:{_UNIT_ALT}))*)"
     rf"(?![_^{{A-Za-z0-9])"
 )
 
@@ -242,6 +256,12 @@ def _sym_tex(sym: str) -> str:
 _BOTH_SIDES = re.compile(
     r"[^\s=≈≤≥≠∝±<>]\s*[=≈≤≥≠∝±<>]\s*[−+\-]?\s*[^\s=≈≤≥≠∝±<>]")
 
+# 作者**显式**写的角标组：`S_{甲}` / `x^{乙}` / `m^{2}`。
+# 这是「手动编辑等价物」——作者标注了才转，一个字符都不猜，所以误报恒为 0。
+# 只认**带花括号**的写法（LaTeX 的标准形态，能容纳任意字符，含空格与标点）；
+# 不带括号的 `x^2` 不在此列：它在正文里出现时意图不够明确。
+_EXPLICIT_SCRIPT_RE = re.compile(r"[\^_]\{")
+
 # 片段两端要裁掉的悬空运算符（箭头也算：手册里 "… → 下一步" 很常见）
 _TRAIL_OP = "=+−-×÷·/,;<>≈≤≥≠∝±∓→←⇒"
 
@@ -298,6 +318,36 @@ def is_math_char(ch: str) -> bool:
     return (0x2190 <= cp <= 0x22ff) or (0x2a00 <= cp <= 0x2aff) or (0x1d400 <= cp <= 0x1d7ff)
 
 
+# 显式角标组的内容上限与硬停字符。`S_{甲}` 里 `甲` 不是数学字符，但它属于
+# 角标内容（任意字符都合法）；上限与句末标点只用于给**未闭合**的括号兜底，
+# 防止一个手滑的 `_{` 把整段吞成公式。
+# ⚠️ 口径（REVIEW-CODE-R5 K-2，别再写错）：判定是 `inside <= _EXPLICIT_SCRIPT_MAX`
+# 且 inside 从 0 起数，所以组内实际**最多放行 25 个字符**（第 26 字起截断）。
+# 超过上限被截断的 span 因 A-1 的平衡检查整段退回纯文本 —— 不丢字、不误排，
+# 作者看到角标没渲染会发现内容太长或漏了 `}`。
+_EXPLICIT_SCRIPT_MAX = 24
+_SCRIPT_GROUP_STOP = set("。！？；\n\r\t")
+
+
+def _open_script_group_len(sofar: str) -> int:
+    r"""``sofar`` 停在未闭合的显式角标组里时，返回**组内已积累的字符数**。
+
+    只认紧跟在 ``^`` / ``_`` 之后的 ``{``（``S_{甲}``）；其余花括号 ——
+    ``\text{…}``、``\begin{…}``、普通分组 —— 各自由别处保护，不计入。
+    返回 ``-1`` 表示当前不在任何显式角标组内。
+    """
+    stack: list[tuple[bool, int]] = []          # (是否由 ^/_ 开启, 内容起点)
+    for i, ch in enumerate(sofar):
+        if ch == "{":
+            stack.append((i > 0 and sofar[i - 1] in "^_", i + 1))
+        elif ch == "}" and stack:
+            stack.pop()
+    for opened_by_script, start in reversed(stack):
+        if opened_by_script:
+            return len(sofar) - start
+    return -1
+
+
 def _looks_like_date(s: str) -> bool:
     return bool(re.fullmatch(r"[\d\-./\s]+", s))
 
@@ -325,6 +375,13 @@ def find_math_spans(atoms: list[dict]) -> list[tuple[int, int]]:
             if sofar.count("\\begin{") > sofar.count("\\end{"):
                 j += 1
                 continue
+            # 作者显式写的角标组未闭合时同样不截断：`S_{甲}` / `x^{乙}` 的
+            # 角标内容本就是任意字符（含汉字），不该在这里被切成正文。
+            # 上限与句末标点是给**手滑漏写 `}`** 的兜底，不是给正常用法的限制。
+            inside = _open_script_group_len(sofar)
+            if 0 <= inside <= _EXPLICIT_SCRIPT_MAX and atoms[j]["ch"] not in _SCRIPT_GROUP_STOP:
+                j += 1
+                continue
             break
         s, e = i, j
         # 裁掉两端空白与悬空运算符
@@ -336,12 +393,25 @@ def find_math_spans(atoms: list[dict]) -> list[tuple[int, int]]:
         has_op = any(c in OP_CHARS for c in text)
         has_strong = any(c in STRONG for c in text)
         alnum = sum(1 for c in text if c.isalnum() or c in GREEK)
+        # 显式角标标注（`S_{甲}` / `m^{2}`）本身就是「这是公式」的充分信号：
+        # 它是作者的主动声明，不是我们的猜测 —— 所以它不必再靠关系符论证。
+        # 这是「手动编辑等价物」路线能落地的一环，也是自动猜路线永远做不到的。
+        explicit_script = bool(_EXPLICIT_SCRIPT_RE.search(text))
+        # ★ span 文本自身不得停在未闭合的显式角标组内（REVIEW-CODE-R5 A-1）。
+        #   未闭合 = 漏写 `}` 的笔误，或角标内容超过豁免上限被截断。这种 span
+        #   若放行，下游 latex2mathml 会**自动补闭括号**：`_{` 两字符被吃进公式
+        #   结构（document.xml 里消失）、其后 ≤25 字正文被排成巨型下角标 ——
+        #   丢字 + 语义错排，比基线（整段纯文本）还差。所以整段退回纯文本，
+        #   作者看到角标没渲染自然会发现漏了 `}`。
+        #   合法的 `S_{甲}` 组已闭合，`_open_script_group_len` 返回 -1，不受影响。
+        script_group_balanced = _open_script_group_len(text) == -1
         ok = (
             len(text) >= 2
             and not _looks_like_date(text)
             and alnum >= 1
-            and (has_op or has_strong)
-            and bool(_BOTH_SIDES.search(text))
+            and (has_op or has_strong or explicit_script)
+            and (bool(_BOTH_SIDES.search(text)) or explicit_script)
+            and script_group_balanced
             # 纯数字 + 单位（如 6V、2Ω）不转
             and not re.fullmatch(r"[\d.]+\s*[A-Za-zΩμ]+", text)
         )
@@ -838,7 +908,7 @@ def _parse_unit_group(s: str, i: int, sep: str = _UNIT_SEP) -> tuple[int, str, b
 # 是字母上标，同样不是数值。`10⁻⁷` 里 `⁻` 后面还跟着 `⁷`，run 从 `⁷` 起算即可。
 # 第 1 组捕获「数字与量纲串之间的空白」——这段空白要一起吃掉，
 # 否则 `8.31 J/(mol·K)` 会留下一个旧实现没有的空格（既有用例锁的是无空格形态）。
-_SUPER_DIGITS = "".join(c for c in _SUPER if _SUPER[c].isdigit())
+# `_SUPER_DIGITS` 已在文件上方（`POW_UNIT_RE` 旁）从 `_SUPER` 派生，两处共用一份。
 _ANCHOR_RE = re.compile(
     r"(?:\)|\^\{\s*[-\u2212+]?\d+\s*\}|[" + re.escape(_SUPER_DIGITS) + r"]+|\d)(\s*)$")
 # 量纲串尾部不能紧跟这些字符（否则只是更长 token 的一段）
