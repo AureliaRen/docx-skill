@@ -30,17 +30,45 @@ contract keys are **always present and populated**: when Word did not run they
 fall back to the XML value, and ``sources`` records which layer each number
 came from.  A consumer never has to guard for a missing key.
 
+Page numbers: displayed vs physical vs computed
+-----------------------------------------------
+Two numbers exist for every page and they are not interchangeable:
+
+* ``WD_ACTIVE_END_PAGE`` (3) — the **physical** sheet ordinal, 1-based from the
+  start of the document, ignoring every ``w:pgNumType`` restart and format.
+* ``WD_ACTIVE_END_ADJUSTED_PAGE`` (1) — the number **printed** on the page, i.e.
+  what ``w:pgNumType`` adjusted the counter to.  Turn it into a glyph with
+  :func:`page_glyph`, which delegates to ``scripts/docx_section.cached_page``
+  so the counter alphabets live in exactly one place.
+
+Measured on ``work/subjects/math/paper.docx`` (5 sections, the last one
+``lowerRoman start=1``): physical page 7 carries the printed number 2, physical
+page 8 carries ``i``, and the exported PDF's footer band reads ``- i -`` on that
+page.  Reporting "page 7" and "i" as the same thing is wrong in both directions,
+so every page-number statement carries its source.
+
+``computed`` is a third, weaker source and the rule around it is absolute:
+**computed 不得当作交付页码**.  :func:`estimated_paragraph_pages` fills
+``paragraph_pages`` when Word is absent or was not asked, but those rows come
+from ``w:pgNumType`` plus the section's paragraph span alone — they know which
+section a paragraph belongs to, never where it falls on a page, and they inherit
+the XML index space, which drifts from Word's by one paragraph per table row.
+Every such row is stamped ``exact: false`` / ``source: "computed"`` and the
+report repeats it in ``warnings``.
+
 Contract
 --------
 ::
 
     python tools/word_accept.py <in.docx> [--pdf OUT.pdf] [--png DIR]
         [--json OUT.json] [--expect-sections N] [--expect-bookmarks N]
-        [--expect-params N]
+        [--expect-params N] [--page-probe I[,J,...]]
 
     --expect-params N        asserted ``paragraphs`` (alias of
                              ``--expect-paragraphs``)
     --word auto|on|off       default ``auto`` = use Word when it is there
+    --page-probe 1,9,43      Word paragraph indices (1-based) whose page numbers
+                             to read; two COM round trips each, hence opt-in
 
 Exit codes: 0 success or skipped, 1 ``ok: false``, 2 usage error.
 Everything a human should read (summary, errors) goes to stderr, so stdout is
@@ -109,6 +137,12 @@ SCRIPT_PROBE_BUDGET = 400
 
 # Word constants
 WD_STAT_PAGES = 2
+# ``wdActiveEndAdjustedPageNumber`` — the number *printed* on the page, i.e. the
+# value the page counter has been adjusted to by ``w:pgNumType``.  A page shown
+# as ``iii`` reports 3 here, not 3-as-in-third-sheet.
+WD_ACTIVE_END_ADJUSTED_PAGE = 1
+# ``wdActiveEndPageNumber`` — the physical sheet ordinal, 1-based from the start
+# of the document, ignoring every ``w:pgNumType`` restart and format.
 WD_ACTIVE_END_PAGE = 3
 WD_EXPORT_FORMAT_PDF = 17
 # Footer index: 1 primary, 2 first page, 3 even pages
@@ -312,7 +346,30 @@ def _field_entries(root, limit: int):
     return count, entries[:limit]
 
 
-_TOC_NUM_RE = re.compile(r"[\t. ]([0-9]{1,4}|[ivxlcdm]{1,6})\s*$")
+# The trailing page number of a TOC line.  Three families, because a document
+# may number its sections with any of them:
+#
+#   digits        ``15``
+#   Roman         ``iv``, ``xii``   (a subset of the letters below)
+#   letters       ``a``, ``b``, ``aa``  — an appendix numbered ``lowerLetter``
+#
+# The letter branch has to exist: without it every entry of a Latin-numbered
+# appendix was reported as "no page number at all", i.e. a correct TOC was
+# labelled broken 8 times over and its tokens were dropped from the sequence
+# (work/REVIEW-ADVERSARIAL-R6.md 阻塞-2).  A single letter is *also* a valid
+# Roman numeral (``i``, ``v``, ``x``, ``l``, ``c``, ``d``, ``m``), so the family
+# is decided later, by ``_token_number`` with the section's own ``fmt`` and by
+# ``_family`` for the run splitting — not here, where nothing else is known.
+#
+# The separator matters as much as the value.  A TOC line is *title + tab +
+# number*; when the number has not been filled in yet the line ends with the
+# tab, and a pattern that also accepted a plain space would read the last word
+# of the title as the page number -- ``节 0<TAB>`` reported page ``0``, and
+# ``第一章 概述<TAB>`` reported nothing but ``第 5 章 概述`` would report ``5``.
+# So the tab form is tried first and a space/dot form is only a fallback for
+# producers that write no tab at all.
+_TOC_NUM_AFTER_TAB_RE = re.compile(r"(?:[0-9]{1,4}|[A-Za-z]{1,6})")
+_TOC_NUM_LOOSE_RE = re.compile(r"[. ]([0-9]{1,4}|[A-Za-z]{1,6})\s*$")
 _TOC_STYLE_RE = re.compile(r"^(toc|目录|contents)", re.IGNORECASE)
 # A caption paragraph style, in the many names it is spelled with: Word's
 # built-in "caption", the demo template's "图表名", and the Chinese "题注".
@@ -320,12 +377,537 @@ _CAPTION_STYLE_RE = re.compile(r"(caption|图表名|题注|图名|表名)", re.I
 
 
 def _toc_token(text: str):
-    """Trailing page number of a table-of-contents entry, or ``None``."""
-    t = (text or "").replace("\u00a0", " ").rstrip()
+    """Trailing page number of a table-of-contents entry, or ``None``.
+
+    A tab is the entry/number separator in every producer seen so far, and its
+    presence is authoritative: if the line has a tab, the page number is what
+    follows the **last** tab and nothing before it counts.  Only a line with no
+    tab at all falls back to the looser space/dot reading, so a title that ends
+    in a digit cannot masquerade as a page number.
+
+    The tab test is made on the *raw* text: stripping first would remove a
+    trailing tab -- exactly the marker that says "the number has not been filled
+    in yet" -- and hand a title like ``附录 A<TAB>`` to the loose pattern, which
+    then reported ``A`` as the page number.
+    """
+    raw = (text or "").replace("\u00a0", " ")
+    if not raw.strip():
+        return None
+    if "\t" in raw:
+        tail = raw.rsplit("\t", 1)[1].strip()
+        if tail and _TOC_NUM_AFTER_TAB_RE.fullmatch(tail):
+            return tail
+        return None
+    m = _TOC_NUM_LOOSE_RE.search(raw.rstrip())
+    return m.group(1) if m else None
+
+
+# Word's built-in TOC paragraph styles are named ``toc 1``, ``toc 2``, … (and
+# ``TOC1``/``Toc 2`` in documents written by other producers).  Only these carry
+# a *level*; ``table of figures`` and the Chinese ``目录`` style are TOC-ish but
+# not levelled, so they are audited separately (``_TOC_STYLE_RE``).
+_TOC_LEVEL_RE = re.compile(r"toc\s*([0-9])", re.IGNORECASE)
+
+_ROMAN_VALUE = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+
+# Paragraph-page probing is opt-in because it costs COM round trips: a probe
+# that asks for 300 paragraphs is 900 RPCs, which is how the automation channel
+# starts answering ``被呼叫方拒绝接收呼叫``.  Callers pass the handful of
+# paragraphs they actually hand to a reader (TOC targets, section heads).
+PAGE_PROBE_BUDGET = 60
+
+# ``scripts/docx_section`` is imported lazily and never fatally: the tool must
+# keep working when that module is mid-edit, missing, or fails to import (its
+# own dependencies are python-docx / lxml, neither of which the XML layer
+# otherwise needs).
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+_SECTION_MOD = {"mod": None, "tried": False}
+
+
+def _section_module():
+    """``scripts/docx_section`` as a module, or ``None``.  Imported once."""
+    if _SECTION_MOD["tried"]:
+        return _SECTION_MOD["mod"]
+    _SECTION_MOD["tried"] = True
+    mod = None
+    try:
+        here = str(_SCRIPTS_DIR)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import docx_section as mod      # local import by design; see above
+    except Exception:
+        mod = None
+    _SECTION_MOD["mod"] = mod
+    return mod
+
+
+def page_glyph(fmt, n):
+    """The glyph a reader sees for page number ``n`` under ``w:pgNumType/@fmt``.
+
+    ``3`` + ``lowerRoman`` -> ``"iii"``; ``None``/``decimal`` -> ``"3"``.  The
+    counter alphabets live in exactly one place — ``docx_section.cached_page`` —
+    so this delegates instead of growing a second copy; if that module cannot be
+    imported the number is passed through as text, which is lossy but honest.
+    """
+    try:
+        num = int(n)
+    except (TypeError, ValueError):
+        return "" if n is None else str(n)
+    mod = _section_module()
+    if mod is not None:
+        try:
+            return str(mod.cached_page(fmt, num))
+        except Exception:
+            pass
+    return str(num)
+
+
+def _token_number(tok, fmt=None):
+    """``"iii"`` -> 3, ``"12"`` -> 12, anything unparseable -> ``None``.
+
+    ``fmt`` is the enclosing section's ``w:pgNumType/@fmt``.  It matters: the
+    same token means different numbers under different counters.  ``"c"`` is 3
+    under ``lowerLetter`` (a, b, c) and 100 under ``lowerRoman`` (c = 100);
+    ``"i"`` is 9 under ``lowerLetter`` and 1 under ``lowerRoman``.  Guessing
+    Roman for every alphabetic token silently misnumbers a Latin appendix and
+    makes an increasing TOC look like it goes backwards -- see
+    work/REVIEW-ADVERSARIAL-R6.md 阻塞-2.
+
+    Only the counter families whose alphabet can collide are disambiguated;
+    anything else falls back to the old digit-then-Roman reading.
+    """
+    if tok is None:
+        return None
+    t = str(tok).strip()
     if not t:
         return None
-    m = _TOC_NUM_RE.search(t)
-    return m.group(1) if m else None
+    if t.isdigit():
+        return int(t)
+
+    low = t.lower()
+
+    # A section that says "letters" means letters, full stop.  ``lowerLetter``
+    # continues a, b, ..., z, aa, ab -- so a multi-character token is only
+    # valid there when every character is a Latin letter, which is also true of
+    # ``iii``; the caller's fmt is the tie-breaker and is trusted.
+    if fmt in ("lowerLetter", "upperLetter"):
+        if low.isalpha() and low.isascii():
+            total = 0
+            for ch in low:
+                total = total * 26 + (ord(ch) - ord("a") + 1)
+            return total
+        return None
+
+    if fmt in ("decimalFullWidth", "decimalEnclosedCircle", "decimalEnclosedCircleChinese",
+               "ideographDigital", "chineseCounting", "chineseCountingThousand",
+               "chineseLegalSimplified", "japaneseCounting", "taiwaneseCounting"):
+        # These all render a digit string in another glyph set; the trailing
+        # token was matched as digits already when the document is well formed.
+        # A non-digit token means the reader sees something we cannot invert.
+        return None
+
+    if low == "0":
+        return 0
+    if not all(ch in _ROMAN_VALUE for ch in low):
+        return None
+    total = 0
+    prev = 0
+    for ch in reversed(low):
+        val = _ROMAN_VALUE[ch]
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total
+
+
+def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
+               section_of=None, section_specs=None) -> dict:
+    """What the table of contents looks like from the bytes alone.
+
+    Two sets of paragraphs matter, and they are counted separately because they
+    are not the same set:
+
+    * **levelled entries** — resolved style name matches ``^toc\\s*\\d``
+      (``toc 1``, ``toc 2``, ``TOC1``).  ``entries`` / ``styles`` / ``levels``
+      describe these.  Resolution is required: the XML stores
+      ``w:pStyle w:val="9"``, so matching the raw value finds nothing.
+    * **any TOC-styled paragraph** — resolved name matches :data:`_TOC_STYLE_RE`
+      (``toc…``, ``目录…``, ``contents…``, and hand-rolled names such as
+      ``TocLine`` which carry no level).  ``page_tokens`` /
+      ``page_parse_failures`` / ``monotonic`` are computed over these, i.e. the
+      *same* set ``page_numbers`` is built from, so the two blocks can never
+      disagree about which paragraphs the document calls a TOC.
+
+    ``monotonic`` answers the question a reader asks first: do the numbers ever
+    go backwards?  Two things make a naive reading wrong, both measured:
+
+    * the token has to be read under the **counter of its own section**
+      (``_token_number``'s ``fmt``); ``a, b, c`` in a Latin appendix is 1, 2, 3,
+      not 1, 2, 100;
+    * a document legitimately **restarts** its counter when the format changes
+      (front matter ``i, ii, iii`` then body ``1, 2, ...``).  Comparing across
+      such a boundary reports a correct thesis TOC as broken, so the comparison
+      is made **within one section** only.  ``monotonic_across_sections`` keeps
+      the blunt whole-document answer visible for callers that want it.
+
+    ``page_parse_failures`` lists the entries whose trailing page number could
+    not be read at all — an entry with no number is a broken TOC even when it
+    renders.  A **TOC title line** (style ``TOC Heading``, text ``目录``) is not
+    an entry and is excluded from that count; otherwise every titled TOC would
+    report itself broken.
+
+    ``source`` is ``"toc"`` when the document really has TOC-styled paragraphs,
+    ``"computed"`` when it has none — that is a structural statement ("no table
+    of contents here"), not a measurement.
+    """
+    entries = 0
+    styles = []
+    levels = set()
+    broad = 0
+    tokens = []
+    failures = []
+    # ``[(token, section_index), ...]`` in document order.  The pair is kept
+    # together because the counter that decides how to read a token is the one
+    # its own section declares -- see ``_token_number``.
+    token_sections = []
+    for idx, p in enumerate(paras):
+        _sid, name = _para_style(p, style_names)
+        if not name:
+            continue
+        flat = name.replace("\u3000", " ")
+        m = _TOC_LEVEL_RE.match(flat)
+        if m:
+            entries += 1
+            if name not in styles:
+                styles.append(name)
+            levels.add(int(m.group(1)))
+        if not _TOC_STYLE_RE.match(name):
+            continue
+        # ``TOC Heading`` is the *title* of the list, not a line of it: it has no
+        # level number and never carries a page number.  Counting it would make
+        # ``page_parse_failures`` permanently non-empty for any titled TOC.
+        if m is None:
+            continue
+        broad += 1
+        text = _para_text(p)
+        tok = _toc_token(text)
+        if tok is None:
+            failures.append({"index": idx, "style": name, "text": _cap(text)})
+        else:
+            tokens.append(tok)
+            sec = None
+            if section_of is not None:
+                try:
+                    sec = section_of(idx)
+                except Exception:
+                    sec = None
+            token_sections.append((tok, sec))
+
+    def _fmt_of(section_index):
+        """The counter family in force for a section, or ``None``."""
+        if not section_specs or section_index is None:
+            return None
+        for spec in section_specs:
+            if spec.get("index") == section_index:
+                return spec.get("fmt")
+        return None
+
+    nums = [_token_number(tok, _fmt_of(sec)) for tok, sec in token_sections]
+    parseable = [n for n in nums if n is not None]
+    whole_document_monotonic = all(
+        b >= a for a, b in zip(parseable, parseable[1:]))
+
+    by_section = {}
+    for tok, sec in token_sections:
+        by_section.setdefault(sec, []).append(tok)
+
+    # Monotonicity has to answer "do the numbers go backwards *within one
+    # numbering run*", and that run is not the section a TOC line physically
+    # sits in -- every entry of a table of contents lives in the TOC's own
+    # section, at the front of the document.  What varies is the counter the
+    # *target* heading uses.  So the sequence is split wherever the glyph
+    # family changes (``ii, iii`` then ``1, 15``), and each run is checked on
+    # its own: a document that restarts its counter for the body is correct,
+    # not broken (work/REVIEW-ADVERSARIAL-R6.md 阻塞-2).
+    #
+    # Every family that is compared MUST be handed the counter it is read
+    # under.  A ``letter`` token parsed with ``fmt=None`` falls through to the
+    # Roman reading, so plain letters other than i/v/x/l/c/d/m come back as
+    # ``None``, the run stays empty, and ``all()`` over an empty sequence is
+    # ``True`` -- which reported a descending appendix (``c, a, b``) as
+    # monotonic.  Silently passing a real regression is worse than the noisy
+    # false alarm this split was introduced to remove, so the mapping below is
+    # exhaustive and the fallback is a *refusal to judge*, not a green light
+    # (work/REVIEW-ADVERSARIAL-R6.md 第三轮 阻塞-④).
+    _FAMILY_FMT = {"roman": "lowerRoman", "letter": "lowerLetter",
+                   "decimal": "decimal"}
+
+    def _family(tok):
+        t = str(tok).strip()
+        if not t:
+            return None
+        low = t.lower()
+        if low.isdigit():
+            return "decimal"
+        if not low.isalpha():
+            # Punctuation or a mix: no counter family this tool can read.
+            return None
+        if len(low) > 1 and all(ch in _ROMAN_VALUE for ch in low):
+            return "roman"
+        if len(low) > 1:
+            return "letter"
+        # A single letter is ambiguous only if it could be a Roman numeral.
+        # Seven letters can (i v x l c d m); every other letter -- a, b, e, f,
+        # k, ... -- is unambiguously a Latin sequence number, and saying so
+        # keeps an appendix numbered ``a, b, c`` from being reported as
+        # unreadable.
+        return "single" if low in _ROMAN_VALUE else "letter"
+
+    # Two passes, because a lone letter cannot be typed until its neighbours
+    # speak.  ``i`` opens either ``i, ii, iii`` (Roman) or ``i, j, k`` (Latin);
+    # ``c`` is 100 in one counter and 3 in the other.  Pass 1 splits the stream
+    # into runs at every *explicit* family change; a run's explicit members
+    # decide what its single letters meant.  Pass 2 compares numbers inside
+    # each run.  A run made only of singles never gets typed, so it is counted
+    # as unread rather than silently assumed -- that distinction is what keeps
+    # the verdict from going green on material nobody could read.
+    families = [_family(tok) for tok in tokens]
+
+    runs = []
+    current = None
+    for fam in families:
+        if fam is None:
+            current = None
+            runs.append([None])
+            continue
+        if fam == "single":
+            if current is None:
+                current = []
+                runs.append(current)
+            current.append("single")
+            continue
+        explicit = {f for f in current or () if f != "single"}
+        if current is None or (explicit and fam not in explicit):
+            current = []
+            runs.append(current)
+        current.append(fam)
+
+    unparsed = sum(1 for fam in families if fam is None)
+
+    monotonic = True
+    pos = 0
+    for run in runs:
+        if run == [None]:
+            pos += 1
+            continue
+        kinds = {f for f in run if f != "single"}
+        if len(kinds) == 1:
+            fam = next(iter(kinds))
+            settled = True
+        else:
+            # A run of nothing but single letters.  It still has to be
+            # *judged*: skipping it is how a descending appendix (``c, a, b``,
+            # ``d, c, b, a``) reported itself monotonic.  Latin is the right
+            # default here -- a Roman sequence is written largest-first, so
+            # reading these as Latin can only under-report a jump, never invent
+            # one, and any real decrease shows up either way.  The run is
+            # advisory (`unknown`) because the counter was inferred, not read.
+            fam = "letter"
+            settled = False
+            unparsed += len(run)
+        run_nums = []
+        for _ in run:
+            num = _token_number(tokens[pos], _FAMILY_FMT[fam])
+            pos += 1
+            if num is None:
+                if settled:
+                    unparsed += 1
+                continue
+            run_nums.append(num)
+            if any(b < a for a, b in zip(run_nums, run_nums[1:])):
+                monotonic = False
+                break
+        if not monotonic:
+            break
+
+    # A green ``monotonic`` over a half-read TOC is not a clean verdict, so the
+    # count is published as an integer and the boolean is *downgraded* when any
+    # token could not be read.
+    #
+    # There is a second reason to refuse a verdict: a document that restarts its
+    # counter mid-sequence.  math's TOC reads ``1, 1, 1, 3, 1, 1, 1`` -- section
+    # 3 ends on page 3 and section 4 declares ``w:start="1"``, so the drop from 3
+    # to 1 is correct.  From the bytes alone that is indistinguishable from a
+    # genuinely broken TOC, and both readings use the same decimal family, so no
+    # amount of glyph inspection separates them.  When any section declares an
+    # explicit ``start``, a backwards step therefore downgrades the verdict to
+    # ``unknown`` instead of asserting a regression -- an audit that cries wolf
+    # on every restarted document is worse than one that admits it cannot tell.
+    # Only a ``start`` on a section *after the first* restarts a counter.  The
+    # first section's ``start="1"`` is where numbering begins, not a restart, so
+    # counting it would downgrade every ordinary document to ``unknown``.
+    restarts = [s for s in (section_specs or [])
+                if s.get("start") and (s.get("index") or 1) > 1]
+    if monotonic and unparsed:
+        verdict = "unknown"
+    elif monotonic:
+        verdict = "true"
+    elif restarts:
+        verdict = "unknown"
+    else:
+        verdict = "false"
+
+    return {
+        "entries": entries,
+        "entries_toc_style": broad,
+        "styles": sorted(styles),
+        "levels": sorted(levels),
+        "page_tokens": tokens[:limit],
+        "page_tokens_total": len(tokens),
+        "page_parse_failures": failures[:limit],
+        "monotonic": monotonic,
+        "monotonic_verdict": verdict,
+        "monotonic_across_sections": whole_document_monotonic,
+        "monotonic_partial": unparsed > 0,
+        "unparsed_tokens": unparsed,
+        "page_number_restarts": [
+            {"section": s.get("index"), "start": s.get("start"),
+             "fmt": s.get("fmt")} for s in restarts],
+        "sections": sorted(s for s in by_section if s is not None),
+        "source": "toc" if broad else "computed",
+    }
+
+
+def _sectpr_pgnum(sectPr) -> dict:
+    """``{"fmt": str|None, "start": str|None}`` from ``<w:sectPr>/<w:pgNumType>``.
+
+    ``start`` is kept as the raw string the XML holds (``"1"``) rather than an
+    int, so "absent" and "explicitly 1" stay distinguishable — that difference is
+    the whole reason a section restarts numbering or continues from the previous
+    one.  ``fmt`` is the Word counter name (``lowerRoman``, ``decimal``,
+    ``upperLetter``, ``decimalZero``, …) that :func:`page_glyph` understands.
+
+    **A ``sectPr`` may carry more than one** ``pgNumType`` and Word then obeys
+    only the *last* one.  Measured on Word 16 with a section holding
+    ``lowerRoman start=1`` followed by ``upperRoman start=5``: the page reads
+    ``V``, i.e. the earlier element is dead.  That is exactly what happens when
+    ``python-docx``'s ``add_section()`` clones a ``sectPr`` and the caller then
+    appends a second ``pgNumType`` instead of replacing the first.  Reading the
+    last element keeps this layer in agreement with what the reader sees; the
+    duplicate count is reported separately by :func:`_section_specs` so the
+    defect is still visible.
+    """
+    if sectPr is None:
+        return {"fmt": None, "start": None, "count": 0}
+    els = sectPr.findall(q("pgNumType"))
+    if not els:
+        return {"fmt": None, "start": None, "count": 0}
+    el = els[-1]
+    return {"fmt": el.get(q("fmt")), "start": el.get(q("start")),
+            "count": len(els)}
+
+
+def _section_specs(body, all_paras) -> list:
+    """Per-section page-number spec plus the paragraph span each section covers.
+
+    A ``<w:sectPr>`` is attached to the **last paragraph of the section it
+    closes** (python-docx's ``add_section()`` puts it there too); only the final
+    section's one hangs off the end of ``<w:body>``.  So a section runs from the
+    paragraph after the previous ``<w:sectPr>`` through the paragraph that
+    carries its own — inclusive at both ends, because the closing paragraph is
+    still body text of that section.  That span is what makes "which section is
+    paragraph N in" answerable without Word.
+
+    Two index spaces are reported because this file uses both, and they are
+    **named apart** so a caller cannot silently mix them
+    (work/REVIEW-ADVERSARIAL-R6.md 应修-4):
+
+    * ``first_para_index`` / ``last_para_index`` — 0-based ordinals among the
+      body's **direct** ``<w:p>`` children (tables are not counted; a table's
+      paragraphs live inside ``<w:tbl>``).  Same space as
+      ``paragraphs_body_direct``.
+    * ``first_para_index_xml`` / ``last_para_index_xml`` — 0-based positions in
+      ``root.iter(w:p)``, the same space as ``numpr_paragraphs[].index_xml - 1``
+      and ``_vertalign_claims[].para_index``.  Same space as
+      ``paragraphs_xml``.
+
+    ``index_space`` on each dict says which pair the *span* is in, so a caller
+    never has to guess: it is ``"direct"`` (the natural one for "which section
+    is this body paragraph in") and both pairs are always present.
+
+    A middle section whose closing paragraph carries the ``sectPr`` is closed by
+    *that* paragraph.  The final section runs to the end of the body, so it is
+    closed explicitly at ``len-1`` — otherwise a document whose last section has
+    no trailing ``<w:sectPr>`` child element reports a span that stops short and
+    every lookup past it returns ``None`` (应修-5).
+
+    Neither equals a Word ``Paragraphs`` index exactly: Word inserts one extra
+    paragraph per table row (see the module docstring, fact 2), so the Word layer
+    carries its own index and never translates by arithmetic.
+    """
+    flat = {}
+    for i, p in enumerate(all_paras):
+        flat[id(p)] = i
+    direct_flat = [flat.get(id(child)) for child in body if child.tag == q("p")]
+    specs = []
+    para_ord = 0
+    start_ord = 0
+    start_flat = 0
+
+    def _emit(pgnum, first_ord, first_flat, last_ord, last_flat):
+        specs.append({
+            "index": len(specs) + 1,
+            "first_para_index": first_ord,
+            "first_para_index_xml": first_flat,
+            # The paragraph carrying the closing ``w:sectPr`` — the section's own
+            # last paragraph, which is what makes the range inclusive on both
+            # ends and lets "which section is paragraph N in" be answered by a
+            # simple ``first <= N <= last`` test.
+            "last_para_index": last_ord,
+            "last_para_index_xml": last_flat,
+            "index_space": "direct",
+            "fmt": pgnum["fmt"],
+            "start": pgnum["start"],
+            # >1 means the producer appended a ``pgNumType`` instead of editing
+            # the one it cloned; Word obeys the last of them and silently drops
+            # the others, so the count is reported rather than "cleaned up".
+            "pgNumType_count": pgnum["count"],
+        })
+
+    seen_sectpr = False
+    for child in body:
+        if child.tag == q("p"):
+            flat_pos = direct_flat[para_ord] if para_ord < len(direct_flat) \
+                else None
+            ppr = child.find(q("pPr"))
+            sp = ppr.find(q("sectPr")) if ppr is not None else None
+            if sp is not None:
+                last_flat = flat_pos if flat_pos is not None else len(all_paras)
+                _emit(_sectpr_pgnum(sp), start_ord, start_flat, para_ord,
+                      last_flat)
+                start_ord = para_ord + 1
+                start_flat = last_flat + 1
+                seen_sectpr = True
+            para_ord += 1
+        elif child.tag == q("sectPr"):
+            _emit(_sectpr_pgnum(child), start_ord, start_flat, para_ord - 1,
+                  max(len(all_paras) - 1, start_flat))
+            seen_sectpr = True
+
+    # The last section of a document has no closing paragraph and its
+    # ``sectPr`` may be the body-level child handled above -- but a document can
+    # also end with neither (python-docx always writes the body-level one, a
+    # hand-built part may not).  Either way the final section reaches the end of
+    # the body: leaving it short makes every lookup past its end return
+    # ``section=None``, which downstream reads as "this document has no such
+    # section" (应修-5).
+    if para_ord > start_ord and (not specs or specs[-1]["last_para_index"] < para_ord - 1):
+        _emit({"fmt": None, "start": None, "count": 0},
+              start_ord, start_flat, para_ord - 1,
+              max(len(all_paras) - 1, start_flat))
+    return specs
 
 
 def probe_xml(docx) -> dict:
@@ -347,6 +929,9 @@ def probe_xml(docx) -> dict:
         "table_rows": 0,
         "tables_xml": 0,
         "sections_xml": 0,
+        "section_specs": [],
+        "page_number_formats": [],
+        "page_number_restarts": [],
         "bookmarks_xml": 0,
         "bookmarks_internal_xml": 0,
         "bookmark_names_xml": [],
@@ -432,6 +1017,37 @@ def probe_xml(docx) -> dict:
                             if has_ancestor(t, q("body")))
     rep["table_rows"] = sum(1 for _ in root.iter(q("tr")))
     rep["sections_xml"] = sum(1 for _ in root.iter(q("sectPr")))
+
+    # --- per-section page numbering ----------------------------------------
+    # Page numbering is a *section* property, never a document property, so a
+    # page number opinion is worthless without knowing which section said what.
+    # ``section_specs`` is the Word-free answer: one row per section, in
+    # document order, carrying the raw ``w:pgNumType`` and the paragraph where
+    # the section starts.  ``page_number_formats`` / ``page_number_restarts`` are
+    # flat conveniences over the same rows — a reader asking "is this document
+    # numbered i, ii, 1, 2?" needs the fmt list and, separately, the sections
+    # that explicitly restart (``start`` present), because an absent ``start``
+    # means "continue from the previous section", not "restart at 1".
+    rep["section_specs"] = _section_specs(body, paras)
+    fmts = []
+    restarts = []
+    dup_pgnum = []
+    for spec in rep["section_specs"]:
+        if spec["fmt"] and spec["fmt"] not in fmts:
+            fmts.append(spec["fmt"])
+        if spec["start"] is not None:
+            restarts.append({"section": spec["index"],
+                             "start": spec["start"], "fmt": spec["fmt"]})
+        if spec.get("pgNumType_count", 0) > 1:
+            dup_pgnum.append({"section": spec["index"],
+                              "count": spec["pgNumType_count"]})
+    rep["page_number_formats"] = fmts
+    rep["page_number_restarts"] = restarts
+    if dup_pgnum:
+        rep["xml_warnings"].append(
+            "section(s) %s carry more than one w:pgNumType; Word obeys only the "
+            "last one and silently ignores the rest"
+            % ([d["section"] for d in dup_pgnum],))
 
     # --- bookmarks ---------------------------------------------------------
     names = []
@@ -699,6 +1315,46 @@ def probe_xml(docx) -> dict:
     rep["toc_styles"] = sorted({nm for (_sid, nm) in usage
                                 if nm and _TOC_STYLE_RE.match(nm)})
 
+    # --- table-of-contents audit ------------------------------------------
+    # The TOC is the document's own claim about page numbers; auditing it here
+    # keeps the claim and the evidence in one report.  ``toc_audit.page_tokens``
+    # is the same sequence as ``page_numbers`` but deliberately *not* gated on a
+    # successful token parse, so a TOC that renders without numbers shows up as
+    # ``entries > 0`` with ``page_parse_failures`` full instead of looking empty.
+    #
+    # The section map is handed in so a token can be read under the counter its
+    # own section declares: ``c`` is 3 in a Latin appendix and 100 as a Roman
+    # numeral, and a counter that restarts at a format change is not a
+    # regression (work/REVIEW-ADVERSARIAL-R6.md 阻塞-2).
+    _specs = rep.get("section_specs") or []
+
+    def _section_of_para(idx, _specs=_specs):
+        """Which section the paragraph at ``root.iter(w:p)`` position *idx* is in.
+
+        ``_toc_audit`` walks ``root.iter(w:p)``, so *idx* lives in the **xml**
+        space -- and the span to test it against is ``*_xml``, not the
+        body-direct one.  Mixing the two silently answers ``1`` for every
+        paragraph once a table or a paragraph inside ``<w:tbl>`` shifts the two
+        ordinal spaces apart (work/REVIEW-ADVERSARIAL-R6.md 应修-4).
+        """
+        for spec in _specs:
+            first = spec.get("first_para_index_xml")
+            last = spec.get("last_para_index_xml")
+            if first is None or last is None:
+                continue
+            if first <= idx <= last:
+                return spec.get("index")
+        return None
+
+    rep["toc_audit"] = _toc_audit(paras, style_names, section_of=_section_of_para,
+                                  section_specs=_specs)
+    if rep["page_number_restarts"]:
+        rep["xml_warnings"].append(
+            "page numbering restarts in section(s) %s; a page number read from "
+            "the TOC or a footer is the *displayed* number, not the physical "
+            "page — keep both when comparing"
+            % ([r["section"] for r in rep["page_number_restarts"]],))
+
     if rep["paragraphs_in_textboxes"]:
         rep["xml_warnings"].append(
             "document has %d paragraph(s) inside text boxes; Word's "
@@ -878,8 +1534,37 @@ def _render_pngs(pdf_path, png_dir, dpi: int, limit: int = 400):
 
 def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
                update_fields: bool = True, numbering_scan: str = "numpr",
-               limit: int = DEFAULT_LIMIT, vertalign_claims=None) -> dict:
-    """Word COM probe.  Never raises: every failure becomes ``skipped``/``errors``."""
+               limit: int = DEFAULT_LIMIT, vertalign_claims=None,
+               page_probe_indices: list[int] | None = None,
+               section_formats=None) -> dict:
+    """Word COM probe.  Never raises: every failure becomes ``skipped``/``errors``.
+
+    Two page-number facts are kept apart on purpose, because conflating them is
+    how a report ends up telling a student their paper's page 7 is "i":
+
+    * ``WD_ACTIVE_END_ADJUSTED_PAGE`` (1) is the **displayed** number — the one
+      the reader sees in the footer, already adjusted by ``w:pgNumType``.  A page
+      printed ``iii`` reports ``3`` here.  Turn it into the glyph with
+      :func:`page_glyph` using that section's ``fmt``.
+    * ``WD_ACTIVE_END_PAGE`` (3) is the **physical** sheet ordinal, counted from
+      page 1 of the document and ignoring every restart.
+
+    ``page_probe_indices`` turns on per-paragraph probing of both.  It is opt-in
+    because each paragraph costs two COM round trips; leave it ``None`` and
+    ``out["paragraph_pages"]`` stays empty with ``paragraph_pages_source``
+    ``"none"``.  This probe **never invents** a page number: when Word is absent
+    or nothing was asked for, the caller can consult
+    :func:`estimated_paragraph_pages`, whose output is labelled ``computed`` and
+    is a structural estimate from ``w:pgNumType`` — it **must not be delivered
+    as a page number to a reader**, because it knows where a section starts but
+    not where a paragraph falls inside it.
+
+    ``section_formats`` is the per-section ``w:pgNumType/@fmt`` list (1-based
+    section order, from ``probe_xml()["section_specs"]``).  Word does not expose
+    ``pgNumType`` through its object model, so the format has to come from the
+    XML layer; passing it is what makes ``displayed_text`` a glyph rather than a
+    bare number.
+    """
     out = {
         "word_ok": False,
         "skipped": False,
@@ -893,6 +1578,7 @@ def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
         "hyperlink_targets": [], "field_list": [],
         "page_numbers": [], "page_numbers_source": "none",
         "section_details": [],
+        "paragraph_pages": [], "paragraph_pages_source": "none",
         "pdf": None, "pngs": [], "pdf_pages": None, "pdf_page_footers": [],
         "word_version": None,
     }
@@ -1189,6 +1875,29 @@ def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
                     .Information(WD_ACTIVE_END_PAGE))
             except Exception:
                 pass
+            # Same page, read the other way: the number the footer shows.  On a
+            # front-matter section numbered ``i, ii, iii`` this is 3 while
+            # ``last_page`` above is 7 — the two are not interchangeable and the
+            # pair is what lets a caller prove which one it has.
+            try:
+                disp = int(doc.Range(sec.Range.End - 1, sec.Range.End)
+                           .Information(WD_ACTIVE_END_ADJUSTED_PAGE))
+                info["last_page_displayed_number"] = disp
+            except Exception:
+                disp = None
+            sec_fmt = None
+            if section_formats:
+                sec_fmt = section_formats[si - 1] if si - 1 < len(section_formats) \
+                    else None
+            info["page_format"] = sec_fmt
+            if disp is not None:
+                info["last_page_displayed_text"] = page_glyph(sec_fmt, disp)
+            try:
+                info["start_page"] = int(
+                    doc.Range(sec.Range.Start, sec.Range.Start + 1)
+                    .Information(WD_ACTIVE_END_PAGE))
+            except Exception:
+                pass
             footer_page = None
             for fi in WD_FOOTER_INDEXES:
                 try:
@@ -1206,6 +1915,100 @@ def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
             if footer_page:
                 info["footer_page_number"] = footer_page
             out["section_details"].append(info)
+
+        # --- per-paragraph page numbers (opt-in) ---------------------------
+        # Both readings are taken for the same paragraph and both are kept:
+        # ``physical`` (WD_ACTIVE_END_PAGE, the sheet ordinal) and
+        # ``displayed_number``/``displayed_text`` (WD_ACTIVE_END_ADJUSTED_PAGE,
+        # the number in the footer, rendered through the section's pgNumType
+        # fmt).  They disagree exactly where a section restarts or changes
+        # format — which is the case this probe exists for.  Indices are Word
+        # ``Paragraphs`` indices (1-based), not XML ones; ``section`` is the
+        # 1-based section number the paragraph sits in, from Word's own range
+        # comparison, so nothing is translated by arithmetic.
+        wanted = list(page_probe_indices or [])
+        if wanted:
+            if len(wanted) > PAGE_PROBE_BUDGET:
+                out["warnings"].append(
+                    "page_probe_indices truncated to %d of %d entries"
+                    % (PAGE_PROBE_BUDGET, len(wanted)))
+                wanted = wanted[:PAGE_PROBE_BUDGET]
+            sec_bounds = []
+            for sd in out["section_details"]:
+                try:
+                    srange = doc.Sections(sd["index"]).Range
+                    sec_bounds.append((sd["index"], int(srange.Start),
+                                       int(srange.End)))
+                except Exception:
+                    continue
+
+            def _section_of(pos):
+                for sidx, a, b in sec_bounds:
+                    if a <= pos < b:
+                        return sidx
+                return None
+
+            rows = []
+            for raw_idx in wanted:
+                try:
+                    idx = int(raw_idx)
+                except (TypeError, ValueError):
+                    out["warnings"].append(
+                        "page_probe_indices: %r is not an integer" % (raw_idx,))
+                    continue
+                if idx < 1 or idx > int(out["paragraphs"] or 0):
+                    out["warnings"].append(
+                        "page_probe_indices: paragraph %d out of range 1..%s"
+                        % (idx, out["paragraphs"]))
+                    rows.append({"index": idx, "physical": None,
+                                 "displayed_number": None,
+                                 "displayed_text": None, "section": None,
+                                 "error": "out of range"})
+                    continue
+                row = {"index": idx, "physical": None, "displayed_number": None,
+                       "displayed_text": None, "section": None}
+                try:
+                    prng = doc.Paragraphs(idx).Range
+                except Exception as exc:
+                    row["error"] = "Paragraphs(%d) failed: %s" % (idx, exc)
+                    rows.append(row)
+                    continue
+                try:
+                    row["physical"] = int(
+                        prng.Information(WD_ACTIVE_END_PAGE))
+                except Exception as exc:
+                    row["error"] = "Information(page) failed: %s" % exc
+                sidx = _section_of(int(prng.Start))
+                row["section"] = sidx
+                fmt = None
+                if sidx is not None and section_formats \
+                        and sidx - 1 < len(section_formats):
+                    fmt = section_formats[sidx - 1]
+                row["page_format"] = fmt
+                try:
+                    disp = int(prng.Information(WD_ACTIVE_END_ADJUSTED_PAGE))
+                except Exception as exc:
+                    row.setdefault("error", "Information(adjusted page) "
+                                             "failed: %s" % exc)
+                    disp = None
+                if disp is not None:
+                    row["displayed_number"] = disp
+                    row["displayed_text"] = page_glyph(fmt, disp)
+                rows.append(row)
+            out["paragraph_pages"] = rows
+            # A row is not evidence: every out-of-range index still produces
+            # one, with ``displayed_number = None``.  Labelling the whole batch
+            # "word" on the strength of ``rows`` being non-empty would let a
+            # caller trust a page number that was never measured -- the same
+            # failure the computed/word split exists to prevent, just inverted
+            # (work/REVIEW-ADVERSARIAL-R6.md 应修-3).
+            measured = sum(1 for r in rows if r.get("displayed_number") is not None)
+            if measured == 0:
+                out["paragraph_pages_source"] = "none"
+            elif measured < len(rows):
+                out["paragraph_pages_source"] = "word-partial"
+            else:
+                out["paragraph_pages_source"] = "word"
 
         # --- PDF + PNG -----------------------------------------------------
         if pdf_path:
@@ -1238,6 +2041,120 @@ def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
 # ===========================================================================
 # merge / expectations / reporting
 # ===========================================================================
+def estimated_paragraph_pages(section_specs, section_details=None,
+                              indices=None) -> dict:
+    """Structural page estimate used when Word is absent.  **Not a page number.**
+
+    Compute what can honestly be computed from the bytes: which section each
+    requested paragraph belongs to (``section_specs[].first_para_index``), that
+    section's counter format, and — when ``section_details`` came from a earlier
+    Word run — where the section's *last* page was.  What cannot be computed is
+    where inside the section a paragraph falls, because that needs layout.
+
+    So the returned ``displayed_number``/``displayed_text`` are derived from the
+    section's ``pgNumType`` **start**, not from the paragraph's position: they
+    describe the section's first page number, and the row is marked
+    ``exact: false`` with ``basis: "section-start"``.  The point of the block is
+    that a caller can see *which section and which alphabet* a paragraph lives
+    under without Word, and that every such row is stamped ``computed``.
+
+    ``computed`` rows must never be delivered as a document's page numbers.  Use
+    them to explain a structure, to sanity-check a Word reading, or to keep a
+    report populated when Office is missing — never as "the page this paragraph
+    is on".
+
+    **The section mapping inherits the XML index space, not Word's.**  Word
+    counts one extra paragraph per table row (module docstring, fact 2), so once
+    a document has tables, paragraph *n* in the XML is a different paragraph from
+    ``Paragraphs(n)`` in Word.  Measured on ``work/subjects/math/paper.docx``
+    (one table): XML ordinal 95 (Word index 96) maps to section 5 here while Word
+    says section 4.  Every row therefore carries ``index_space: "xml"``, and
+    :func:`build_report` raises a warning whenever the document has table rows
+    and the estimate is being used.  With Word present this whole function is
+    bypassed — the Word layer resolves the section from the paragraph's own
+    range, which has no drift.
+
+    Returns::
+
+        {"source": "computed",
+         "warning": "...computed 不得当作交付页码...",
+         "rows": [{"index": i, "section": sidx, "page_format": fmt,
+                   "physical": None, "displayed_number": n,
+                   "displayed_text": glyph, "exact": False,
+                   "basis": "section-start", "index_space": "xml"}]}
+    """
+    specs = list(section_specs or [])
+    bounds = []
+    for pos, spec in enumerate(specs):
+        start = spec.get("first_para_index")
+        end = spec.get("last_para_index")
+        nxt = (specs[pos + 1].get("first_para_index")
+               if pos + 1 < len(specs) else None)
+        bounds.append((spec.get("index", pos + 1), start, end, nxt,
+                       spec.get("fmt"), spec.get("start")))
+    last_page = {}
+    for sd in (section_details or []):
+        if sd.get("index") is not None:
+            last_page[sd["index"]] = sd.get("last_page")
+
+    rows = []
+    for raw_idx in (indices or []):
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        # Same index convention as ``probe_word``: Word ``Paragraphs`` indices
+        # are 1-based, the section spans are 0-based ordinal over direct
+        # paragraphs.  Converting in one place keeps the two layers comparable —
+        # the same ``--page-probe`` list can be read by either and mean the same
+        # paragraph.
+        ordinal = idx - 1
+        hit = None
+        for sidx, start, end, nxt, fmt, st in bounds:
+            if start is None:
+                continue
+            # Prefer the inclusive span; fall back to [start, next start) when a
+            # spec has no closing paragraph (a malformed document, or a section
+            # whose sectPr the producer dropped).
+            if end is not None:
+                inside = start <= ordinal <= end
+            else:
+                inside = ordinal >= start and (nxt is None or ordinal < nxt)
+            if inside:
+                hit = (sidx, fmt, st)
+                break
+        if hit is None:
+            rows.append({"index": idx, "section": None, "page_format": None,
+                         "physical": None, "displayed_number": None,
+                         "displayed_text": None, "exact": False,
+                         "basis": "unknown-section", "index_space": "xml"})
+            continue
+        sidx, fmt, st = hit
+        num = None
+        try:
+            num = int(st) if st not in (None, "") else 1
+        except (TypeError, ValueError):
+            num = None
+        rows.append({
+            "index": idx,
+            "section": sidx,
+            "page_format": fmt,
+            "physical": None,
+            "displayed_number": num,
+            "displayed_text": page_glyph(fmt, num) if num is not None else None,
+            "section_last_page": last_page.get(sidx),
+            "exact": False,
+            "basis": "section-start",
+            "index_space": "xml",
+        })
+    return {
+        "source": "computed",
+        "warning": ("computed: 结构性估算（按节起始页码推），不是排版结果；"
+                    "computed 不得当作交付页码"),
+        "rows": rows,
+    }
+
+
 def _merge_numbering(xml_entries, word_lists, limit):
     """Zip ``numPr`` paragraphs with Word's list paragraphs **by ordinal**.
 
@@ -1322,7 +2239,11 @@ def build_report(args) -> dict:
                           dpi=args.dpi, update_fields=not args.no_update_fields,
                           numbering_scan=args.numbering_scan,
                           limit=args.limit_list,
-                          vertalign_claims=xml.get("_vertalign_claims"))
+                          vertalign_claims=xml.get("_vertalign_claims"),
+                          page_probe_indices=getattr(args, "page_probe_indices",
+                                                     None),
+                          section_formats=[s["fmt"] for s in
+                                           xml.get("section_specs") or []])
         if word["skipped"]:
             want_word = False
             skipped = True
@@ -1400,6 +2321,35 @@ def build_report(args) -> dict:
         page_numbers = list(word["page_numbers"])
         page_src = word["page_numbers_source"]
 
+    # --- per-paragraph page numbers: Word evidence, else a labelled estimate -
+    # "Never fabricate a page number" is the rule here.  With Word and a request
+    # list there are real readings; without either, the caller gets a
+    # ``computed`` structure that says which section a paragraph is in and what
+    # alphabet that section prints with — and says, in the same object, that it
+    # is not a layout measurement.
+    probe_idx = list(getattr(args, "page_probe_indices", None) or [])
+    paragraph_pages = []
+    paragraph_pages_source = "none"
+    if word is not None and word.get("paragraph_pages"):
+        paragraph_pages = list(word["paragraph_pages"])
+        paragraph_pages_source = word.get("paragraph_pages_source") or "word"
+    elif probe_idx:
+        estimate = estimated_paragraph_pages(
+            xml["section_specs"], (word or {}).get("section_details"),
+            probe_idx[:args.limit_list])
+        paragraph_pages = [
+            dict(row, source="computed") for row in estimate["rows"]]
+        paragraph_pages_source = estimate["source"]
+        warnings.append(
+            "paragraph_pages are computed structural estimates (section start "
+            "page only), not measured page numbers — computed 不得当作交付页码")
+        if xml.get("table_rows"):
+            warnings.append(
+                "paragraph_pages indexes are XML ordinals, but this document has "
+                "%d table row(s): Word counts one extra paragraph per row, so an "
+                "index here is not Paragraphs(n) in Word — run with Word for "
+                "measured values" % xml["table_rows"])
+
     numbering_render = []
     mismatch = 0
     if word is not None and word.get("word_ok"):
@@ -1431,6 +2381,7 @@ def build_report(args) -> dict:
 
     # pages and section geometry are Word-only facts, never XML fallbacks
     sources["pages"] = "word" if (word or {}).get("pages") is not None else "none"
+    sources["paragraph_pages"] = paragraph_pages_source
     sources["page_numbers"] = ("word" if (word or {}).get("page_numbers")
                                else (xml["page_numbers_source"] if page_numbers
                                      else "none"))
@@ -1465,6 +2416,12 @@ def build_report(args) -> dict:
         },
         "page_numbers": page_numbers[:args.limit_list],
         "page_numbers_source": page_src,
+        "page_number_formats": list(xml["page_number_formats"]),
+        "page_number_restarts": list(xml["page_number_restarts"]),
+        "section_specs": list(xml["section_specs"]),
+        "paragraph_pages": paragraph_pages,
+        "paragraph_pages_source": paragraph_pages_source,
+        "toc_audit": dict(xml.get("toc_audit") or {}),
         "xref_summary": xref_summary,
         "pdf": (word or {}).get("pdf"),
         "pngs": (word or {}).get("pngs") or [],
@@ -1592,6 +2549,29 @@ def render_summary(report: dict) -> str:
                     xs["superscript"], xs["normal_size"], xs["clickable"]))
     lines.append("  page_numbers   %s (%s)"
                  % (report["page_numbers"][:12], report["page_numbers_source"]))
+    fmts = report.get("page_number_formats") or []
+    restarts = report.get("page_number_restarts") or []
+    if fmts or restarts:
+        lines.append("  page format    %s%s"
+                     % (",".join(fmts) or "(inherit)",
+                        ("  restarts at %s" % (
+                            [(r["section"], r["start"]) for r in restarts],))
+                        if restarts else ""))
+    pp = report.get("paragraph_pages") or []
+    if pp:
+        lines.append("  para pages     %d rows (%s)"
+                     % (len(pp), report.get("paragraph_pages_source")))
+        for row in pp[:8]:
+            lines.append("    para %-4s sec=%-3s physical=%-4s shown=%s"
+                         % (row.get("index"), row.get("section"),
+                            row.get("physical"), row.get("displayed_text")))
+    ta = report.get("toc_audit") or {}
+    if ta.get("entries"):
+        lines.append("  toc_audit      entries=%s levels=%s tokens=%d "
+                     "monotonic=%s source=%s"
+                     % (ta.get("entries"), ta.get("levels"),
+                        len(ta.get("page_tokens") or []),
+                        ta.get("monotonic"), ta.get("source")))
     su = report["xml"].get("style_usage") or []
     if su:
         lines.append("  styles         %d kinds: %s"
@@ -1617,6 +2597,35 @@ def render_summary(report: dict) -> str:
 # ===========================================================================
 # CLI
 # ===========================================================================
+def _page_probe_list(text):
+    """``"1,9,43"`` -> ``[1, 9, 43]``; blank -> ``None``.
+
+    Duplicates are dropped (a caller assembling the list from several sources
+    tends to repeat), order is preserved (document order is what makes the
+    output readable), and anything non-numeric is a usage error rather than a
+    silently skipped entry.
+    """
+    seen = set()
+    out = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated paragraph indices, got %r" % part)
+        if n < 1:
+            raise argparse.ArgumentTypeError(
+                "paragraph indices are 1-based, got %d" % n)
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="word_accept.py",
@@ -1640,6 +2649,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip Fields.Update() (leaves REF results stale)")
     p.add_argument("--limit-list", type=int, default=DEFAULT_LIMIT,
                    help="cap for every list-valued output key")
+    p.add_argument("--page-probe", dest="page_probe_indices", default=None,
+                   type=_page_probe_list, metavar="I[,J,...]",
+                   help="Word paragraph indices (1-based) to read page numbers "
+                        "for; comma separated, e.g. 1,9,43.  Each one costs two "
+                        "COM round trips, so this is opt-in.  Without Word the "
+                        "report carries a 'computed' structural estimate that "
+                        "must not be delivered as a page number")
     p.add_argument("--quiet", action="store_true", help="suppress the stderr summary")
 
     p.add_argument("--expect-sections", type=int, default=None,

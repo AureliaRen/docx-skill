@@ -157,14 +157,131 @@ def letters(n: int, upper: bool = False) -> str:
     return txt.upper() if upper else txt
 
 
+def _fullwidth_digits(n: int) -> str:
+    """``3`` -> ``'３'`` (``decimalFullWidth``)."""
+    return "".join(chr(0xFF10 + int(d)) for d in str(int(n)))
+
+
+_CN_DIGITS = "〇一二三四五六七八九"
+_CN_UNITS = ("", "十", "百", "千")
+_CN_BIG = ("", "万", "亿")
+
+
+def _chinese_number(n: int) -> str:
+    """``3`` -> ``'三'``, ``12`` -> ``'十二'`` (``chineseCounting``/ideograph)."""
+    n = int(n)
+    if n < 0:
+        return str(n)
+    if n == 0:
+        return _CN_DIGITS[0]
+    if n < 10:
+        return _CN_DIGITS[n]
+    groups = []
+    rest = n
+    while rest > 0:
+        groups.append(rest % 10000)
+        rest //= 10000
+    out = []
+    for gi in range(len(groups) - 1, -1, -1):
+        g = groups[gi]
+        if g == 0:
+            continue
+        part = []
+        zero_pending = False
+        for pos in range(3, -1, -1):
+            d = (g // (10 ** pos)) % 10
+            if d == 0:
+                if part:
+                    zero_pending = True
+                continue
+            if zero_pending:
+                part.append(_CN_DIGITS[0])
+                zero_pending = False
+            part.append(_CN_DIGITS[d] + _CN_UNITS[pos])
+        chunk = "".join(part)
+        # 十一 is written without the leading 一; 一十一 is wrong in a page number.
+        if gi == 0 and len(groups) == 1 and chunk.startswith("一十"):
+            chunk = chunk[1:]
+        out.append(chunk + _CN_BIG[gi])
+    return "".join(out)
+
+
+_EN_ONES = ("", "one", "two", "three", "four", "five", "six", "seven", "eight",
+            "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+            "fifteen", "sixteen", "seventeen", "eighteen", "nineteen")
+_EN_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+            "eighty", "ninety")
+_EN_ORDINAL_IRREGULAR = {
+    "one": "first", "two": "second", "three": "third", "five": "fifth",
+    "eight": "eighth", "nine": "ninth", "twelve": "twelfth",
+}
+
+
+def _english_ordinal(n: int) -> str:
+    """``3`` -> ``'third'`` (``ordinalText``), the way Word renders it."""
+    n = int(n)
+    if n <= 0:
+        return str(n)
+    if n < 20:
+        word = _EN_ONES[n]
+    elif n < 100:
+        tens, ones = divmod(n, 10)
+        word = _EN_TENS[tens] + ("-" + _EN_ONES[ones] if ones else "")
+    elif n < 1000:
+        hundreds, rest = divmod(n, 100)
+        word = _EN_ONES[hundreds] + " hundred"
+        if rest:
+            word += " and " + _english_ordinal(rest)
+            return word
+    else:
+        # Page numbers past 999 are not worth a full English generator; falling
+        # back to the numeral is honest and never matches a real Word glyph, so
+        # the caller can tell the difference.
+        return str(n)
+    tail = word.rsplit("-", 1)[-1]
+    ordinal_tail = _EN_ORDINAL_IRREGULAR.get(
+        tail, tail[:-1] + "ieth" if tail.endswith("y") else tail + "th")
+    if "-" in word:
+        head = word.rsplit("-", 1)[0]
+        return head + "-" + ordinal_tail
+    return ordinal_tail
+
+
 def cached_page(fmt: str | None, start=None) -> str:
     """The text the PAGE field shows before Word recalculates it.
 
     Writing the right glyph here means the file renders correctly even for a
     reader that never updates fields (and makes PDF export verifiable without
     forcing an update first).
+
+    Every branch below is a **measured** Word 16.0 rendering, not a guess: a
+    document per format, a ``PAGE`` field in the footer, ``Fields.Update()``,
+    then read back the rendered text (work/REVIEW-ADVERSARIAL-R6.md 阻塞-3).
+    Formats Word can render but this function does not model would otherwise
+    fall through to ``str(n)`` -- silently claiming an Arabic numeral for a page
+    that shows ``三`` or nothing at all -- so the fall-through is kept
+    deliberately narrow and the two cases where the true glyph is *not* the
+    number are handled explicitly:
+
+    * ``none`` renders an **empty string**; there is no page number on the page;
+    * ``numberInDash`` wraps it as ``- 3 -``.
     """
     n = 1 if start in (None, "") else int(start)
+    if fmt == "none":
+        return ""
+    if fmt == "decimalFullWidth":
+        return _fullwidth_digits(n)
+    if fmt in ("chineseCounting", "chineseCountingThousand",
+               "ideographDigital"):
+        return _chinese_number(n)
+    if fmt == "numberInDash":
+        return "- %d -" % n
+    if fmt == "decimalEnclosedCircle":
+        # ①..⑳ exist as single code points; past that Word keeps enclosing, and
+        # the composed form is what it renders.
+        return chr(0x2460 + n - 1) if 1 <= n <= 20 else str(n)
+    if fmt == "ordinalText":
+        return _english_ordinal(n)
     if fmt == "lowerRoman":
         return roman(n)
     if fmt == "upperRoman":

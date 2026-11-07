@@ -31,6 +31,28 @@ And two more, added after an audit against a real 20-page thesis:
   with cached results, so `如图3所示` is correct the moment the file opens — and
   `renumber` puts it right again after an edit shifts the numbering.
 
+## A table of contents that reads correctly without Word
+
+A `TOC` field is empty until someone presses F9, and a cache pre-filled into it
+is thrown away the moment they do. For a deliverable — anything that gets PDF'd,
+diffed, or opened by a tool that has no Office engine — the entries have to be
+ordinary paragraphs. `scripts/docx_toc.py` writes them that way:
+
+```bash
+python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
+```
+
+Each line is `title<TAB>page` in Word's own `toc 1/2/3` styles, with a
+right-aligned dot-leader tab stop at the text-block width. Page numbers are
+*measured*, never guessed: `tools/word_accept.py --page-probe` reports the glyph
+the reader sees (`Information(WD_ACTIVE_END_ADJUSTED_PAGE)`), which is not the
+physical page order — a `lowerRoman` section prints `i` on page eight.
+
+Two prerequisites it will not invent for you: the heading styles need
+`outline_level` in the spec (a style that merely *looks* like a heading is body
+text to Word), and the numbers come from a second pass over the finished file.
+`references/toc.md` has the recipe, the trap list, and the measured limits.
+
 ## Formulas are not all the same thing
 
 A converter that turns everything it recognises into an equation object gets the
