@@ -42,7 +42,8 @@ python tools/word_accept.py <in.docx> [--pdf OUT.pdf] [--png DIR] [--json OUT.js
 
 ```powershell
 # 典型调用（Wave 2 照抄）
-$py='C:\Users\任泽鑫\AppData\Local\Programs\Python\Python312\python.exe'
+# $py = 你的 Python 3.10+ 解释器（需装 python-docx / pywin32 / PyMuPDF）
+$py = (Get-Command python).Source
 & $py tools/word_accept.py out/exam.docx --pdf out/exam.pdf --png out/exam_png `
      --json out/exam.json --expect-sections 3 --expect-bookmarks 151
 ```
@@ -295,7 +296,7 @@ assert rep["pdf"] and len(rep["pngs"]) == rep["pdf_pages"]
 ## 7. 自检
 
 ```powershell
-$py='C:\Users\任泽鑫\AppData\Local\Programs\Python\Python312\python.exe'
+$py = (Get-Command python).Source
 Set-Location skill-patched
 & $py -m pytest tests/ -q -p no:cacheprovider          # 全绿
 & $py -m pytest tests/test_word_accept_xml.py -q -p no:cacheprovider
