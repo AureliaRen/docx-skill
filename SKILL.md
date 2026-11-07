@@ -77,6 +77,15 @@ round-trip that changes nothing produces an equivalent archive.
 | Force table widths | `python scripts/table_width.py set unpacked/ --widths 2.4,4.2,4.2` |
 | Batch linear formulas → Office Math | `python scripts/docx_mathify.py in.docx -o out.docx --report conv.md` |
 | Insert one LaTeX formula | `python scripts/insert_formula.py unpacked/ "\frac{-b}{2a}" --display` |
+| Inspect numbering definitions | `python scripts/docx_numbering.py list in.docx` |
+| Add a numbering definition | `python scripts/docx_numbering.py define in.docx --text "[%1]" -o out.docx` |
+| Number paragraphs | `python scripts/docx_numbering.py apply in.docx --index 155:171 --num-id 1` |
+| Restart a list mid-document | `python scripts/docx_numbering.py restart in.docx --index 7 --num-id 1` |
+| Strip numbering | `python scripts/docx_numbering.py detach in.docx --index 3:9` |
+| Make a numbered caption | `python scripts/docx_crossref.py caption in.docx --index 42 --label 图 --text "架构"` |
+| Insert a cross-reference | `python scripts/docx_crossref.py ref in.docx --index 70 --target 图_1 --prefix "如图" --suffix 所示` |
+| Refresh all field results | `python scripts/docx_crossref.py renumber in.docx -o out.docx` |
+| List bookmarks / fields | `python scripts/docx_crossref.py list in.docx` |
 
 ## Creating a document
 
@@ -88,14 +97,19 @@ round-trip that changes nothing produces an equivalent archive.
 | `heading` | `text`, `level` (1–9) |
 | `paragraph` | `text`, or `runs`, plus optional `style` |
 | `bullet_list` | `items` |
-| `numbered_list` | `items` |
+| `numbered_list` | `items`; optional `num_id` (reuse an existing counter), `num_text` (default `%1.`), `num_fmt`, `start`, `ilvl`, `indent_left`, `hanging` |
+| `caption` | `label` (default `图`), `text`, optional `bookmark` — inserts `图 N  题注` with a `SEQ` counter + bookmark |
+| `crossref` | `target` (a bookmark), optional `prefix`, `suffix`, `format` (`default`/`full`/`above-below`/`page`/`number`), `cached`, `own_paragraph` |
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold` |
 | `image` | `path`, optional `width_mm` |
 | `page_break` | — |
-| `toc` | — (inserts a TOC field; update fields in Word to populate) |
+| `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures |
 
-To control column widths, run `table_width.py` on the unpacked document — a
-`table` block's own width is not configurable at creation time.
+`numbered_list` really numbers now. The previous version applied Word's
+`List Number` *style*, which carries no `numPr`, so the paragraphs rendered with
+no numbers at all; it now defines an `abstractNum` + `num` and attaches a real
+`numId`. Pass the same `num_id` to two blocks to continue one sequence, or call
+`docx_numbering.py restart` to break it.
 
 ```json
 {
@@ -108,11 +122,39 @@ To control column widths, run `table_width.py` on the unpacked document — a
         {"text": ", underlined", "underline": true}
     ]},
     {"type": "bullet_list", "items": ["first", "second"]},
+    {"type": "numbered_list", "items": ["甲", "乙"], "num_text": "[%1]"},
+    {"type": "caption", "label": "图", "text": "系统架构示意图"},
+    {"type": "paragraph", "text": "系统架构如"},
+    {"type": "crossref", "target": "图_1", "suffix": "所示。"},
     {"type": "table",  "header": ["Item", "Value"],
      "rows": [["Voltage", "220 V"]]}
   ]
 }
 ```
+
+`crossref` appends its field to the *previous* paragraph, so a sentence can be
+split across the two blocks above and read as `系统架构如1所示。`. Set
+`"own_paragraph": true` to give it a fresh paragraph instead.
+
+## Numbering and cross-references
+
+Two scripts own these features:
+
+- `docx_numbering.py` — `list` / `define` / `apply` / `detach` / `restart`
+- `docx_crossref.py` — `caption` / `ref` / `bookmark` / `renumber` / `list`
+
+Word numbering is a two-level indirection that no other script here exposed:
+`<w:abstractNum>` defines the format (``lvlText`` like `[%1]`), `<w:num>` is a
+counter instance pointing at it, and a paragraph's `<w:numPr>` names the
+`numId`. Two paragraphs sharing a `numId` share one running counter.
+
+A cross-reference is a `REF <bookmark>` field, and a caption is a
+`SEQ <label> \* ARABIC` field wrapped in a bookmark. Every field this toolkit
+writes carries a **cached result** (`begin / instrText / separate / result /
+end`), so the number is visible before Word recalculates anything and stays
+correct after F9. `renumber` recomputes `SEQ` counters and rewrites every
+cached `REF` value, which is what makes a generated document correct for
+readers that never update fields.
 
 ## Formula conversion (LaTeX → native Office Math)
 
@@ -122,13 +164,66 @@ Two entry points share one engine (`math_omml.py`):
   Unicode characters plus real sub/superscript runs (`U`+sub`oc`, `√2`,
   `1kΩ=10³Ω`, `∠53.1°`), converts each into native OMML, and leaves the Chinese
   prose, table structure, and font sizes untouched. `--dry-run` reports without
-  writing; `--report md` records every before/after pair.
+  writing; `--report md` records every before/after pair, plus a count and a
+  per-paragraph table for spans that took the no-layout tier.
 - **`insert_formula.py` — single.** Takes LaTeX and drops one equation into an
   unpacked document at an anchor.
 
 `linear_to_latex.py` decides *what counts as a formula*. It deliberately stays
 conservative so ordinary prose survives: `[0, 1]`, `f(x, y)`, and CJK headings
-are left alone; `U=IR`, `ΣI=0`, `f=50Hz` are converted.
+are left alone; `U=IR` and `ΣI=0` become equations. Recognising a span is not
+the same as needing an equation *object* — see the tiers below.
+
+### Three output tiers
+
+`docx_mathify` places every recognised span in one of three tiers. The order is
+fixed: master switch, then the no-layout tier, then the script tier, then OMML.
+
+| Tier | Test | Output | Example |
+|---|---|---|---|
+| Structural formula | contains a command from `_STRUCTURAL_CMDS` (43 entries: `\frac`, `\sqrt`, `\int`, `\sum`, `\begin{`, `\left`, `\overline`, …) | OMML equation object | `x^2/16+y^2/9=1`, `v=s/t` |
+| Plain script | no structural command, and at least one `^` or `_` | ordinary run + `w:vertAlign` — a real Word superscript, restored to full size by `Ctrl+Shift+=` | `a=9.8m/s2`, `10^-7` |
+| No layout needed | no structural command, no `^`/`_`, exactly one `=`, a single ASCII letter on the left, a number plus an optional unit on the right | ordinary text run | `s=10km`, `t=2h`, `m=5kg`, `v=3m/s` |
+
+The third tier is `no_layout_reason()` in `docx_mathify.py`. Its unit tail is a
+whitelist, not "any letters": each factor must be a member of
+`linear_to_latex.UNITS`. That is why `y=2x` and `n=2t` stay equations — they are
+function relations, not "2 metres" and "2 tonnes" — and why `v=s/t` stays a real
+fraction (`t` is deliberately absent from `UNITS`). `x=3` lands here too, as
+`plain_equation` rather than `plain_quantity`. Current conservatism: `T=25℃`
+(no `℃` in `UNITS`) and Greek quantity symbols (`η=80%`) stay equations.
+
+### What the plain tier costs
+
+A span that drops to the plain tier loses its math italic — `s` becomes upright.
+That is an accepted trade decided on 2026-11-07, not an outstanding defect:
+where nothing needs two-dimensional layout, something expressible as text should
+not become an equation object. An equation object means opening the formula
+editor to change one character, losing shape when pasted elsewhere, and a line
+height the formula engine stretches.
+
+When the italic is wanted, supply it from the shape of the input rather than from
+the tier: write the form with a script (`a=9.8m/s2`, which lands in the
+plain-script tier), or set `vert_align` explicitly on the runs of a `docx_create`
+spec — `superscript` / `subscript` booleans are accepted as aliases, and an
+explicit `vert_align` wins over them.
+
+### Switching the tiers off
+
+Two module-level constants in `docx_mathify.py`:
+
+| Constant | Default | Set to `False` |
+|---|---|---|
+| `MIXED_SUPERSCRIPT` | `True` | every span goes to OMML — the master switch |
+| `NO_LAYOUT_NEEDED` | `True` | only the no-layout tier stops; the plain-script tier still applies |
+
+`NO_LAYOUT_NEEDED` sits *inside* `MIXED_SUPERSCRIPT`: turning the master switch
+off stops both, which is what keeps "`MIXED_SUPERSCRIPT = False` equals the old
+behaviour" true.
+
+Two defects in source-text handling were fixed alongside these tiers (consecutive
+Unicode superscripts, and a unit after an exponent read as a fraction); both are
+written up in [formula-guide](references/formula-guide.md#two-defects-fixed-in-this-round).
 
 Equation font defaults to **Times New Roman**. Override with the `MATH_FONT`
 environment variable (`MATH_FONT="Cambria Math"` restores Word's default look;

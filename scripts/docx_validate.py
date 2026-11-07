@@ -111,7 +111,8 @@ def validate(path: str) -> dict:
                        f"document.xml references {rid} with no relationship")
 
     # --- embedded images decode ------------------------------------------
-    for name in [n for n in names if n.startswith("word/media/")]:
+    for name in [n for n in names
+                 if n.startswith("word/media/") and not n.endswith("/")]:
         data = zf.read(name)
         if not data:
             _issue(issues, "error", "empty-image", name)

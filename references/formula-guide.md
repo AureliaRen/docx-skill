@@ -19,7 +19,204 @@ docx (zip)
    ├─ insert_formula.py     one equation, at an anchor, into an unpacked doc
    │
    └─ docx_mathify.py       batch: scan, convert, place, report
+          _om_or_scripts()       the tier split (see below)
+          no_layout_reason()     tier 3: does this need an equation object at all
+          is_pure_script()       tier 2: scripts but no structure
 ```
+
+## Three output tiers
+
+Recognising a span as a formula is one decision; deciding what to emit for it is
+another. `_om_or_scripts()` in `docx_mathify.py` makes the second decision in a
+fixed order, and each tier has its own test:
+
+| Tier | Test | Output | Example |
+|---|---|---|---|
+| 1. Structural | `structural_reason()` finds a command in `_STRUCTURAL_CMDS` — 43 entries covering fractions, radicals, integrals, big operators, limits, accents, delimiters, environments, and equation tags | OMML via `latex_to_omml_lxml()` | `x^2/16+y^2/9=1`, `v=s/t` |
+| 2. Plain script | no structural command, and the span contains at least one `^` or `_` | ordinary `<w:r>` runs carrying `w:rPr/w:vertAlign` | `a=9.8m/s2`, `10^-7` |
+| 3. No layout needed | no structural command, no `^`/`_`, exactly one `=`, a single ASCII letter (optionally with a trailing `'`) on the left, a signed decimal on the right, and an optional unit tail | ordinary text runs, original `rPr` preserved | `s=10km`, `t=2h`, `m=5kg`, `v=3m/s` |
+
+The order matters and is not interchangeable. Tier 3 requires the *absence* of
+`^`/`_`; tier 2 requires their *presence*. They are mutually exclusive by
+construction, and `no_layout_reason()` is a pure function so the switch is
+applied only at the call site, never inside the test.
+
+### Why tier 2 exists at all
+
+Word stores a real superscript as `<w:rPr><w:vertAlign w:val="superscript"/>`,
+which is what `Ctrl+Shift+=` toggles and what restores the character to full size
+when toggled back. An OMML `m:sSup` cannot do that: its raised glyph is a
+formula-engine layout, `Font.Superscript` reports `0`, and pressing the shortcut
+on it stacks a second superscript on already-shrunken type. Tier 2 emits the run
+form so the shortcut behaves the way a Word user expects.
+
+### Why tier 3 costs the italic, and why that is settled
+
+Tier 2 and tier 3 both lose the math italic that OMML would have supplied. For a
+span that genuinely needs scripts, that is the price of getting real scripts. For
+tier 3 the accounting was revisited and the cost accepted on 2026-11-07: where
+nothing needs two-dimensional layout, a thing expressible as text should not
+become an equation object.
+
+The reasoning is about the object, not the glyph. An equation object in a body
+paragraph means opening the formula editor to change one character, losing shape
+when copied into other software, and a line box the formula engine stretches.
+Against that, `s=10km` has no fraction, no radical, no script — nothing the
+object is for. So the span is emitted as text and `s` comes out upright.
+
+The correct remedy when the italic is wanted is to change the *input*, not to
+push the span back up a tier:
+
+- write the form with a script — `a=9.8m/s2` becomes tier 2 and keeps a real
+  superscript run;
+- or, building a document from a spec, mark the runs explicitly with
+  `vert_align` (`superscript` / `subscript`; the `superscript` and `subscript`
+  booleans are accepted as aliases, and an explicit `vert_align` wins over
+  them) in `docx_create`.
+
+`w:i` is not the answer: it is run-wide italic, so `18` and `g/mol` would be
+slanted along with the quantity symbol.
+
+### What tier 3 refuses, and why
+
+The unit tail is a whitelist rather than "any letters". `_is_unit_tail()` splits
+on `/`, `·`, `⋅` and requires every factor to be a member of
+`linear_to_latex.UNITS`, or `%`. Two consequences worth stating outright:
+
+- `y=2x` stays an equation. A permissive tail would read it as "2 metres" and
+  flatten a function relation to upright text.
+- `n=2t` stays an equation. `t` is deliberately absent from `UNITS` (it must not
+  shadow time as a quantity symbol), so `v=s/t` keeps its real fraction, and
+  `n=2t` is refused by the same rule.
+
+Also refused, all conservatively — the span keeps its equation object:
+
+| Input | Refused at | Reason |
+|---|---|---|
+| `F=ma`, `U=IR` | right-hand side | not a pure number |
+| `f(x)=0`, `A=(-1,3)` | left-hand side | not a single letter |
+| `n\geq 2` | `=` count | no equation sign |
+| `m=\rho V=1.2\times 60=72kg` | `=` count | chained equality |
+| `a=9.8\,\mathrm{m/s^{2}}` | `^`/`_` | tier 2 picks it up instead |
+| `y=2x`, `n=2t` | unit whitelist | see above |
+| `s=10m/`, `s=10/x` | unit whitelist | incomplete or non-unit factor |
+
+Two current limits, recorded as behaviour rather than as guarantees: `T=25℃`
+stays an equation because `℃` is not in `UNITS`, and a Greek quantity symbol such
+as `η=80%` stays an equation because the left-hand side must be a single ASCII
+letter. Both err toward keeping the equation object, so neither can mangle text.
+
+### The two switches
+
+Both are module-level constants in `docx_mathify.py`:
+
+| Constant | Default | `False` |
+|---|---|---|
+| `MIXED_SUPERSCRIPT` | `True` | every span goes to OMML — the master switch |
+| `NO_LAYOUT_NEEDED` | `True` | only tier 3 stops; tier 2 still applies |
+
+`NO_LAYOUT_NEEDED` is contained by `MIXED_SUPERSCRIPT`. Turning the master switch
+off stops both tiers, which is what makes "`MIXED_SUPERSCRIPT = False` restores
+the old behaviour" a true statement rather than a nearly-true one. The report
+recomputes the tier-3 reason only when both switches are on, so a report cannot
+claim a downgrade that the document did not get.
+
+## Three output tiers
+
+Recognising a span as a formula is one decision; deciding what to emit for it is
+another. `_om_or_scripts()` in `docx_mathify.py` makes the second decision in a
+fixed order, and each tier has its own test:
+
+| Tier | Test | Output | Example |
+|---|---|---|---|
+| 1. Structural | `structural_reason()` finds a command in `_STRUCTURAL_CMDS` — 43 entries covering fractions, radicals, integrals, big operators, limits, accents, delimiters, environments, and equation tags | OMML via `latex_to_omml_lxml()` | `x^2/16+y^2/9=1`, `v=s/t` |
+| 2. Plain script | no structural command, and the span contains at least one `^` or `_` | ordinary `<w:r>` runs carrying `w:rPr/w:vertAlign` | `a=9.8m/s2`, `10^-7` |
+| 3. No layout needed | no structural command, no `^`/`_`, exactly one `=`, a single ASCII letter (optionally with a trailing `'`) on the left, a signed decimal on the right, and an optional unit tail | ordinary text runs, original `rPr` preserved | `s=10km`, `t=2h`, `m=5kg`, `v=3m/s` |
+
+The order matters and is not interchangeable. Tier 3 requires the *absence* of
+`^`/`_`; tier 2 requires their *presence*. They are mutually exclusive by
+construction, and `no_layout_reason()` is a pure function so the switch is
+applied only at the call site, never inside the test.
+
+### Why tier 2 exists at all
+
+Word stores a real superscript as `<w:rPr><w:vertAlign w:val="superscript"/>`,
+which is what `Ctrl+Shift+=` toggles and what restores the character to full size
+when toggled back. An OMML `m:sSup` cannot do that: its raised glyph is a
+formula-engine layout, `Font.Superscript` reports `0`, and pressing the shortcut
+on it stacks a second superscript on already-shrunken type. Tier 2 emits the run
+form so the shortcut behaves the way a Word user expects.
+
+### Why tier 3 costs the italic, and why that is settled
+
+Tier 2 and tier 3 both lose the math italic that OMML would have supplied. For a
+span that genuinely needs scripts, that is the price of getting real scripts. For
+tier 3 the accounting was revisited and the cost accepted on 2026-11-07: where
+nothing needs two-dimensional layout, a thing expressible as text should not
+become an equation object.
+
+The reasoning is about the object, not the glyph. An equation object in a body
+paragraph means opening the formula editor to change one character, losing shape
+when copied into other software, and a line box the formula engine stretches.
+Against that, `s=10km` has no fraction, no radical, no script — nothing the
+object is for. So the span is emitted as text and `s` comes out upright.
+
+The correct remedy when the italic is wanted is to change the *input*, not to
+push the span back up a tier:
+
+- write the form with a script — `a=9.8m/s2` becomes tier 2 and keeps a real
+  superscript run;
+- or, building a document from a spec, mark the runs explicitly with
+  `vert_align` (`superscript` / `subscript`; the `superscript` and `subscript`
+  booleans are accepted as aliases, and an explicit `vert_align` wins over
+  them) in `docx_create`.
+
+`w:i` is not the answer: it is run-wide italic, so `18` and `g/mol` would be
+slanted along with the quantity symbol.
+
+### What tier 3 refuses, and why
+
+The unit tail is a whitelist rather than "any letters". `_is_unit_tail()` splits
+on `/`, `·`, `⋅` and requires every factor to be a member of
+`linear_to_latex.UNITS`, or `%`. Two consequences worth stating outright:
+
+- `y=2x` stays an equation. A permissive tail would read it as "2 metres" and
+  flatten a function relation to upright text.
+- `n=2t` stays an equation. `t` is deliberately absent from `UNITS` (it must not
+  shadow time as a quantity symbol), so `v=s/t` keeps its real fraction, and
+  `n=2t` is refused by the same rule.
+
+Also refused, all conservatively — the span keeps its equation object:
+
+| Input | Refused at | Reason |
+|---|---|---|
+| `F=ma`, `U=IR` | right-hand side | not a pure number |
+| `f(x)=0`, `A=(-1,3)` | left-hand side | not a single letter |
+| `n\geq 2` | `=` count | no equation sign |
+| `m=\rho V=1.2\times 60=72kg` | `=` count | chained equality |
+| `a=9.8\,\mathrm{m/s^{2}}` | `^`/`_` | tier 2 picks it up instead |
+| `y=2x`, `n=2t` | unit whitelist | see above |
+| `s=10m/`, `s=10/x` | unit whitelist | incomplete or non-unit factor |
+
+Two current limits, recorded as behaviour rather than as guarantees: `T=25℃`
+stays an equation because `℃` is not in `UNITS`, and a Greek quantity symbol such
+as `η=80%` stays an equation because the left-hand side must be a single ASCII
+letter. Both err toward keeping the equation object, so neither can mangle text.
+
+### The two switches
+
+Both are module-level constants in `docx_mathify.py`:
+
+| Constant | Default | `False` |
+|---|---|---|
+| `MIXED_SUPERSCRIPT` | `True` | every span goes to OMML — the master switch |
+| `NO_LAYOUT_NEEDED` | `True` | only tier 3 stops; tier 2 still applies |
+
+`NO_LAYOUT_NEEDED` is contained by `MIXED_SUPERSCRIPT`. Turning the master switch
+off stops both tiers, which is what makes "`MIXED_SUPERSCRIPT = False` restores
+the old behaviour" a true statement rather than a nearly-true one. The report
+recomputes the tier-3 reason only when both switches are on, so a report cannot
+claim a downgrade that the document did not get.
 
 ## Why the conversion goes through Microsoft's stylesheet
 
@@ -104,6 +301,11 @@ It refuses:
 It accepts `U=IR`, `ΣI=0`, `f=50Hz`, `i_{L}(0^{+}) = i_{L}(0^{-})`,
 `A = [a, b; c, d]`.
 
+Accepting a span is not the same as emitting an equation object for it — the tier
+split decides that. Of that list, `U=IR`, `ΣI=0`, and the two subscripted forms
+stay OMML; `f=50Hz` lands in tier 3 as plain text, because it is a quantity
+symbol, one `=`, a number, and a whitelisted unit.
+
 ## Merged scripts
 
 Word does not store "sub 0, then letter L" as two scripts. It stores a run whose
@@ -114,6 +316,53 @@ gives `\omega_{0L}` — one subscript containing two tokens — when the author 
 `repair_merged_scripts()` splits these apart heuristically: it recognises when
 the tail of a script is actually a following token, and honours the cases where
 it genuinely is one script (`U^{2}`, `10^{-6}`).
+
+## Two defects fixed in this round
+
+Both live in `linear_to_latex.py` and both are about source-text shapes that the
+converter used to read wrong. Neither touches `docx_mathify.py`'s tier split.
+
+### Consecutive Unicode superscripts were split into separate groups
+
+`_escape_unicode` translated literal Unicode script characters one at a time, so
+each character of a multi-character exponent emitted its own script group.
+`10⁻⁷` is one exponent written as two characters, and it came out as
+`10^{-}^{7}` — an empty superscript group followed by a second superscript. That
+is not merely ugly, it is invalid LaTeX: `latex2mathml` keeps the first group and
+drops or flattens the second, so the document showed a `10` with an empty
+exponent, or a stray body-text `7` beside it. Subscripts had the identical flaw
+(`₁₂`), just unreported.
+
+The fix merges each maximal run of same-kind characters into one group before the
+per-character loop runs. Only same-kind characters merge, so `x²₁` still yields
+`x^{2}_{1}` in that order. Single-character runs produce byte-identical output to
+the old code, which is why no existing assertion had to change.
+
+This also repaired three real classes of error found in the sample corpus:
+chemical charges (`Fe^{3}^{+}` → `Fe^{3+}`, `SO_{4}^{2}^{-}` → `SO_{4}^{2-}`),
+negative unit exponents (`L^{-}^{1}` → `L^{-1}`), and scientific notation
+(`4\times 10^{-}^{7} m` → `4\times 10^{-7} m`).
+
+### A unit after an exponent was read as a fraction
+
+The dimension-span finder runs before Unicode escapes are applied, so it sees the
+source shape. For `c=3×10⁸m/s` the `⁸` was still a literal character, and it
+satisfied neither anchor the finder accepts: it is not one of the ASCII forms the
+anchor regex knew (a digit, a `^{n}` closing brace, a closing parenthesis), and
+the left-boundary check rejected it because `⁸`.isalnum() is true. With no valid
+anchor the span went to the fraction builder and produced
+`\frac{10^{8}m}{s}`.
+
+The anchor regex now also accepts runs of literal superscript *digits*, so
+`c=3×10⁸m/s` becomes `c=3\times 10^{8}\,\text{m/s}`. The character class holds
+digits only: `⁺` and `⁻` are signs with no value to anchor on, and `ⁿ` / `ⁱ` are
+letters, so `xⁿm/s` still reads as a fraction.
+
+The governing principle is parity, not permissiveness. The braced spelling
+`c=3×10^{8}m/s` already produced a dimension string before this change; only the
+literal spelling diverged. Both spellings now give the same result, which is the
+point — two spellings of one fact producing two different outputs was the bug.
+The same test already existed for `kg/m3` versus `kg/m³`.
 
 ## Escaping traps in source text
 

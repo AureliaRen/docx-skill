@@ -100,31 +100,39 @@ def pack(src_dir: str | Path, out_path: str | Path,
     order: list[str] = []
     stored: set[str] = set()
 
+    source = None
     if original is not None:
         orig = Path(original)
         if orig.is_file():
-            with zipfile.ZipFile(orig) as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    name = _safe_member(info.filename)
-                    order.append(name)
-                    if info.compress_type == zipfile.ZIP_STORED:
-                        stored.add(name)
+            source = zipfile.ZipFile(orig)
+            for info in source.infolist():
+                if info.is_dir():
+                    continue
+                name = _safe_member(info.filename)
+                order.append(name)
+                if info.compress_type == zipfile.ZIP_STORED:
+                    stored.add(name)
 
     # Anything new the caller added goes at the end, in a stable order.
     for name in sorted(present - set(order)):
         order.append(name)
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in order:
-            member = src / name
-            if not member.is_file():
-                # Present in the original but deleted by the caller: skip it.
-                if original is not None:
-                    continue
-                continue
-            method = zipfile.ZIP_STORED if name in stored else zipfile.ZIP_DEFLATED
-            zf.write(member, name, compress_type=method)
+    try:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in order:
+                member = src / name
+                method = (zipfile.ZIP_STORED if name in stored
+                          else zipfile.ZIP_DEFLATED)
+                if member.is_file():
+                    zf.write(member, name, compress_type=method)
+                elif source is not None and name in source.namelist():
+                    # Present in the original but absent from src_dir (most
+                    # often a part the caller never touched): carry it over
+                    # byte-for-byte so an edit to one part loses nothing.
+                    zf.writestr(zipfile.ZipInfo(name), source.read(name),
+                                compress_type=method)
+    finally:
+        if source is not None:
+            source.close()
     return out
