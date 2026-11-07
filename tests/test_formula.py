@@ -114,22 +114,8 @@ def atoms_of(text: str) -> list[dict]:
     return [{"ch": c, "rpr": None, "script": None} for c in text]
 
 
-def _omml_available() -> bool:
-    try:
-        import latex2mathml  # noqa: F401
-    except ImportError:
-        return False
-    try:
-        math_omml.find_xslt()
-    except Exception:
-        return False
-    return True
-
-
-needs_omml = pytest.mark.skipif(
-    not _omml_available(),
-    reason="needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)",
-)
+# OMML 可用性判定收在 `tests/_omml.py` 一处（REVIEW-CODE-R4 应修 5）。
+from _omml import needs_omml  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
