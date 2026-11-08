@@ -82,10 +82,14 @@ Hard-won facts encoded here
    ``Document.ListParagraphs`` collection, whose order matches the document
    order of the ``w:numPr`` paragraphs found by ``probe_xml``.  The two lists are
    zipped by *ordinal*, never by paragraph index.
-2. ``XML paragraph index != Word paragraph index``: Word counts one extra
-   paragraph per table row (the row-end mark).  Measured on ``f5.docx``: 261
-   ``w:p`` in XML, 287 ``Word.Paragraphs``, 26 ``w:tr``.  So never translate an
-   XML index into ``Paragraphs(i)`` by arithmetic; carry both and label them.
+2. ``XML paragraph index != Word paragraph index``: Word adds paragraph marks
+   for tables beyond the ones the XML holds.  Measured as ``columns + 1`` per
+   row (one mark per cell plus the row-end mark), **not** a flat ``+1``:
+   1x1 table ``+2``, 2x2 ``+6``, 3x4 ``+15``
+   (work/REVIEW-ADVERSARIAL-R6.md §7.1).  On ``f5.docx``: 261 ``w:p`` in XML
+   against 287 ``Word.Paragraphs`` with 26 ``w:tr``.  So never translate an XML
+   index into ``Paragraphs(i)`` by arithmetic — least of all by row count; carry
+   both and label them.
 3. ``\\h`` on a REF field does **not** create a ``w:hyperlink`` element.  A real
    wrapper — ``<w:hyperlink w:anchor="..." w:history="1">`` around the whole
    field — is what makes ``Document.Hyperlinks.Count >= 1`` and
@@ -541,7 +545,7 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
       disagree about which paragraphs the document calls a TOC.
 
     ``monotonic`` answers the question a reader asks first: do the numbers ever
-    go backwards?  Two things make a naive reading wrong, both measured:
+    go backwards?  Three things make a naive reading wrong, all measured:
 
     * the token has to be read under the **counter of its own section**
       (``_token_number``'s ``fmt``); ``a, b, c`` in a Latin appendix is 1, 2, 3,
@@ -551,6 +555,12 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
       such a boundary reports a correct thesis TOC as broken, so the comparison
       is made **within one section** only.  ``monotonic_across_sections`` keeps
       the blunt whole-document answer visible for callers that want it.
+    * **case is part of the counter family**: ``A, B`` is ``upperLetter`` and
+      ``a, b`` is ``lowerLetter``, so a case-only change splits runs the same
+      way an alphabet change does.  The step across it is still *observed* in
+      ``monotonic`` (``A, B, a, b`` really does go 2 -> 1) but the verdict is
+      downgraded to ``unknown``: from the bytes, a restarted counter in the
+      other case and a mis-cased token look the same.
 
     ``page_parse_failures`` lists the entries whose trailing page number could
     not be read at all — an entry with no number is a broken TOC even when it
@@ -641,8 +651,18 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
     # false alarm this split was introduced to remove, so the mapping below is
     # exhaustive and the fallback is a *refusal to judge*, not a green light
     # (work/REVIEW-ADVERSARIAL-R6.md 第三轮 阻塞-④).
-    _FAMILY_FMT = {"roman": "lowerRoman", "letter": "lowerLetter",
-                   "decimal": "decimal"}
+    #
+    # Case is part of the family: Word's letter and Roman counters each come
+    # in a lower and an UPPER case (``lowerLetter``/``upperLetter``,
+    # ``lowerRoman``/``upperRoman``), and a case change between two counters
+    # is a legitimate restart, so ``upperLetter -> lowerLetter`` must split
+    # runs just like ``roman -> decimal`` does (work/P3-REPORT-B.md §1.5,
+    # adopted for R7-5a).  The bare ``letter``/``roman`` keys stay because a
+    # run of single-letter tokens is *inferred* to be Latin in pass 2 below.
+    _FAMILY_FMT = {"roman": "lowerRoman", "roman_upper": "upperRoman",
+                   "roman_lower": "lowerRoman",
+                   "letter": "lowerLetter", "letter_upper": "upperLetter",
+                   "letter_lower": "lowerLetter", "decimal": "decimal"}
 
     def _family(tok):
         t = str(tok).strip()
@@ -654,16 +674,39 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
         if not low.isalpha():
             # Punctuation or a mix: no counter family this tool can read.
             return None
+        # The case of the token is the case of the counter that wrote it
+        # (``A, B`` is ``upperLetter``; ``a, b`` is ``lowerLetter``).  A token
+        # that mixes cases inside itself (``Aa``) is an artefact no counter
+        # emits and is typed by its lowercase form.  A single letter that
+        # could be Roman stays ``single`` -- case-free -- because its
+        # alphabet is not settled until the run speaks.
+        case = "upper" if t.isupper() else "lower"
         if len(low) > 1 and all(ch in _ROMAN_VALUE for ch in low):
-            return "roman"
+            return "roman_" + case
         if len(low) > 1:
-            return "letter"
+            return "letter_" + case
         # A single letter is ambiguous only if it could be a Roman numeral.
         # Seven letters can (i v x l c d m); every other letter -- a, b, e, f,
         # k, ... -- is unambiguously a Latin sequence number, and saying so
         # keeps an appendix numbered ``a, b, c`` from being reported as
         # unreadable.
-        return "single" if low in _ROMAN_VALUE else "letter"
+        return "single" if low in _ROMAN_VALUE else "letter_" + case
+
+    def _glyph_case(tok):
+        """``"upper"`` / ``"lower"`` for an ASCII letter token, else ``None``.
+
+        Decimal tokens carry no case, so a step between a letter and a
+        decimal is never a *case* change; a token that mixes cases inside
+        itself does not speak for either counter.
+        """
+        t = str(tok).strip()
+        if not (t.isascii() and t.isalpha()):
+            return None
+        if t.isupper():
+            return "upper"
+        if t.islower():
+            return "lower"
+        return None
 
     # Two passes, because a lone letter cannot be typed until its neighbours
     # speak.  ``i`` opens either ``i, ii, iii`` (Roman) or ``i, j, k`` (Latin);
@@ -697,7 +740,23 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
     unparsed = sum(1 for fam in families if fam is None)
 
     monotonic = True
+    # A step down that coincides with a case change (``II -> i``, ``B -> a``)
+    # is *observed* -- it drives ``monotonic`` False exactly like any other
+    # backwards step -- but it is not *asserted*: from the bytes alone, a
+    # counter restarted in the other case (``upperLetter`` front matter, then
+    # ``lowerLetter`` body) cannot be told apart from a mis-cased token, so
+    # the verdict is downgraded below for the same reason a declared
+    # ``w:start`` restart is.  The observation runs over adjacent *readable*
+    # tokens across runs too, not just within a run: the splitter hands a
+    # lone ``i`` (family ``single``) to the previous run, where it still reads
+    # as a drop under that run's counter -- the token pair, not the run edge,
+    # is what carries the case change.  The loops below therefore no longer
+    # break at the first backwards step: the case observation and the
+    # ``unparsed`` count must see the whole stream.
+    case_restart = False
     pos = 0
+    prev_num = None
+    prev_case = None
     for run in runs:
         if run == [None]:
             pos += 1
@@ -719,18 +778,23 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
             unparsed += len(run)
         run_nums = []
         for _ in run:
-            num = _token_number(tokens[pos], _FAMILY_FMT[fam])
+            tok = tokens[pos]
+            num = _token_number(tok, _FAMILY_FMT[fam])
             pos += 1
             if num is None:
                 if settled:
                     unparsed += 1
                 continue
+            tok_case = _glyph_case(tok)
+            if (prev_num is not None and num < prev_num
+                    and prev_case and tok_case and prev_case != tok_case):
+                monotonic = False
+                case_restart = True
+            prev_num = num
+            prev_case = tok_case
             run_nums.append(num)
             if any(b < a for a, b in zip(run_nums, run_nums[1:])):
                 monotonic = False
-                break
-        if not monotonic:
-            break
 
     # A green ``monotonic`` over a half-read TOC is not a clean verdict, so the
     # count is published as an integer and the boolean is *downgraded* when any
@@ -748,13 +812,23 @@ def _toc_audit(paras, style_names, limit: int = DEFAULT_LIMIT,
     # Only a ``start`` on a section *after the first* restarts a counter.  The
     # first section's ``start="1"`` is where numbering begins, not a restart, so
     # counting it would downgrade every ordinary document to ``unknown``.
+    #
+    # There is a third reason to refuse a verdict, structurally identical to
+    # the second: a case change inside one alphabet.  ``A, B, a, b`` (front
+    # matter on ``upperLetter``, body restarted on ``lowerLetter``) reads
+    # ``1, 2, 1, 2`` and the ``2 -> 1`` step is real in ``monotonic`` -- but
+    # the bytes cannot say whether the second half is a restarted counter or
+    # a mis-cased continuation, so ``case_restart`` downgrades the verdict
+    # exactly the way a declared restart does.  A case change *without* a
+    # step down (``a, b, E, F``) asserts nothing scary and stays ``true``; a
+    # step down *without* a case change (``c, a, b``) is still ``false``.
     restarts = [s for s in (section_specs or [])
                 if s.get("start") and (s.get("index") or 1) > 1]
     if monotonic and unparsed:
         verdict = "unknown"
     elif monotonic:
         verdict = "true"
-    elif restarts:
+    elif restarts or case_restart:
         verdict = "unknown"
     else:
         verdict = "false"
@@ -834,8 +908,12 @@ def _section_specs(body, all_paras) -> list:
       ``paragraphs_xml``.
 
     ``index_space`` on each dict says which pair the *span* is in, so a caller
-    never has to guess: it is ``"direct"`` (the natural one for "which section
-    is this body paragraph in") and both pairs are always present.
+    never has to guess: it is ``"direct"`` (the pair the ``w:sectPr`` walk is
+    itself defined on — a section is opened and closed by body-direct
+    paragraphs) and both pairs are always present.  A consumer that wants the
+    XML space asks for it explicitly instead of re-deriving it here:
+    :func:`estimated_paragraph_pages` takes ``index_space="xml"`` and stamps the
+    same value on its rows.
 
     A middle section whose closing paragraph carries the ``sectPr`` is closed by
     *that* paragraph.  The final section runs to the end of the body, so it is
@@ -2042,11 +2120,11 @@ def probe_word(docx, pdf_path=None, png_dir=None, dpi: int = 110,
 # merge / expectations / reporting
 # ===========================================================================
 def estimated_paragraph_pages(section_specs, section_details=None,
-                              indices=None) -> dict:
+                              indices=None, index_space="xml") -> dict:
     """Structural page estimate used when Word is absent.  **Not a page number.**
 
     Compute what can honestly be computed from the bytes: which section each
-    requested paragraph belongs to (``section_specs[].first_para_index``), that
+    requested paragraph belongs to (``section_specs[].first_para_index_xml``), that
     section's counter format, and — when ``section_details`` came from a earlier
     Word run — where the section's *last* page was.  What cannot be computed is
     where inside the section a paragraph falls, because that needs layout.
@@ -2064,31 +2142,63 @@ def estimated_paragraph_pages(section_specs, section_details=None,
     is on".
 
     **The section mapping inherits the XML index space, not Word's.**  Word
-    counts one extra paragraph per table row (module docstring, fact 2), so once
-    a document has tables, paragraph *n* in the XML is a different paragraph from
-    ``Paragraphs(n)`` in Word.  Measured on ``work/subjects/math/paper.docx``
-    (one table): XML ordinal 95 (Word index 96) maps to section 5 here while Word
-    says section 4.  Every row therefore carries ``index_space: "xml"``, and
-    :func:`build_report` raises a warning whenever the document has table rows
-    and the estimate is being used.  With Word present this whole function is
-    bypassed — the Word layer resolves the section from the paragraph's own
-    range, which has no drift.
+    inserts extra paragraph marks for tables — measured as ``columns + 1`` per
+    row, not a flat ``+1`` (work/REVIEW-ADVERSARIAL-R6.md §7.1) — so the two
+    spaces drift and neither can be translated into ``Paragraphs(n)`` by
+    arithmetic.  On ``work/subjects/math/paper.docx`` (one table, 130 ``w:p``,
+    102 of them body-direct, 5 sections) the 0-based ordinal 95 gets *different*
+    answers from the two spaces: body-direct puts it in section 5, the XML space
+    in section 4 — and Word's ``Paragraphs(96)`` was measured in section 4
+    (work/REVIEW-ADVERSARIAL-R6.md).  That is why the XML space is the default
+    here: it is the space the rest of the report speaks, and on this document it
+    is the one that agrees with Word.  Agreement is not a guarantee — the drift
+    is structural — so :func:`build_report` still warns whenever the document
+    has table rows, and every row still says ``exact: false``.  With Word
+    present this whole function is bypassed: the Word layer resolves the section
+    from the paragraph's own range, which has no drift.
+
+    **Which span is compared is a parameter, and the label always says which.**
+    ``_section_specs`` emits *two* pairs (``first/last_para_index`` over the
+    body's direct ``<w:p>`` children and ``first/last_para_index_xml`` over
+    ``root.iter(w:p)``), and mixing them silently maps nearly every paragraph to
+    section 1 (work/REVIEW-ADVERSARIAL-R6.md 应修-4).  ``index_space`` picks the
+    pair *and* is copied onto every row, so the label cannot drift from the
+    arithmetic again — the previous revision compared the body-direct pair while
+    stamping ``"xml"`` on the rows, which handed a caller section ``None`` for
+    every paragraph living inside ``<w:tbl>`` (measured: a 1-column/3-row table
+    made XML ordinals 4-5 unresolvable and mapped ordinal 3 to section 2 instead
+    of 1; work/P3-REPORT-B.md).
+
+    ``index_space="xml"`` is the default because it is the space the rest of the
+    report already publishes (``paragraphs_xml``, ``numpr_paragraphs[].index_xml``,
+    ``_vertalign_claims[].para_index``, and the ``_section_of_para`` lookup that
+    ``toc_audit`` uses).  ``index_space="direct"`` is for a caller who wants
+    "which body paragraph" and never looks inside tables.  Note that
+    ``section_specs[].index_space`` stays ``"direct"``: it records the pair the
+    ``w:sectPr`` walk is *defined* on, not the pair a consumer should use.
 
     Returns::
 
         {"source": "computed",
          "warning": "...computed 不得当作交付页码...",
+         "index_space": "xml",
          "rows": [{"index": i, "section": sidx, "page_format": fmt,
                    "physical": None, "displayed_number": n,
                    "displayed_text": glyph, "exact": False,
                    "basis": "section-start", "index_space": "xml"}]}
     """
     specs = list(section_specs or [])
+    spaces = {"xml": ("first_para_index_xml", "last_para_index_xml"),
+              "direct": ("first_para_index", "last_para_index")}
+    if index_space not in spaces:
+        raise ValueError("index_space must be one of %s, got %r"
+                         % (sorted(spaces), index_space))
+    first_key, last_key = spaces[index_space]
     bounds = []
     for pos, spec in enumerate(specs):
-        start = spec.get("first_para_index")
-        end = spec.get("last_para_index")
-        nxt = (specs[pos + 1].get("first_para_index")
+        start = spec.get(first_key)
+        end = spec.get(last_key)
+        nxt = (specs[pos + 1].get(first_key)
                if pos + 1 < len(specs) else None)
         bounds.append((spec.get("index", pos + 1), start, end, nxt,
                        spec.get("fmt"), spec.get("start")))
@@ -2104,10 +2214,10 @@ def estimated_paragraph_pages(section_specs, section_details=None,
         except (TypeError, ValueError):
             continue
         # Same index convention as ``probe_word``: Word ``Paragraphs`` indices
-        # are 1-based, the section spans are 0-based ordinal over direct
-        # paragraphs.  Converting in one place keeps the two layers comparable —
-        # the same ``--page-probe`` list can be read by either and mean the same
-        # paragraph.
+        # are 1-based, the section spans are 0-based ordinals in the space
+        # ``index_space`` names.  Converting in one place keeps the two layers
+        # comparable — the same ``--page-probe`` list can be read by either and
+        # mean the same paragraph.
         ordinal = idx - 1
         hit = None
         for sidx, start, end, nxt, fmt, st in bounds:
@@ -2127,7 +2237,8 @@ def estimated_paragraph_pages(section_specs, section_details=None,
             rows.append({"index": idx, "section": None, "page_format": None,
                          "physical": None, "displayed_number": None,
                          "displayed_text": None, "exact": False,
-                         "basis": "unknown-section", "index_space": "xml"})
+                         "basis": "unknown-section",
+                         "index_space": index_space})
             continue
         sidx, fmt, st = hit
         num = None
@@ -2145,10 +2256,11 @@ def estimated_paragraph_pages(section_specs, section_details=None,
             "section_last_page": last_page.get(sidx),
             "exact": False,
             "basis": "section-start",
-            "index_space": "xml",
+            "index_space": index_space,
         })
     return {
         "source": "computed",
+        "index_space": index_space,
         "warning": ("computed: 结构性估算（按节起始页码推），不是排版结果；"
                     "computed 不得当作交付页码"),
         "rows": rows,
@@ -2348,7 +2460,9 @@ def build_report(args) -> dict:
                 "paragraph_pages indexes are XML ordinals, but this document has "
                 "%d table row(s): Word counts one extra paragraph per row, so an "
                 "index here is not Paragraphs(n) in Word — run with Word for "
-                "measured values" % xml["table_rows"])
+                "measured values; paragraphs inside a table do resolve to their "
+                "section in this index space, only the Word paragraph ordinal "
+                "drifts" % xml["table_rows"])
 
     numbering_render = []
     mismatch = 0

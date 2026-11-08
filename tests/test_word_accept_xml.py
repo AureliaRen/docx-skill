@@ -1041,6 +1041,86 @@ def test_table_rows_warn_about_the_index_space(tmp_path):
     assert any("table row" in w for w in rep["warnings"])
 
 
+# Two spans for the same document, chosen so they disagree: body-direct says
+# section 1 covers paragraphs 0-1 and section 2 covers 2, while the
+# ``root.iter(w:p)`` walk says section 1 covers 0-4 and section 2 covers 5 --
+# three table-cell paragraphs sit in between (work/P3-REPORT-B.md).
+SPLIT_SPACE_SPECS = [
+    {"index": 1, "first_para_index": 0, "last_para_index": 1,
+     "first_para_index_xml": 0, "last_para_index_xml": 4,
+     "fmt": None, "start": None},
+    {"index": 2, "first_para_index": 2, "last_para_index": 2,
+     "first_para_index_xml": 5, "last_para_index_xml": 5,
+     "fmt": "decimal", "start": "1"},
+]
+
+
+def test_estimated_paragraph_pages_compares_the_span_it_labels():
+    """The row's ``index_space`` names the span that was actually compared.
+
+    This is the regression guard for the revision that computed the answer from
+    the body-direct pair while stamping ``"xml"`` on every row.  Measured on a
+    1-column/3-row table (``work/P3-REPORT-B.md``): the label said ``xml`` but
+    probe indices 4-5 came back ``section: None`` and index 3 was called section
+    2, although their XML ordinals all sit inside section 1.
+    """
+    est = wa.estimated_paragraph_pages(SPLIT_SPACE_SPECS, None, [1, 3, 4, 6])
+    assert est["index_space"] == "xml"
+    assert all(r["index_space"] == "xml" for r in est["rows"])
+    # 3 and 4 are table-cell paragraphs: inside section 1 in the XML space, and
+    # the previous (body-direct) arithmetic is what made them vanish.
+    assert [r["section"] for r in est["rows"]] == [1, 1, 1, 2]
+    assert est["rows"][3]["page_format"] == "decimal"
+    assert est["rows"][3]["displayed_text"] == "1"
+
+
+def test_estimated_paragraph_pages_direct_space_is_labelled_direct():
+    """Asking for the body-direct span relabels the rows instead of lying.
+
+    The other half of the same guard: a caller who wants "which body paragraph"
+    gets the direct answer *and* sees ``"direct"`` on every row, so the two
+    spaces can never be confused by reading the output.
+    """
+    est = wa.estimated_paragraph_pages(SPLIT_SPACE_SPECS, None, [1, 3, 4, 6],
+                                       index_space="direct")
+    assert est["index_space"] == "direct"
+    assert all(r["index_space"] == "direct" for r in est["rows"])
+    assert [r["section"] for r in est["rows"]] == [1, 2, None, None]
+    assert est["rows"][2]["basis"] == "unknown-section"
+
+
+def test_estimated_paragraph_pages_rejects_an_unknown_index_space():
+    """A space the function cannot honour is a caller bug, not a silent fallback."""
+    with pytest.raises(ValueError) as exc:
+        wa.estimated_paragraph_pages(SPLIT_SPACE_SPECS, None, [1],
+                                     index_space="word")
+    assert "index_space" in str(exc.value)
+
+
+def test_paragraph_pages_inside_a_table_resolve_in_the_xml_space(tmp_path):
+    """End to end: a probe index pointing inside a table gets its section.
+
+    Body layout is ``0 cover`` / ``1-3 table cells`` / ``4 (sectPr)`` /
+    ``5 body``; ``--page-probe`` is 1-based, so 1,3,4,6 name those paragraphs in
+    XML order.  Before the fix the direct-ordinal arithmetic returned
+    ``[1, 2, None, None]`` for the same document.
+    """
+    doc = Document()
+    doc.add_paragraph("cover")
+    t = doc.add_table(rows=3, cols=1)
+    for r in range(3):
+        t.cell(r, 0).text = "cell%d" % r
+    doc.add_section()
+    doc.add_paragraph("body")
+    rep = wa.build_report(wa.build_parser().parse_args(
+        [str(save(doc, tmp_path)), "--word", "off", "--page-probe", "1,3,4,6"]))
+    assert rep["paragraph_pages_source"] == "computed"
+    rows = rep["paragraph_pages"]
+    assert [r["index"] for r in rows] == [1, 3, 4, 6]
+    assert [r["section"] for r in rows] == [1, 1, 1, 2]
+    assert all(r["index_space"] == "xml" for r in rows)
+
+
 def test_page_probe_cli_parsing():
     parser = wa.build_parser()
     args = parser.parse_args(["x.docx", "--page-probe", "1, 9,9, 43"])
