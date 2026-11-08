@@ -327,6 +327,27 @@ letters c,b,a                    tokens=['c','b','a']        monotonic=False acr
 `a,b,c` 的 `partial=True` 说明单字母无法判定族（`c` 是罗马 100 还是字母 3），
 所以结论降级为 `unknown`——宁可说"判不了"，也不给假绿灯。
 
+### 7.1 大小写本身是两个计数器
+
+Word 的 `upperLetter` / `lowerLetter`（以及 `upperRoman` / `lowerRoman`）是**四个独立计数器**，
+所以 `A,B,C` 之后接 `a,b,c` 不是"页码倒退"，而是换了一个计数器重新从 1 数。
+
+但大小写换族不像切节那样有 `w:start` 可查，只能从 token 形态推断，于是判据是
+**"同一对相邻 token 上同时出现下坠和大小写翻转"**——两个信号重合才认定是换族重起：
+
+```
+A,B,a,b          → monotonic=False, verdict="unknown"   （看得见下坠，但可归因于换族）
+I,II,III,i,ii    → monotonic=False, verdict="unknown"
+A,B,C,a,b,c      → monotonic=False, verdict="unknown"   （下坠跨 run 边界，仍能配对）
+M,D,C            → monotonic=False, verdict="false"     （纯下坠、无翻转：真倒退）
+c,a,b            → monotonic=False, verdict="false"     （纯下坠、同族：真倒退）
+A,a              → monotonic=True,  verdict="true"      （无下坠：同一计数器的重复读法）
+A,B,E,F          → monotonic=True,  verdict="true"      （翻转但无下坠：不降级）
+```
+
+`monotonic` 仍如实报 `False`（"我确实看到了下坠"），`verdict` 才降 `unknown`（"但说不清是不是错"）。
+这与 `w:start` 造成的合法重启是同一套语义：**看得见，但不判**。
+
 ## 8. 完整可跑的例子
 
 三份文件都在 `%TEMP%` 之下，不写死任何本机路径。
