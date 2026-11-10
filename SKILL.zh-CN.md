@@ -6,7 +6,7 @@ license: MIT
 
 # docx — 离线 docx 处理
 
-`scripts/` 全平铺，27 个文件：18 个 argparse CLI（含 `fix_zoom.py`）+ 1 个自检入口（`fix_phasor_dot.py`，无 argparse，`__main__` 跑回归用例）+ 7 个纯库模块（`docx_common.py` 带 `--api` 自述入口，没有 CLI 行为）+ 1 个 PowerShell 导出脚本。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
+`scripts/` 全平铺，**26 个 `.py` + 1 个 `.ps1` = 27 个文件**。**25 个是 CLI**（各自带 `if __name__ == "__main__"` 守卫，能直接从命令行跑），**`_bootstrap.py` 是唯一的纯库**；这 25 个里 **18 个有 argparse 表面**（`--help` 打印 `usage: …`），另 7 个有 `__main__` 但没有 argparse——6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot.py` 跑的是自检。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码，`--page-probe` 只属于它）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
 
 ## 环境
 
@@ -19,6 +19,13 @@ python -m pip install -r requirements.txt
 `latex2mathml` 只有公式功能才需要。OMML 生成另外要本机装 Microsoft Office 提供的
 `MML2OMML.XSL`（转换器复用它那张样式表）——装在非常规位置时用 `MML2OMML_XSL` 指过去。
 
+**两项能力只在 Windows 上成立，而且是在调用时才炸、不在安装时预警。** **公式链**要
+`MML2OMML.XSL`，而 `math_omml.find_xslt()` 只探测 Windows 的 Office 安装位置
+（`%ProgramFiles%`、`%ProgramFiles(x86)%`、`%LOCALAPPDATA%`、写死的 `C:\Program Files…`），
+Linux / macOS 上必抛 `FileNotFoundError`，除非自己放一份并设 `MML2OMML_XSL`。**PDF 导出**
+走 Word COM。其余全部（创建 / 读取 / 编辑 / 校验 / 批注 / 修订 / 编号 / 交叉引用 / 静态目录 /
+分节 / 表格几何 / 字体 / 合并 / 模板 / `docx_pack`）是纯 `python-docx` + `lxml`，不用装 Office。
+
 ## 路由表
 
 | 我要做什么 | 用哪个 |
@@ -27,7 +34,7 @@ python -m pip install -r requirements.txt
 | 改现有文档（查找替换、改单元格、插删段落、套样式、TOC、页码） | `docx_edit.py <sub>` |
 | 读内容 / 提结构 / 看样式 / 抽图 / 查修订 | `docx_read.py file.docx --text\|--structure\|--styles\|--images DIR\|--revisions` |
 | 健康检查（包完整性、关系、图片 magic、样式引用） | `docx_validate.py file.docx`（`ok:false` → exit 1） |
-| 批注增删查 | `docx_comments.py list\|add --target ... \|delete --id N` |
+| 批注增删查 | `docx_comments.py list\|add --target ... \|delete --id N`（**id 从 `0` 起**，`list` 会打印真实 id） |
 | 修订接受/拒绝 | `docx_revisions.py list\|accept-all\|reject-all\|accept --id N\|reject --id N` |
 | `{{token}}` 占位符填充 | `docx_template.py fill tpl.docx values.json out.docx [--strict]` |
 | 抽/套格式模板 | `docx_template.py extract\|apply` |
@@ -201,7 +208,9 @@ Word COM：`Documents.Open($path, $false, $true)`（第三参 ReadOnly，不占�
 
 合并后自检：段落数 = base×2 + 1（分页符段）、`word/media/*` 数量守恒、`sectPr` 仅 1 份且逐属性等于 base。
 
-## 库模块（无 CLI，只能 import）
+## 库模块（只能 import）
+
+**`_bootstrap.py` 是唯一的纯库**：没有 `__main__`、没有 argparse，每个脚本都在解析参数之前先 import 它——**新脚本第一件事就是 `import _bootstrap`**，一行覆盖 `sys.path` 自举、minidom 兜底与 UTF-8 stdio。下面七个模块同样以 import 为用途——其中六个带一行 `__main__` 自述、`fix_phasor_dot` 带自检，裸跑都不干活。它们一律按裸模块名 reach，因为每个脚本都把自己所在目录塞进 `sys.path`（见 §约定）。
 
 | 模块 | 提供什么 |
 |---|---|
@@ -210,10 +219,10 @@ Word COM：`Documents.Open($path, $false, $true)`（第三参 ReadOnly，不占�
 | `fix_phasor_dot.py` | `fix_phasor_dots(omml) -> int`（`__main__` 跑自检） |
 | `docx_pack.py` | `unpack` / `pack`：解到目录、再打回 .docx；保留原条目顺序与压缩方式，往返一次不改内容即等价归档 |
 | `docx_utils.py` | `wtag` / `register_all` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` |
-| `docx_common.py` | `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`（`--api` 自述） |
 | `encoding.py` | `_fix_stdio()`（Windows 下 stdout 切 UTF-8） |
 | `minidom_compat.py` | `defusedxml.minidom` 缺失时兜底 stdlib |
-| `_bootstrap.py` | 平铺自举：`sys.path` + minidom / UTF-8 兜底；**新脚本第一件事就是 `import _bootstrap`** |
+
+`docx_common.py` **故意不在这张表里**：它有真 argparse 表面（`--api` 打印它导出的辅助函数），按判据算 CLI。
 
 两个 CLI（`table_width.py`、`insert_formula.py`）吃**解包目录**——把 .docx 解成一堆 XML 再直接改。`docx_template.py apply --to` 反过来直接就地改写打包好的 .docx，所以给它 `.docx` 文件本身，别给解包目录。解包/打回：
 
@@ -225,7 +234,7 @@ pack("unpacked/", "out.docx", original="in.docx")
 
 `pack` 会沿用原文件的条目顺序与压缩方式，所以原样往返得到的是等价归档（字节级 diff 不会因为重新 deflate 而变噪音）。
 
-`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠都会被拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
+`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠、以及 Windows 盘符形式（如 `D:/x.txt`）都会被拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
 
 ## references/：细节在这里，别塞进本文件
 

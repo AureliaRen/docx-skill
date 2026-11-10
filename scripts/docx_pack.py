@@ -14,6 +14,12 @@ Design notes
   (`../`, absolute paths, backslashes) are rejected rather than written. An
   archive is untrusted input; a crafted .docx must not be able to write outside
   the directory it is unpacked into.
+  "Absolute" here includes **Windows drive-letter forms** — `D:/x.txt`, `D:x.txt`
+  and `//server/share/x.txt`. They are not POSIX-absolute, but `pathlib` on
+  Windows treats them as rooted, and `dst / "D:/x.txt"` silently *discards* the
+  left-hand side, so the entry would land outside the extraction root. Drive
+  prefixes are detected with `ntpath.splitdrive`, which is a no-op on POSIX (it
+  returns an empty drive, so Linux behaves exactly as before).
 * **No dependency on `docx_utils`.** Kept standalone so it can be used by any
   script without dragging in the XML helper surface.
 
@@ -26,8 +32,10 @@ Usage::
 """
 from __future__ import annotations
 
+import ntpath
 import posixpath
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 
@@ -42,6 +50,16 @@ def _safe_member(name: str) -> str:
     """Normalize a zip entry name, rejecting anything outside the root."""
     if not name:
         raise UnsafeArchiveError("empty archive entry name")
+    # Drive-prefix check must come before the POSIX ones: "D:/x.txt" and "D:x.txt"
+    # are not POSIX-absolute, yet pathlib on Windows treats both as rooted and
+    # `dst / "D:/x.txt"` drops `dst` entirely. splitdrive is empty on POSIX, so
+    # this branch never fires on Linux. It also reports UNC shares ("//host/share")
+    # with a non-empty drive, hence "prefix" rather than "letter".
+    drive, _ = ntpath.splitdrive(name)
+    if drive:
+        raise UnsafeArchiveError(
+            f"archive entry is absolute (drive prefix): {name!r}"
+        )
     if "\\" in name:
         raise UnsafeArchiveError(f"archive entry is not a POSIX path: {name!r}")
     if name.startswith("/"):
@@ -138,7 +156,42 @@ def pack(src_dir: str | Path, out_path: str | Path,
     return out
 
 
+_USAGE = """\
+docx_pack is a library module, not a command-line tool.
+
+Import it instead of running it:
+
+    from docx_pack import unpack, pack
+
+    unpack(docx_path, out_dir) -> Path
+        Extract every part of a .docx into out_dir. Rejects entries that would
+        escape out_dir (../, absolute paths, Windows drive letters).
+
+    pack(src_dir, out_path, original=None) -> Path
+        Zip src_dir into out_path. Pass original= to reuse its entry order and
+        compression method, so editing one part keeps the file byte-faithful.
+
+    from docx_pack import UnsafeArchiveError
+        Raised by both functions for entries that are not safe members.
+
+There are no subcommands: any argument other than -h/--help exits 2.
+"""
+
+
+def _main(argv: "list[str]") -> int:
+    """Print usage for -h/--help, refuse everything else (no silent success)."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print(_USAGE, end="")
+        return 0
+    print(
+        "docx_pack is a library module and has no CLI subcommands; "
+        "use `from docx_pack import unpack, pack`.",
+        file=sys.stderr,
+    )
+    print("Run `python docx_pack.py --help` for the API summary.",
+          file=sys.stderr)
+    return 2
+
+
 if __name__ == "__main__":
-    print("docx_pack is a library module, import it:")
-    print("    from docx_pack import unpack, pack  # + UnsafeArchiveError")
-    raise SystemExit(0)
+    raise SystemExit(_main(sys.argv[1:]))

@@ -35,6 +35,13 @@
 
 Linux / macOS 可用除**公式链**与**PDF 导出**以外的全部功能。
 
+两条边界都在**调用时**才炸，不在安装时预警，所以这里写明：
+
+- **公式链**（`docx_mathify.py` / `insert_formula.py` / 任何走到 `math_omml` 的路径）要 `MML2OMML.XSL`，而 `math_omml.find_xslt()` 只探测 Windows 的 Office 安装位置（`%ProgramFiles%`、`%ProgramFiles(x86)%`、`%LOCALAPPDATA%`、写死的 `C:\Program Files…`），Linux / macOS 上必然抛 `FileNotFoundError`——除非自己放一份并设 `MML2OMML_XSL` 指过去。这条链目前只在 Windows 上实测过。
+- **PDF 导出**（`pdf_export.ps1`）走 Word COM，天然绑 Windows + 本机 Word。
+
+其余全部（创建 / 读取 / 编辑 / 校验 / 批注 / 修订 / 编号 / 交叉引用 / 静态目录 / 分节 / 表格几何 / 字体 / 合并 / 模板 / `docx_pack`）是纯 `python-docx` + `lxml`，**机器上完全不用装 Office**。
+
 旧式二进制 `.doc` 不支持——先用 Word 另存为 `.docx`，或在外部用 LibreOffice 转换。
 
 ## 安装
@@ -72,7 +79,16 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 
 ## 脚本清单（`scripts/`，27 个文件）
 
-`scripts/` 下 **26 个 `.py` + 1 个 `.ps1`，共 27 个文件**，全部平铺、无子包、无 `__init__.py`。「CLI」列指该脚本自己有 argparse 入口，可直接命令行调用；「库」列指被别的脚本 import。
+`scripts/` 下 **26 个 `.py` + 1 个 `.ps1`，共 27 个文件**，全部平铺、无子包、无 `__init__.py`。分类只用一条判据，且 `ci.yml` 是机械推导的、不靠这段文字自觉——两条规则取并集（`_*` 前缀 **或** 没有 `if __name__ == "__main__"` 守卫）即判为**纯库**：
+
+| 桶 | 数量 | 判据 |
+|---|---|---|
+| **CLI** | **25** | 带 `__main__` 守卫，能直接从命令行跑 |
+| **纯库** | **1** | `_bootstrap.py` —— 私有模块，在解析参数之前就被 import，永远不单独运行 |
+
+这 25 个 CLI 里，**18 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。
+
+下表末列含义：`✔` = 有 argparse 表面｜`自检` = 有 `__main__`、跑自检｜`库` = 无 argparse 表面（6 个带一行 `__main__` 自述；`_bootstrap` 连 `__main__` 都没有）｜`PS` = PowerShell。
 
 | 文件 | 作用 | CLI |
 |---|---|---|
@@ -80,7 +96,7 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 | `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` | ✔ |
 | `docx_read.py` | `--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` | ✔ |
 | `docx_validate.py` | 包级健康检查，`ok:false` 时 exit 1 | ✔ |
-| `docx_comments.py` | 批注 `list` / `add --target` / `delete --id` | ✔ |
+| `docx_comments.py` | 批注 `list` / `add --target` / `delete --id`（**id 从 `0` 起**） | ✔ |
 | `docx_revisions.py` | 修订 `list` / `accept-all` / `reject-all` / `accept` / `reject` | ✔ |
 | `docx_template.py` | `extract` / `apply`（`-o` 需 node + docx-js，`--to` 打回现有文档）/ `fill`（`{{token}}`） | ✔ |
 | `docx_numbering.py` | 自动编号 `list` / `define` / `apply` / `detach` / `restart` | ✔ |
@@ -94,11 +110,11 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 | `docx_mathify.py` | 批量把线性公式换成 OMML（`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`） | ✔ |
 | `insert_formula.py` | 解包目录插单条 LaTeX 公式（`--after` / `--before` / `--display` / `--dump`） | ✔ |
 | `docx_pack.py` | 解包/重打包（`unpack` / `pack`）：按原条目顺序与压缩方式回写 | 库 |
-| `docx_common.py` | 段落遍历 + 保格式替换；`--api` 自述入口 | 库 |
+| `docx_common.py` | 共享段落遍历：`iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`；`--api` 打印导出面 | ✔ |
 | `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` | 库 |
 | `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts` / `UNITS` | 库 |
 | `math_omml.py` | LaTeX → MathML → OMML（`latex_to_omml_lxml` / `assert_legal`） | 库 |
-| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`，修相量点浮大 | 库 |
+| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`，修相量点浮大（`__main__` 跑自检） | 自检 |
 | `encoding.py` | Windows 下 stdout/stderr 切 UTF-8（`_bootstrap` 已触发） | 库 |
 | `minidom_compat.py` | `defusedxml.minidom` 缺失时兜底 stdlib | 库 |
 | `_bootstrap.py` | 平铺布局自举：`sys.path` + 运行时兜底 | 库 |
@@ -107,18 +123,20 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 ### 仓内目录与 import 纪律
 
 ```
-scripts/    所有 CLI，平铺，按裸模块名 import
-tools/      word_accept.py 等验收工具（--page-probe 在这里）
+scripts/    所有 CLI，平铺，按裸模块名 import —— 27 个文件（25 个 CLI + 1 个纯库 + 1 个 .ps1）
+tools/      word_accept.py 等验收工具；**`--page-probe` 只在这里**
 references/ 长文档笔记，按需阅读，不进 import 路径
 tests/      pytest 套件
 examples/   示例 spec（basic.json / formulas.json）
 ```
 
+`tools/` 只有一个大件 `word_accept.py`，靠 Word COM 接受待处理修订、并报出每个段落实际落在第几页。**`--page-probe` 是它的开关，`docx_toc.py` 自己没有探测参数**——先用 `word_accept.py --page-probe` 量，再把量到的页码通过 `docx_toc.py --pages` 传回去。
+
 所有脚本共用一条 import 纪律：**先把自身所在目录塞进 `sys.path`，再 import 同级模块**。于是 `python scripts/x.py`、在 `scripts/` 里 `python x.py`、以及从别的目录用绝对路径调用，三种方式都能跑——没有一条 `__init__.py` 链要维护，也就没有一处会写错。
 
 ## 典型用法
 
-每个 CLI 脚本都是 CLI，先看 `--help` 再动手（另有 9 个纯库模块没有 CLI，只能 `import`，见上表「库」列）：
+18 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——见上表末列：
 
 ```bash
 python scripts/docx_create.py --help
@@ -136,7 +154,7 @@ pack("unpacked/", "out.docx", original="in.docx")
 
 `pack` 沿用原件的条目顺序与压缩方式，所以"什么都没改"的往返产出等价归档。
 
-`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠一律拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
+`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠、以及 Windows 盘符形式（如 `D:/x.txt`）一律拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
 
 五个常用动作：
 
@@ -169,7 +187,7 @@ python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
 
 完整命令表在 [SKILL.md](SKILL.md)（中文版 [SKILL.zh-CN.md](SKILL.zh-CN.md)）。
 
-还有一个面向 agent 的往返：每个脚本都在 stdout 上给结构性结果——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` 出 JSON，`docx_mathify` / `table_width` / `insert_formula` / `docx_template` 出人读文本（`fill` 除外，它出 JSON）。退出码可靠：`0` 成功，非零失败；`docx_mathify` 返回 `3` 表示文档写出去了但有公式没转成功。
+还有一个面向 agent 的往返：结构性结果一律走 **stdout 的 JSON**——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_section` / `docx_numbering` / `docx_crossref` / `docx_toc`；其余出人读文本（`docx_mathify` / `table_width` / `insert_formula` / `docx_template`，`fill` 除外，它出 JSON）。诊断信息一律走 stderr。退出码可靠：`0` 成功，非零失败；`docx_mathify` 返回 `3` 表示文档写出去了但有公式没转成功。
 
 六篇长文档笔记按需查（都在 `references/`）：
 
@@ -232,9 +250,9 @@ python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
 python -X utf8 -m pytest tests -q
 ```
 
-`tests/` 用 `subprocess` 调 argparse CLI，fixture 现场生成、产物写临时目录。`test_linear_to_latex.py` 的 B 段**依赖 `latex2mathml` + `MML2OMML.XSL`**，缺任一项会直接失败（无 skip 保护）——要跳过就 `--ignore=tests/test_linear_to_latex.py`。
+`tests/` 用 `subprocess` 调 argparse CLI，fixture 现场生成、产物写临时目录。依赖 `latex2mathml` **加** `MML2OMML.XSL` 的用例（`test_formula` / `test_units` / `test_mixed_superscript`）**自己 skip**，并写明原因 `needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)`——所以没有 Office 的机器得到的是**绿跑 + 更大的 skip 数**，不是红灯。全量实测（把 `MML2OMML_XSL` 指向一个不存在的文件来模拟「整机没有 Office」）：**1357 passed / 370 skipped / 0 failed**。
 
-其余按 `requirements.txt` 走：`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例自动 skip。
+其余按 `requirements.txt` 走：`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 
 ## 授权
 

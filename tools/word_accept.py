@@ -236,7 +236,7 @@ def _style_names(zf: zipfile.ZipFile):
     """``{styleId: style name}`` from ``word/styles.xml``.
 
     Necessary because ``<w:pStyle w:val="...">`` holds the *styleId*, not the
-    name.  In the 示例竞赛 source the TOC paragraphs carry ``val="9"``/``"12"``/
+    name.  In the 样例 source the TOC paragraphs carry ``val="9"``/``"12"``/
     ``"6"``, whose names are ``toc 1``/``toc 2``/``toc 3``; the Chinese body
     styles are ``章标题``/``节标题``/``条标题``/``正文`` behind numeric
     ids.  Anything that pattern-matches on style *names* without resolving
@@ -377,7 +377,7 @@ _TOC_NUM_AFTER_TAB_RE = re.compile(r"(?:[0-9]{1,4}|[A-Za-z]{1,6})")
 _TOC_NUM_LOOSE_RE = re.compile(r"[. ]([0-9]{1,4}|[A-Za-z]{1,6})\s*$")
 _TOC_STYLE_RE = re.compile(r"^(toc|目录|contents)", re.IGNORECASE)
 # A caption paragraph style, in the many names it is spelled with: Word's
-# built-in "caption", the demo template's "图表名", and the Chinese "题注".
+# built-in "caption", the sample template's "图表名", and the Chinese "题注".
 _CAPTION_STYLE_RE = re.compile(r"(caption|图表名|题注|图名|表名)", re.IGNORECASE)
 
 
