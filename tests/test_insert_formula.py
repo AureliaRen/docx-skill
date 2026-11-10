@@ -59,11 +59,30 @@ L158-164  insert_near(...) / marker not found: return 1        ← marker 检查
 第 6 条虽然有 ``out=None``，但那是**不产出文件**、不是 dry-run：`rebuild()` 照跑，
 计数照累。
 
+## P5-A1 补测（7～12 条）：三个开关 + `--before` 正向 + 表格单元格 +
+
+全部挂 `@needs_omml`，理由同上（`build_para()` 先于一切 marker 校验）。六条各锁一个
+**此前零覆盖**的开关或路径，断言口径全部来自实测（下面每条 docstring 里写了实测
+数字），不臆造期望值：
+
+7. ``--before`` 正向：公式段落落在 marker 段的**前一位**（此前只有「与 --after 互斥」
+   的反向用例，没有正向位置断言）；
+8. ``--display``：产物是 ``m:oMathPara``（块级）而非裸 ``m:oMath``，且**不带**行内
+   兜底的 U+200B run；
+9. ``--dump``：``document.xml`` 的 SHA256 与段落数**都不变**（真只读），stdout 是
+   可解析的 ``<w:p>`` 且含恰好 1 个 ``m:oMath``；
+10. ``--raw-spacing``：与默认路径的 OMML **结构差异**（默认把 ``\\quad`` 改写成 NBSP
+    run，raw 路径该 run 被 XSLT 丢掉）——默认 ``m:r`` 数比 raw 多 1；
+11. 表格单元格内 marker：``--after`` 命中 ``w:tc`` 里的文字时**真插进那个单元格**
+    （tc 内多出一段带 oMath 的 ``w:p``），body 直接子元素序列不变；
+12. ``--after`` + ``--dump`` 同时给：``--dump`` 先返回、**只读**，不是互斥报错。
+
 Run:  python -m pytest tests/test_insert_formula.py -q
 """
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -110,13 +129,65 @@ def run_insert(unpacked: Path, *args) -> subprocess.CompletedProcess:
     )
 
 
+def freeze_docx(path: Path) -> Path:
+    r"""把 **.docx 包**里 zip 条目的时间戳钉成 ``1980-01-01``，就地重写该包。
+
+    为什么要钉（P5-A2 发现、P5-A1 §八 移植）：
+
+    ``python-docx`` 保存走 ``zipfile`` 默认的 DOS 时间戳，**粒度 2 秒**。同一 2 秒
+    刻度内构建的两个内容不同的包，若只比**包**的 SHA256，会因为时间戳相同而**碰巧
+    一致**——「包 SHA 不变 → 内容没变」这条断言就会随机放行真实回归。
+
+    ## 本文件为什么要它（以及它在本文件里**不是**主角）
+
+    本文件所有「改前/改后」断言比的是**解包后**的 ``word/document.xml``
+    （``doc_sha()``），不是 .docx 包。实测（P5-A1 §八 实验 A/B）：
+
+    * 不同时刻构建的同内容包 → 包 SHA **不同**（时间戳在变）、
+      ``word/document.xml`` SHA **完全相同**（该文件里没有任何时间戳字段，
+      实测不含 ``dcterms``/``created``/``modified``/年份串）；
+    * 同一刻度内构建 → 包 SHA 相同、``document.xml`` SHA 也相同。
+
+    所以 **DOS 时间戳够不到 ``document.xml`` 这一层**，本文件的 ``doc_sha()``
+    本来就是确定性内容指纹。移植 ``freeze_docx()`` 的价值是**消除包层的时间漂移**，
+    让 fixture 可复现、dump/比对不受时刻影响；它不是 ``doc_sha()`` 判别力的来源。
+
+    ## 真正让 ``doc_sha()`` 有判别力的东西
+
+    ``docx_utils.write()`` 会重排 XML（``tree.write`` + ``fix_root_any`` 改根标签），
+    即使语义没变也会改字节——实测「原样 ``a29b80155ad6`` → 无改动 ``parse``+``write``
+    一次 ``a3009f94ce6fc65f``」。所以「保留 ``return 1`` 但先 ``write()``」这类回归
+    必被抓住。**这是内容变更检测，与 2 秒刻度无关**；P5-A1 §八 的实验 C 连跑 3 次
+    全 RED 就是这个证据（三次耗时 2.40/2.24/2.48s，横跨多个刻度窗口，结果相同）。
+    """
+    src = Path(path)
+    raw = src.read_bytes()
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as zin:
+        infos = zin.infolist()
+        with zipfile.ZipFile(out, "w") as zout:
+            for info in infos:
+                new = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
+                new.compress_type = info.compress_type
+                new.external_attr = info.external_attr
+                zout.writestr(new, zin.read(info.filename))
+    src.write_bytes(out.getvalue())
+    return src
+
+
 def make_unpacked(tmp_path: Path, paragraphs: list[str]) -> Path:
-    """造一个 docx（每项一段）→ 解包成目录，返回解包目录。"""
+    """造一个 docx（每项一段）→ 解包成目录，返回解包目录。
+
+    打包后先 ``freeze_docx()`` 再解包：让 fixture 的 zip 时间戳固定，包层字节可复现。
+    解包出来的 ``word/document.xml`` 本身不含任何时间戳（见 ``freeze_docx`` 的
+    docstring），所以这条 freeze 不影响 ``doc_sha()`` 的判别力。
+    """
     d = docx.Document()
     for text in paragraphs:
         d.add_paragraph(text)
     src = tmp_path / "in.docx"
     d.save(str(src))
+    freeze_docx(src)
 
     up = tmp_path / "unpacked"
     unpack(src, up)
@@ -438,6 +509,7 @@ def test_phasor_exception_lands_in_phasor_errors_not_failed(
     d.add_paragraph(r"相量 $\dot{U}_{AB}$ 结束")
     src = tmp_path / "in.docx"
     d.save(str(src))
+    freeze_docx(src)          # zip 时间戳钉死（见 freeze_docx docstring）
     out = tmp_path / "out.docx"
 
     stats = M.mathify(src, out, None, None)
@@ -458,3 +530,368 @@ def test_phasor_exception_lands_in_phasor_errors_not_failed(
     assert count(root, m("limUpp")) >= 1, (
         "既然修失败，limUpp 应原样保留；它为 0 说明 monkeypatch 没生效，"
         "本用例实际没测到异常路径")
+
+
+# ===========================================================================
+# P5-A1 · 7) --before 正向：公式段落在 marker 段的**前一位**
+# ===========================================================================
+@needs_omml
+def test_before_marker_inserts_paragraph_right_before_marker(tmp_path: Path):
+    r"""``--before "marker here"``：公式段落必须紧贴 marker 段的**前一位**。
+
+    此前 ``--before`` 只出现在「与 ``--after`` 互斥」的反向用例里（第 3 条），
+    **正向位置一次都没验过**——于是「``--before`` 被实现成 ``--after``」这种
+    最典型的回归，现有 6 条全绿也发现不了。
+
+    实测（fixture 三段 ``alpha one`` / ``marker here`` / ``omega three``）：
+    ``insert_near(position="before")`` 取 ``at = i``，产物段落序为
+
+    ```
+    ['alpha one', '\u200b', 'marker here', 'omega three']
+    ```
+
+    ``\u200b`` 是插进去的公式段（行内路径必带 U+200B 兜底 run，见源码规则 2）。
+    所以下标关系是 ``公式段 == marker 段 - 1``，而不是 ``+ 1``——这正是本条要钉住
+    的方向；改成 ``--after`` 会让公式跑到 marker 后面，``formula_i == marker_i - 1``
+    立刻不成立。
+
+    首末段必须不变：``--before`` 走 fallback 时插在 ``w:sectPr`` 之前（= 文末），
+    末段断言正是拦这个。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    before = body_paragraphs(up)
+    assert len(before) == 3, f"fixture 段落数不对：{[para_text(p) for p in before]}"
+
+    proc = run_insert(up, r"\frac{a}{b}", "--before", "marker here")
+    assert proc.returncode == 0, (
+        "插入失败：rc=%s stderr=%r" % (proc.returncode,
+                                     proc.stderr.decode("utf-8", "replace")))
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "Inserted inline formula" in stdout, f"没走到写入分支：stdout={stdout!r}"
+
+    after = body_paragraphs(up)
+    texts = [para_text(p) for p in after]
+    assert len(after) == 4, f"应多出 1 段公式段，实际段落 = {texts}"
+
+    marker_i = index_of_paragraph_containing(after, "marker here")
+    formula_i = marker_i - 1
+    assert formula_i >= 0, f"marker 落在第 0 段，--before 不可能有前一位：{texts}"
+
+    assert omath_in(after[formula_i]) == 1, (
+        f"marker 段的**前一段**不是公式段（--before 方向反了？）："
+        f"段落序 = {texts}，各段 oMath 数 = {[omath_in(p) for p in after]}")
+    assert omath_in(after[marker_i]) == 0, (
+        f"公式被塞进了 marker 段内部：段落序 = {texts}")
+
+    total = omath_in(xml_root(up))
+    assert total == 1, f"oMath 数量不是 1（插了多处或没插）：{total}"
+
+    assert texts[0] == "alpha one", f"文档开头被改动：{texts}"
+    assert texts[-1] == "omega three", (
+        f"公式落到了文末（fallback 到 sectPr 之前）而不是 marker 之前：{texts}")
+
+
+# ===========================================================================
+# P5-A1 · 8) --display：块级 m:oMathPara，不带行内 U+200B 兜底
+# ===========================================================================
+@needs_omml
+def test_display_switch_emits_block_omathpara_without_zwsp(tmp_path: Path):
+    r"""``--display``：公式段落里是 ``m:oMathPara``（块级），**没有** U+200B run。
+
+    源码两条分支（``build_para`` L95–L101）本身就分叉：
+
+    * ``display=True``  → ``w:pPr``（``jc=center``）+ ``m:oMathPara``，**不补** U+200B；
+    * ``display=False`` → 裸 ``m:oMath`` + ``mkrun("\u200b")``（防止独占整段时被 Word
+      提升成行间公式）。
+
+    实测 ``--display`` 产出的 ``<w:p>`` 直接子元素 == ``['pPr', 'oMathPara']``，
+    全文档 ``oMathPara == 1``、``oMath == 1``、段落文字 == ``''``（无 U+200B）。
+
+    三条断言各拦一类回归：
+    * 只断 ``oMathPara == 1`` → 挡不住「oMathPara 存在但外面还套了个 oMath」；
+    * 只断 ``oMath == 1`` → 挡不住「开关被忽略，退回行内路径」；
+    * 不断「无 U+200B」→ 挡不住「display 分支顺手也补了兜底 run」，那会让行间公式
+      里多一个零宽字符（Word 里看不见，但把段落判成「有正文内容」）。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    proc = run_insert(up, r"\frac{a}{b}", "--display", "--after", "marker here")
+    assert proc.returncode == 0, (
+        "插入失败：rc=%s stderr=%r" % (proc.returncode,
+                                     proc.stderr.decode("utf-8", "replace")))
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "Inserted display formula" in stdout, (
+        f"stdout 没标 display 分支（提示词措辞回归）：{stdout!r}")
+
+    root = xml_root(up)
+    paras = body_paragraphs(up)
+    texts = [para_text(p) for p in paras]
+    assert len(paras) == 4, f"应多出 1 段公式段，实际段落 = {texts}"
+
+    marker_i = index_of_paragraph_containing(paras, "marker here")
+    formula = paras[marker_i + 1]
+    assert omath_in(formula) == 1, (
+        f"marker 下一段没有公式：各段 oMath 数 = {[omath_in(p) for p in paras]}")
+
+    # ← 承重断言 1：块级容器，且只在公式段里
+    assert count(formula, m("oMathPara")) == 1, (
+        "--display 没产出 m:oMathPara（退回行内了？）；该段子元素 = "
+        f"{[etree.QName(c).localname for c in formula]}")
+    assert count(root, m("oMathPara")) == 1, (
+        f"全文档 oMathPara 数不是 1：{count(root, m('oMathPara'))}")
+    assert count(root, m("oMath")) == 1, (
+        f"全文档 oMath 数不是 1：{count(root, m('oMath'))}")
+
+    # ← 承重断言 2：oMathPara 是公式段的直接子元素（不是套在 oMath 里）
+    child_tags = [etree.QName(c).localname for c in formula]
+    assert "oMathPara" in child_tags, (
+        f"m:oMathPara 不在 <w:p> 直接子元素里：{child_tags}")
+
+    # ← 承重断言 3：display 分支不补 U+200B 兜底 run
+    assert "\u200b" not in texts[marker_i + 1], (
+        f"块级公式段里混进了 U+200B 兜底 run（display 分支不该补）："
+        f"{texts[marker_i + 1]!r}")
+
+
+# ===========================================================================
+# P5-A1 · 9) --dump：真只读 + stdout 是可解析的 <w:p>
+# ===========================================================================
+@needs_omml
+def test_dump_switch_writes_nothing_and_prints_parsable_paragraph(tmp_path: Path):
+    r"""``--dump``（单独使用）：``document.xml`` 的 SHA256 与段落数**都不变**，
+    stdout 可解析。
+
+    ``main()` L131–L138 在 ``--dump`` 分支里 **return 0**，位于
+    ``doc_xml.exists()`` 检查、``parse()``、``insert_near()``、``write()`` **之前** ——
+    所以它连 ``word/document.xml`` 是否存在都不看，纯打印。
+
+    实测：单独 ``--dump``（不给任何锚点），rc=0、``document.xml`` 的 SHA256 与段落数
+    均不变、stdout 以 ``<w:p `` 开头且含 1 个 ``m:oMath``。
+
+    刻意**不给** ``--after``：这条只测「dump 本身只读」这一个语义；锚点与 dump 的
+    组合归第 12 条。两件事分开，反向自证时才能各打各的（一条改坏只红一条）。
+
+    「只断 rc==0 + stdout 有 oMath」不够：把 ``--dump`` 实现成「先写文件再打印」
+    照样能过。所以必须同时断 **文件没动**（SHA256 + 段落数）与 **stdout 是可解析
+    的 XML 且恰好 1 个 oMath**（不是一句提示语里含 "oMath" 字样）。
+
+    同时断 ``Inserted`` 不在 stdout：那是写入分支的措辞，出现即证明它穿透了 dump 的
+    ``return 0``。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    sha_before = doc_sha(up)
+    paras_before = len(body_paragraphs(up))
+
+    proc = run_insert(up, r"\frac{a}{b}", "--dump")
+    assert proc.returncode == 0, (
+        "rc=%s stderr=%r" % (proc.returncode,
+                            proc.stderr.decode("utf-8", "replace")))
+
+    # ← 承重断言 1：文件一个字节都没动
+    assert doc_sha(up) == sha_before, (
+        "--dump 仍改写了 document.xml（只读语义被破坏）："
+        f"改前 {sha_before[:12]} → 改后 {doc_sha(up)[:12]}")
+    assert len(body_paragraphs(up)) == paras_before, (
+        f"--dump 增删了段落：改前 {paras_before} 段 → 改后 "
+        f"{len(body_paragraphs(up))} 段")
+
+    # ← 承重断言 2：stdout 是可直接解析的 <w:p>，含恰好 1 个 oMath
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "<w:p" in stdout, f"stdout 不是 XML（没打印段落）：{stdout[:200]!r}"
+    dumped = etree.fromstring(stdout.encode("utf-8"))
+    assert etree.QName(dumped).localname == "p", (
+        f"stdout 根元素不是 w:p：{etree.QName(dumped).localname}")
+    assert omath_in(dumped) == 1, (
+        f"dump 出来的段落里 oMath 数不是 1：{omath_in(dumped)}")
+    assert count(dumped, m("limUpp")) == 0, "dump 出来的公式带着未修的 limUpp"
+
+
+# ===========================================================================
+# P5-A1 · 10) --raw-spacing：与默认路径的 OMML 结构差异
+# ===========================================================================
+@needs_omml
+def test_raw_spacing_keeps_latex_spacing_instead_of_nbsp_run(tmp_path: Path):
+    r"""``--raw-spacing``：不做 ``\quad → \ `` 改写，产物 **少一个 m:r**。
+
+    默认路径经 ``math_omml.keep_spacing()``：
+    ``re.sub(r"\\(?:qquad|quad|,|;|:|!)", r"\\ ", latex)`` —— ``\quad`` 被改写成
+    控制空格 ``\ ``，产物里落成一个 **NBSP run**（``m:rPr/m:sty@val="p"`` +
+    ``m:t`` = ``\u00a0``）。``--raw-spacing`` 跳过这一步，``\quad`` 原样进
+    ``latex2mathml``，XSLT 把这个间距命令丢掉。
+
+    实测 ``a\quad b`` 两条路径的 ``m:r`` 数与文本：
+
+    | 路径 | m:r 数 | m:t 序列 |
+    |---|---|---|
+    | 默认（无开关） | 3 | ``['a', '\u00a0', 'b']`` |
+    | ``--raw-spacing`` | 2 | ``['a', 'b']`` |
+
+    所以断言口径是「精确差额」（``default_runs == raw_runs + 1`` + NBSP 只在默认
+    路径出现），不是模糊的「两者不同」——后者对「开关把两条路径都跑了一遍」这类
+    回归免疫。
+
+    两组都必须先断 ``oMath == 1``：raw 路径若直接转换失败/降级成纯文字，``m:r`` 数
+    差异会来自「公式压根没生成」，差异断言就成了假证据。
+    """
+    latex = r"a\quad b"
+
+    def omath_texts(unpacked: Path) -> tuple[int, list[str]]:
+        root = xml_root(unpacked)
+        oms = list(root.iter(m("oMath")))
+        assert len(oms) == 1, f"oMath 数不是 1：{len(oms)}（公式没生成或生成多处）"
+        om = oms[0]
+        runs = list(om.iter(m("r")))
+        return len(runs), ["".join(t.text or "" for t in r.iter(m("t")))
+                           for r in runs]
+
+    # 两条路径各造一份 fixture：同一个解包目录跑两次，第二遍会读到已被改写过的
+    # document.xml（多出一个 oMath），`omath == 1` 前置断言会先炸。
+    (tmp_path / "def").mkdir()
+    (tmp_path / "raw").mkdir()
+    up_default = make_unpacked(tmp_path / "def", ["alpha one", "marker here"])
+    up_raw = make_unpacked(tmp_path / "raw", ["alpha one", "marker here"])
+
+    p_def = run_insert(up_default, latex, "--after", "marker here")
+    p_raw = run_insert(up_raw, latex, "--after", "marker here", "--raw-spacing")
+    for label, proc in (("默认", p_def), ("--raw-spacing", p_raw)):
+        assert proc.returncode == 0, (
+            f"{label} 路径失败：rc=%s stderr=%r"
+            % (proc.returncode, proc.stderr.decode("utf-8", "replace")))
+
+    n_def, texts_def = omath_texts(up_default)
+    n_raw, texts_raw = omath_texts(up_raw)
+
+    assert n_def == n_raw + 1, (
+        "默认路径应比 --raw-spacing 多一个 run（\\quad → NBSP）：\n"
+        f"  默认 {n_def} 个 m:r，文本 {texts_def}\n"
+        f"  raw  {n_raw} 个 m:r，文本 {texts_raw}")
+    assert "\u00a0" in texts_def, (
+        f"默认路径没把 \\quad 改写成 NBSP run：{texts_def}")
+    assert "\u00a0" not in texts_raw, (
+        f"--raw-spacing 仍做了 \\quad → NBSP 改写（开关没生效）：{texts_raw}")
+    assert texts_raw == ["a", "b"], (
+        f"--raw-spacing 的 m:t 序列不是 ['a', 'b']（间距应被 XSLT 丢掉）：{texts_raw}")
+
+
+# ===========================================================================
+# P5-A1 · 11) 表格单元格内 marker：--after 真插进那个 w:tc
+# ===========================================================================
+@needs_omml
+def test_after_marker_inside_table_cell_inserts_into_that_cell(tmp_path: Path):
+    r"""``--after`` 命中表格单元格里的文字 → 公式段落**插进该单元格**。
+
+    ``docx_utils.insert_near`` 的容器列表是 ``[body] + list(body.iter(w:tc))``，
+    即**刻意**支持单元格内锚点。但现有 6 条里没有任何一条带表格，这条路径长期
+    零覆盖。
+
+    实测（body = ``p(alpha one)`` / ``tbl`` / ``p(omega three)``，表格 1×1 单元格
+    文字 ``cell marker inside``）：rc=0，``w:tc`` 子元素由
+    ``['tcPr', 'p']`` 变成 ``['tcPr', 'p', 'p']``，新段落含 1 个 ``m:oMath``，
+    **body 直接子元素序列不变**（仍是 ``['p','tbl','p','sectPr']``，
+    公式没有漏到 body 层）。
+
+    这条同时钉住「不许 fallback」：若 ``insert_near`` 不再搜 ``w:tc``，marker 找不到
+    时主线会 ``return 1``（`insert_formula` L159–L164 把 anchored=False 当错误），
+    而**不是**静默追加到文末 —— rc 断言与「body 段落数不变」两条一起兜住这个。
+    """
+    d = docx.Document()
+    d.add_paragraph("alpha one")
+    table = d.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "cell marker inside"
+    d.add_paragraph("omega three")
+    src = tmp_path / "tbl.docx"
+    d.save(str(src))
+    freeze_docx(src)          # zip 时间戳钉死（见 freeze_docx docstring）
+
+    up = tmp_path / "unpacked_tbl"
+    unpack(src, up)
+    assert doc_xml(up).is_file(), "解包没产出 word/document.xml"
+
+    body_before = [etree.QName(c).localname for c in xml_root(up).find(w("body"))]
+    assert body_before == ["p", "tbl", "p", "sectPr"], (
+        f"fixture 结构不对（造表格失败）：{body_before}")
+
+    proc = run_insert(up, "E=mc^2", "--after", "cell marker inside")
+    assert proc.returncode == 0, (
+        "单元格内 marker 未命中（insert_near 没搜 w:tc？）：rc=%s stderr=%r"
+        % (proc.returncode, proc.stderr.decode("utf-8", "replace")))
+
+    root = xml_root(up)
+    body = root.find(w("body"))
+    paras = [c for c in body if c.tag == w("p")]
+    assert len(paras) == 2, (
+        "公式段落漏到了 body 层（应插进单元格）：body 段落数 = "
+        f"{[para_text(p) for p in paras]}")
+
+    cells = list(body.iter(w("tc")))
+    assert len(cells) == 1, f"表格单元格数不是 1：{len(cells)}"
+    tc = cells[0]
+    tc_paras = [c for c in tc if c.tag == w("p")]
+    assert len(tc_paras) == 2, (
+        "单元格内没多出公式段：tc 子元素 = "
+        f"{[etree.QName(c).localname for c in tc]}")
+
+    cell_texts = [para_text(p) for p in tc_paras]
+    assert cell_texts[0] == "cell marker inside", (
+        f"marker 段被挪动了（应保持第一段）：{cell_texts}")
+    assert omath_in(tc_paras[1]) == 1, (
+        f"单元格第二段不是公式段（--after 方向错？）：{cell_texts}，"
+        f"各段 oMath 数 = {[omath_in(p) for p in tc_paras]}")
+    assert omath_in(root) == 1, f"全文档 oMath 数不是 1：{omath_in(root)}"
+
+
+# ===========================================================================
+# P5-A1 · 12) --after 与 --dump 同时给：--dump 先返回，是只读而非互斥
+# ===========================================================================
+@needs_omml
+def test_after_with_dump_is_readonly_not_mutually_exclusive(tmp_path: Path):
+    r"""``--after`` + ``--dump`` 同时给 → **rc=0 且不写文件**，不是互斥报错。
+
+    源码顺序（``main()``）：
+
+    ```
+    L131  if args.dump:  print(...); return 0      ← 先返回
+    L152  if args.after and args.before: ... return 1   ← 互斥检查在 dump 之后
+    ```
+
+    也就是说 ``--dump`` 抢在互斥检查与 ``insert_near`` 之前返回：``--after`` 被
+    **完全忽略**（连 marker 是否存在都不查）。实测：给一个**存在**的 marker，
+    rc=0、``document.xml`` 的 SHA256 与段落数不变、stdout 是 ``<w:p>``。
+
+    这条锁的是「``--dump`` 的只读优先级高于锚点参数」这一既有语义。它也是个
+    容易看走眼的地方：`--after` 与 `--dump` 在 ``argparse`` 里**都不是**互斥组，
+    有人会以为该报错；实际行为是静默只读。按实测写断言，不按直觉。
+
+    额外断言 stdout 里**没有** ``Inserted`` 字样：出现了就说明它穿过了 dump 分支、
+    真去写了文件（此时 SHA 断言也会红，两条互为交叉验证）。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    sha_before = doc_sha(up)
+    paras_before = len(body_paragraphs(up))
+
+    proc = run_insert(up, "E=mc^2", "--after", "marker here", "--dump")
+    stdout = proc.stdout.decode("utf-8", "replace")
+    stderr = proc.stderr.decode("utf-8", "replace")
+
+    assert proc.returncode == 0, (
+        "--dump 与 --after 被当成互斥报错（实测应为 dump 先返回 rc=0）："
+        f"rc={proc.returncode} stdout={stdout[:200]!r} stderr={stderr[:200]!r}")
+    assert "mutually exclusive" not in stderr.lower(), (
+        f"--dump 分支没抢在互斥检查之前返回：{stderr!r}")
+
+    assert doc_sha(up) == sha_before, (
+        "--after + --dump 改写了 document.xml（dump 的只读语义被破坏）："
+        f"改前 {sha_before[:12]} → 改后 {doc_sha(up)[:12]}")
+    assert len(body_paragraphs(up)) == paras_before, (
+        f"段落数被改：{paras_before} → {len(body_paragraphs(up))}")
+
+    assert "Inserted" not in stdout, (
+        f"stdout 出现了写入分支的措辞，说明它真去写文件了：{stdout[:200]!r}")
+    dumped = etree.fromstring(stdout.encode("utf-8"))
+    assert etree.QName(dumped).localname == "p", (
+        f"--dump 的 stdout 不是 <w:p>：{etree.QName(dumped).localname}")
+    assert omath_in(dumped) == 1, (
+        f"dump 出来的段落里 oMath 数不是 1：{omath_in(dumped)}")

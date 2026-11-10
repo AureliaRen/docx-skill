@@ -3,7 +3,7 @@ r"""Extract/apply .docx formatting templates, and fill {{token}} placeholders.
 Usage:
     python docx_template.py extract template.docx -o tpl.json
     python docx_template.py apply tpl.json -o new.docx [--fix-formulas]
-    python docx_template.py apply tpl.json --to existing.docx [--fix-formulas]
+    python docx_template.py apply tpl.json --to existing.docx [-o out.docx] [--fix-formulas]
     python docx_template.py fill template.docx values.json output.docx [--strict]
     python docx_template.py template.docx values.json output.docx      # fill 简写
 
@@ -22,8 +22,10 @@ Usage:
 
 * ``extract`` —— 把一份成品 docx 的页面设置、docDefaults、全部样式抽成 JSON
   （这是"照着这份排版再做一份"的取证步骤）；
-* ``apply`` —— 两条路：``-o`` 走 node + docx-js 直接生成一份带同样式的空骨架；
-  ``--to`` 把 JSON 打回任意现有 docx（合并 rPr/pPr、改页面设置）。
+* ``apply`` —— 两条路：``-o``（无 ``--to``）走 node + docx-js 直接生成一份带同样式的
+  空骨架；``--to`` 把 JSON 打回任意现有 docx（合并 rPr/pPr、改页面设置）。
+  ``--to`` 同时给 ``-o`` 时**写到 ``-o``、``--to`` 那份原文件一个字节都不动**；
+  只给 ``--to`` 时原地改写，但会先写一份 ``<file>.bak`` 备份。
 
 坑（从 source-snapshot 原版踩过来后改的架构）
 --------------------------------------------
@@ -673,10 +675,34 @@ def main(argv=None):
         if args.to:
             target = Path(args.to)
             if not target.exists(): print(f"error: {target} not found", file=sys.stderr); sys.exit(1)
-            _apply_existing(tpl, target, fix_formulas=args.fix_formulas)
-            print(f"Applied template → {target}")
-            if args.omml_formulas:
-                _convert_formulas(target)
+            # P0-B: -o is the write path. Without this branch honouring it, the
+            # flag was silently dropped and `apply tpl.json --to in.docx -o out.docx`
+            # rewrote in.docx in place (no out.docx, no backup, exit 0).
+            dest = Path(args.output) if args.output else target
+            if dest.exists() and dest.resolve() == target.resolve():
+                dest = target                     # -o pointing at --to: in place
+            if dest is target:
+                # In place: the original cannot survive, so snapshot it first.
+                backup = Path(str(target) + ".bak")
+                overwrote = backup.exists()
+                shutil.copyfile(target, backup)
+                _apply_existing(tpl, target, fix_formulas=args.fix_formulas)
+                print(f"Applied template → {target}  (in place)")
+                print(f"  backup → {backup}"
+                      + ("  (previous backup overwritten)" if overwrote else ""))
+                if args.omml_formulas:
+                    _convert_formulas(target)
+            else:
+                if not dest.parent.is_dir():
+                    print(f"error: output directory does not exist: {dest.parent}\n"
+                          f"       {target} was NOT modified", file=sys.stderr)
+                    return 1
+                shutil.copyfile(target, dest)      # byte copy: source stays pristine
+                _apply_existing(tpl, dest, fix_formulas=args.fix_formulas)
+                print(f"Applied template → {dest}")
+                print(f"  source untouched → {target}")
+                if args.omml_formulas:
+                    _convert_formulas(dest)
         else:
             out = args.output or "output.docx"
             script = _gen_js(tpl)

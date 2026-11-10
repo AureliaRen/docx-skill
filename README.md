@@ -113,6 +113,38 @@ Both lower tiers sit behind switches in `docx_mathify.py` — `NO_LAYOUT_NEEDED`
 for the third, `MIXED_SUPERSCRIPT` as the master switch covering the second and
 third. See [SKILL.md](SKILL.md#three-output-tiers).
 
+## Requirements
+
+| Item | Requirement |
+|---|---|
+| Python | **3.10 or newer** — the CI floor; the matrix runs 3.10 and 3.12 on both Linux and Windows |
+| Dependencies | `python-docx`, `lxml` — `python -m pip install -r requirements.txt` |
+| Tests | additionally `pypdfium2` and `pytest`; no script imports either one |
+| Formula chain | **Windows** + Microsoft Office: needs `MML2OMML.XSL` (ships with Office; `math_omml.find_xslt()` probes the Windows install paths, `MML2OMML_XSL` overrides) |
+| PDF export | **Windows** + Microsoft Word (COM). **Not WPS**: WPS drops the text layer of a document that carries OMML |
+| Template `apply` (building a new document from a template) | Node.js with the `docx` package |
+
+**The platform boundary, stated plainly: two capabilities do not leave Windows.**
+
+- **The formula chain** — `docx_mathify.py`, `insert_formula.py`, and anything
+  that reaches `math_omml`. The LaTeX→OMML step reuses Microsoft's
+  `MML2OMML.XSL`, and `math_omml.find_xslt()` looks for it under
+  `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%` and the hard-coded
+  `C:\Program Files…` roots — Windows paths only — then raises
+  `FileNotFoundError` with the two ways to fix it. On Linux or macOS there is
+  nothing for it to find unless you supply a copy yourself and point
+  `MML2OMML_XSL` at it; the chain has only been measured on Windows.
+- **PDF export** — `pdf_export.ps1` drives Word through COM, so it is Windows
+  plus a local Word install by construction.
+
+Everything else — create, read, edit, validate, comments, revisions, numbering,
+cross-references, static TOC, sections, table geometry, fonts, merge, template
+`extract` / `fill`, and `docx_pack` — is pure `python-docx` + `lxml` and runs
+with no Office installed at all.
+
+Legacy `.doc` (binary) files are not supported — save as `.docx` first, or use
+LibreOffice externally.
+
 ## Install
 
 **For agents** (Claude Code, Cursor, Codex, Copilot, Gemini CLI and 20+ others):
@@ -129,21 +161,32 @@ cd docx-skill
 python -m pip install -r requirements.txt
 ```
 
-Python 3.10 or newer.
+Python **3.10** or newer. `requirements.txt` carries exactly three hard
+requirements — `python-docx`, `lxml`, `latex2mathml`; it also lists `pypdfium2`
+and `pytest` for the test suite, but no script imports either one.
 
 Optional extras:
 
 | Feature | Extra requirement |
 |---|---|
-| Formula conversion | `latex2mathml` + a local Microsoft Office (for `MML2OMML.XSL`) |
+| Formula conversion | `latex2mathml` + a local **Windows** Microsoft Office (for `MML2OMML.XSL`) |
 | Template apply (creating a doc from a template) | Node.js with the `docx` package |
 
-Legacy `.doc` (binary) files are not supported — save as `.docx` first, or use
-LibreOffice externally.
+The formula step reuses the stylesheet the local Office already ships instead of
+re-deriving a MathML→OMML mapping. When Office lives somewhere unusual, point the
+environment variable at it:
+
+```powershell
+$env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
+```
+
+`docx_mathify.py` and `insert_formula.py` share that lookup, and only the formula
+features need it — every other script runs on a machine with no Office at all.
 
 ## Use
 
-Every script is a CLI. Start with `--help`:
+Every script runs from a shell on its own, and **18 of the 25 CLIs expose an
+argparse surface** — start with `--help`:
 
 ```bash
 python scripts/docx_create.py --help
@@ -171,14 +214,35 @@ python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
 
 Full command table in [SKILL.md](SKILL.md).
 
+One rule holds for an agent consumer: the scripts that report structure write it
+to **stdout as JSON** — `docx_create`, `docx_read`, `docx_edit`, `docx_validate`,
+`docx_comments`, `docx_revisions`, `docx_section`, `docx_numbering`,
+`docx_crossref`, `docx_toc`. The rest write human-readable text that is meant to be
+read: `docx_mathify`, `table_width`, `insert_formula`, `docx_template` (`fill`
+excepted — it emits JSON). Diagnostics always go to stderr, and exit codes are
+reliable: `0` success, non-zero failure, and `docx_mathify` returning `3` means
+the document was written but at least one formula did not convert.
+
 ## Scripts
 
 `scripts/` holds **26 `.py` + 1 `.ps1` = 27 files**, all flat, no sub-package and
-no `__init__.py`. "CLI" below means the file has its own argparse entry and runs
-from a shell; "lib" means it exists to be imported by the others. Full flags per
-command are in [SKILL.md](SKILL.md).
+no `__init__.py`. The split below follows one definition, and `ci.yml` derives it
+mechanically rather than trusting this prose — two unioned rules,
+`_*`-prefixed **or** no `if __name__ == "__main__"` guard, mean *pure library*:
 
-**CLI tools (18)**
+| Bucket | Count | Test |
+|---|---|---|
+| **CLI** | **25** | carries a `__main__` guard, so it can be run from a shell |
+| **pure library** | **1** | `_bootstrap.py` — private, imported before argument parsing, never run on its own |
+
+Of those 25 CLIs, **18 expose an argparse surface** (`--help` prints `usage: …`)
+and are tabulated first. The other 7 have a `__main__` but no argparse: six print
+a one-line `… is a library module, import it:` self-description (`docx_pack`,
+`docx_utils`, `encoding`, `linear_to_latex`, `math_omml`, `minidom_compat`) and
+`fix_phasor_dot` runs its self-check. They are imported by bare name, exactly
+like `_bootstrap`. Full flags per command are in [SKILL.md](SKILL.md).
+
+**CLI tools (18 `.py` with argparse)**
 
 | File | What it does |
 |---|---|
@@ -186,8 +250,9 @@ command are in [SKILL.md](SKILL.md).
 | `docx_read.py` | Reads a document back: `--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` |
 | `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` |
 | `docx_validate.py` | Package-level health check; exits 1 when `ok:false` |
-| `docx_comments.py` | Comments: `list` / `add --target` / `delete --id` |
+| `docx_comments.py` | Comments: `list` / `add --target` / `delete --id` (**ids start at `0`**) |
 | `docx_revisions.py` | Tracked changes: `list` / `accept-all` / `reject-all` / `accept` / `reject` |
+| `docx_common.py` | Shared paragraph walkers: `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`; `--api` prints the exported surface |
 | `docx_template.py` | `extract` / `apply` (`-o` needs node + docx-js, `--to` writes into an existing file) / `fill` (`{{token}}`) |
 | `docx_numbering.py` | Real auto-numbering: `list` / `define` / `apply` / `detach` / `restart` |
 | `docx_crossref.py` | Captions and cross-references: `caption` / `ref` / `bookmark` / `renumber` / `list` |
@@ -199,21 +264,30 @@ command are in [SKILL.md](SKILL.md).
 | `fix_fonts.py` | Font normalisation across style layer, run layer, and over-sized headings (`--heading-threshold`) |
 | `fix_zoom.py` | Adds the `w:percent` that `<w:zoom>` needs to pass a strict XSD (`--percent`) |
 | `merge_docs.py` | Appends one document to another, keeping styles / numbering / media (`base src out`) |
-| `pdf_export.ps1` | Word COM export to PDF, `ExportAsFixedFormat(17)`, opened `ReadOnly` (`-DocxPath` / `-PdfPath`) |
 
-**Library modules (9)** — no CLI of their own, imported by bare name.
+The 27th file is not a `.py`: `pdf_export.ps1` is the PowerShell export path —
+Word COM, `ExportAsFixedFormat(17)`, opened `ReadOnly` (`-DocxPath` /
+`-PdfPath`). See [Exporting to PDF](SKILL.md#exporting-to-pdf-additional-capability).
+
+**Library and self-describing modules (7)** — imported by bare name; the first
+six ship a one-line `__main__` self-description, `fix_phasor_dot` ships a
+self-check. `_bootstrap.py` is the one pure library and is documented last.
 
 | Module | What it provides |
 |---|---|
 | `docx_pack.py` | `unpack` / `pack` — round-trips a `.docx` through a directory, restoring the original entry order and per-entry compression. `table_width.py` and `insert_formula.py` operate on a directory produced by it, though neither imports it. |
-| `docx_common.py` | `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`; `--api` prints the surface |
 | `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`, `FONT_HEITI`, `FONT_SONG` |
 | `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts`, plus the `UNITS` whitelist |
 | `math_omml.py` | LaTeX → MathML → OMML: `latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
-| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`, so a phasor dot stops rendering oversized |
+| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`, so a phasor dot stops rendering oversized; `python scripts/fix_phasor_dot.py` runs its self-check |
 | `encoding.py` | `_fix_stdio()` — stdout and stderr to UTF-8 on Windows |
 | `minidom_compat.py` | `defusedxml.minidom` with a stdlib fallback when the package is absent |
-| `_bootstrap.py` | Flat-layout bootstrap: `sys.path` self-location plus the minidom / UTF-8 fallbacks |
+
+And the one file that is a **pure library**:
+
+| Module | What it provides |
+|---|---|
+| `_bootstrap.py` | Flat-layout bootstrap: `sys.path` self-location plus the minidom / UTF-8 fallbacks. No `__main__`, no argparse — every other script imports it before parsing arguments. |
 
 `docx_pack` is worth knowing by name even if you never call the CLI:
 
@@ -228,24 +302,27 @@ pack("unpacked/", "out.docx", original="in.docx")
 Passing `original` is what lets `pack` reuse the source archive's entry order and
 compression, so a no-op round trip produces an equivalent archive rather than a
 re-zipped approximation. `unpack` refuses archive entries that would escape the
-target directory (`../`, absolute paths, backslashes) and raises
-`UnsafeArchiveError` — a `.docx` is untrusted input.
+target directory (`../`, absolute paths, backslashes, and Windows drive-letter
+forms such as `D:/x.txt`) and raises `UnsafeArchiveError` — a `.docx` is untrusted
+input.
 
 ## Layout
 
 ```
-scripts/     flat CLI modules, imported by bare name — 27 scripts (26 .py + 1 .ps1)
-tools/       Word COM acceptance helper — word_accept.py, which backs docx_toc --page-probe
+scripts/     flat CLI modules, imported by bare name — 27 files (26 .py + 1 .ps1)
+tools/       Word COM acceptance helper — word_accept.py, which owns --page-probe
 references/  longer notes loaded on demand
 tests/       pytest suite
 examples/    sample specs
 ```
 
 `tools/` holds one large helper, `word_accept.py`, which drives Word COM to accept
-pending revisions and to report the page each paragraph actually lands on.
-`docx_toc --page-probe` depends on it: page numbers are measured there, never
-computed. That matters because the probe returns the glyph the reader sees, which
-is not the physical page order once a section restarts its numbering.
+pending revisions and to report the page each paragraph actually lands on. **The
+`--page-probe` flag lives there and only there** — `docx_toc.py` has no probing
+flag of its own; you run `word_accept.py --page-probe` first and hand the measured
+numbers to `docx_toc.py --pages`. Page numbers are measured, never computed. That
+matters because the probe returns the glyph the reader sees, which is not the
+physical page order once a section restarts its numbering.
 
 All scripts share one import discipline: each puts its own directory on
 `sys.path` before importing a sibling. That means `python scripts/x.py`,
@@ -271,6 +348,18 @@ and is loaded only when you need it:
 ```bash
 python -m pytest tests/ -v
 ```
+
+The suite drives the argparse CLIs through `subprocess`, generates its fixtures on
+the spot, and writes artifacts to a temp directory. Tests that need
+`latex2mathml` **and** `MML2OMML.XSL` (`test_formula`, `test_units`,
+`test_mixed_superscript`) skip themselves with an explicit reason —
+`needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)` — so a machine
+without Office gets a **green run with a larger skip count, not a red one**.
+Measured on the whole suite with `MML2OMML_XSL` pointed at a nonexistent file, i.e.
+no Office anywhere: **1357 passed / 370 skipped / 0 failed**. Everything else
+follows `requirements.txt`: `pypdfium2` backs the PDF text-layer assertions and
+`pytest` is the runner; neither is a runtime dependency. Word COM tests skip exactly
+the same way when Word is absent.
 
 ## License
 

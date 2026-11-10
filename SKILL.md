@@ -6,17 +6,22 @@ license: MIT
 
 # Word documents (.docx)
 
-All scripts live flat in `scripts/` and are argparse CLIs with `--help`. Run them
-with any Python 3.10+ that has `python-docx` and `lxml` installed.
+Scripts live flat in `scripts/` — **26 `.py` + 1 `.ps1`**, no sub-package, no
+`__init__.py`. **25 are CLIs** (each carries an `if __name__ == "__main__"`
+guard); **`_bootstrap.py` is the one pure library**. Of the 25, **18 expose an
+argparse surface** with `--help` and the other 7 print a one-line self-description
+or run a self-check. Run them with any Python 3.10+ that has `python-docx` and
+`lxml` installed.
 
 Output convention differs by script and is deliberate:
 
 - **JSON on stdout** — `docx_create`, `docx_read`, `docx_edit`, `docx_validate`,
-  `docx_comments`, `docx_revisions`, `docx_delete`-style machine-readable tools.
-  Parse these.
+  `docx_comments`, `docx_revisions`, `docx_section`, `docx_numbering`,
+  `docx_crossref`, `docx_toc`. Parse these.
 - **Human-readable text** — `docx_mathify`, `table_width`, `insert_formula`,
-  `docx_template` (except `fill`, which emits JSON on stdout). These report
-  progress and are meant to be read.
+  `docx_template` (except `fill`, which emits JSON on stdout), and
+  `docx_common --api` (a name-plus-signature listing). These report progress and
+  are meant to be read.
 
 Exit codes are reliable: `0` on success, non-zero on failure. See
 [Exit codes](#exit-codes) for the one historical exception.
@@ -30,6 +35,16 @@ python -m pip install -r requirements.txt
 `latex2mathml` is only needed for the formula features. A local Microsoft Office
 install supplies `MML2OMML.XSL`, which the LaTeX→OMML converter reuses — point
 `MML2OMML_XSL` at it if it lives somewhere unusual.
+
+**Two capabilities are Windows-only, and they fail at call time rather than at
+install time.** The **formula chain** needs `MML2OMML.XSL`, and
+`math_omml.find_xslt()` probes only Windows Office locations
+(`%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%`, `C:\Program Files…`),
+so on Linux or macOS it raises `FileNotFoundError` unless you supply a copy and
+set `MML2OMML_XSL`. **PDF export** drives Word through COM. Everything else —
+create / read / edit / validate / comments / revisions / numbering /
+cross-references / static TOC / sections / table geometry / fonts / merge /
+templates / `docx_pack` — is pure `python-docx` + `lxml` and needs no Office.
 
 ## Working on an unpacked document
 
@@ -57,7 +72,8 @@ pack("unpacked/", "out.docx", original="in.docx")
 `pack` reuses the original's entry order and compression method, so a
 round-trip that changes nothing produces an equivalent archive. `unpack` treats
 the archive as untrusted input and refuses entries that would escape the target
-directory — `../`, absolute paths, backslashes — raising `UnsafeArchiveError`.
+directory — `../`, absolute paths, backslashes, and Windows drive-letter forms
+such as `D:/x.txt` — raising `UnsafeArchiveError`.
 
 ## Quick reference
 
@@ -73,7 +89,7 @@ directory — `../`, absolute paths, backslashes — raising `UnsafeArchiveError
 | Health-check a document | `python scripts/docx_validate.py in.docx` |
 | List comments | `python scripts/docx_comments.py list in.docx` |
 | Add a comment | `python scripts/docx_comments.py add in.docx --target "some text" --text "note"` |
-| Delete a comment | `python scripts/docx_comments.py delete in.docx --id 1` |
+| Delete a comment | `python scripts/docx_comments.py delete in.docx --id 0` (ids start at `0`; `list` prints them) |
 | List / accept / reject revisions | `python scripts/docx_revisions.py list\|accept-all\|reject-all in.docx` |
 | Fill `{{token}}` placeholders | `python scripts/docx_template.py tpl.docx values.json out.docx` |
 | Extract a formatting template | `python scripts/docx_template.py extract tpl.docx -o tpl.json` |
@@ -157,9 +173,11 @@ text-block width and a dot leader. The width comes from
 test volumes genuinely differ (170 mm vs 160 mm).
 
 **Page numbers have to be measured, not guessed.** `pages=None` leaves the slot
-empty; fill it from `word_accept.py --page-probe`, which reports
+empty; fill it from `tools/word_accept.py --page-probe`, which reports
 `paragraph_pages[].displayed_text` — the number the reader sees, taken from
-`Information(WD_ACTIVE_END_ADJUSTED_PAGE)`. That is *not* the physical page
+`Information(WD_ACTIVE_END_ADJUSTED_PAGE)`. `docx_toc.py` has no probing flag of
+its own: you measure with `word_accept.py`, then pass the numbers back through
+`--pages`. That is *not* the physical page
 order: a `lowerRoman start=1` section prints `i` on what is physically page 8.
 See `references/toc.md` for the two-pass recipe and the full trap list.
 
@@ -453,9 +471,12 @@ Do not route a document with OMML through WPS.
 
 ## Library modules
 
-Nine modules have no CLI and exist to be imported. Scripts reach them by bare
-name, which works because every script bootstraps its own directory onto
-`sys.path` (see [Conventions](#conventions)).
+**`_bootstrap.py` is the one pure library**: no `__main__`, no argparse, imported
+by every other script before argument parsing. The seven modules below also exist
+to be imported — six ship a one-line `__main__` self-description and
+`fix_phasor_dot` ships a self-check, so all seven answer a bare run without doing
+any work. Scripts reach them all by bare name, which works because every script
+bootstraps its own directory onto `sys.path` (see [Conventions](#conventions)).
 
 | Module | What it provides |
 |---|---|
@@ -464,10 +485,11 @@ name, which works because every script bootstraps its own directory onto
 | `fix_phasor_dot.py` | `fix_phasor_dots(omml) -> int`; `python scripts/fix_phasor_dot.py` runs its self-check |
 | `docx_pack.py` | `unpack` / `pack` — the round-trip described under [Working on an unpacked document](#working-on-an-unpacked-document) |
 | `docx_utils.py` | `wtag` / `register_all` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`, `FONT_HEITI`, `FONT_SONG` |
-| `docx_common.py` | `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph` (`--api` prints the surface) |
 | `encoding.py` | `_fix_stdio()` — switches stdout and stderr to UTF-8 on Windows |
 | `minidom_compat.py` | `defusedxml.minidom` with a stdlib fallback |
-| `_bootstrap.py` | flat-layout bootstrap: `sys.path` plus the minidom / UTF-8 fallbacks |
+
+`docx_common.py` deliberately is **not** in that table: it has a real argparse
+surface (`--api` prints the helpers it exports), so it counts as a CLI.
 
 `minidom_compat` matters more than it looks. `defusedxml` hardens XML parsing
 against entity expansion, but a bundled interpreter — the DSH runtime, a portable
@@ -500,9 +522,9 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 ## Layout
 
 ```
-scripts/     every CLI, flat, imported by bare module name — 26 .py + 1 .ps1
+scripts/     flat, imported by bare module name — 26 .py + 1 .ps1 (25 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 6 files
-tools/       Word COM helper used by docx_toc's --page-probe
+tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
 tests/       pytest suite
 ```
 

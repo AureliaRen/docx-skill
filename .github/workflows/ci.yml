@@ -198,10 +198,10 @@ jobs:
         # tests has been turned into skips. The counts are asserted below.
         #
         # The numbers are the hosted-runner reality, not this workstation:
-        #   passed  >= 1297, skipped <= 366
-        # Re-measured on a simulated runner after the P3-4 rework tickets landed
+        #   passed  >= 1356, skipped <= 372
+        # Re-measured on a simulated runner after the P5 round landed
         # (no Office -> no MML2OMML.XSL, no _smoke/ in the parent dir, no
-        # work/r7_final/): 1297 passed / 365 skipped / collect 1662.
+        # work/r7_final/): 1356 passed / 371 skipped / collect 1727.
         #
         # How that number is built, so the next person can audit it instead of
         # just bumping it:
@@ -210,10 +210,24 @@ jobs:
         #                                            without Office: no OMML)
         #   + RT-002 test_insert_formula.py 6 tests          +0  /  +6   (all six
         #                                            skip without the XSL)
-        #   =                                                1297 / 365
-        # A developer machine with Office reports ~1423 passed / 239 skipped
-        # because 119 OMML tests and 1 _smoke test really execute there -- do
+        #   = P3-4 baseline                                  1297 / 365
+        #   + P5-A2 test_docx_edit_subcommands.py 38 tests  +38 /   0   (docx_edit
+        #                                            imports no OMML module at all,
+        #                                            so all 38 really run)
+        #   + P5-A1 test_insert_formula.py 6 more tests      +0  /  +6   (same
+        #                                            reason as RT-002 above)
+        #   + P5 P0  test_docx_pack_safety.py 14 tests      +14 /   0
+        #   + P5 P0  test_docx_template_output.py 7 tests    +7 /   0   (neither
+        #                                            file touches the OMML chain)
+        #   =                                                1356 / 371
+        # A developer machine with Office reports ~1488 passed / 239 skipped
+        # because 125 OMML tests and 1 _smoke test really execute there -- do
         # NOT use that number here.
+        #
+        # The floor only ever moves up: every new block that runs on the runner
+        # is added to it, so losing those tests trips the floor instead of
+        # passing silently. The ceiling keeps the documented "measured + 1"
+        # headroom.
         #
         # skipped is bounded above, not pinned: the count moves whenever a spec
         # file is added or _smoke starts shipping. A *rise* past the bound means
@@ -235,8 +249,8 @@ jobs:
           python - "$log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1297   # simulated-runner measurement, not a local number
-          MAX_SKIPPED = 366   # 365 measured + 1 headroom; breakdown in the step comment
+          MIN_PASSED = 1356   # simulated-runner measurement, not a local number
+          MAX_SKIPPED = 372   # 371 measured + 1 headroom; breakdown in the step comment
 
           log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
 

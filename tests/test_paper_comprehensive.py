@@ -247,7 +247,7 @@ def test_every_subject_contributes_a_formula_paragraph():
     assert has("牛顿第二定律") or has("F=ma"), "物理第 10 题的 F=ma"
     assert has("mol/L"), "化学的 c=0.5mol/L / c(HI)=1.0mol/L"
     assert has("g/mol"), "化学的 M=18g/mol"
-    assert has("P=100"), "生物的 P=50W/m2"
+    assert has("P=50"), "生物的 P=50W/m2"
     assert has("酶促反应速率"), "跨学科第 13 题的 v=s/t"
 
     # —— 真结构公式必须仍是 OMML（这是本轮不许回退的硬指标）——
