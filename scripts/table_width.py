@@ -39,8 +39,7 @@ Notes:
   * All w:w values here are dxa (twentieths of a point); 1 cm = 566.93 dxa.
   * Row heights are left alone; this script only touches horizontal geometry.
 """
-import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix
+import _bootstrap  # noqa: F401
 import argparse
 import sys
 from pathlib import Path

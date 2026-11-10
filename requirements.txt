@@ -6,3 +6,14 @@ lxml>=5.0.0
 # Pure Python, no compiled deps. OMML generation additionally needs
 # Microsoft's MML2OMML.XSL from a local Office install at runtime.
 latex2mathml>=3.77.0
+
+# Test-only dependency: PDF text-layer assertions when a test exports to PDF.
+# No library module imports it, so the scripts run fine without it.
+pypdfium2>=4.0
+
+# Optional hardening: minidom_compat falls back to the stdlib xml.dom.minidom
+# when defusedxml is absent, so this stays commented out on purpose.
+# defusedxml>=0.7
+
+# Dev-only tooling, not required to run any script.
+# pytest>=7.4

@@ -3,6 +3,10 @@
 """Shared helpers: paragraph iteration and run-preserving text replacement."""
 from __future__ import annotations
 
+# --- repo bootstrap: make sibling imports work from any cwd ---------------
+import _bootstrap  # noqa: F401 — UTF-8 stdio on Windows
+# --------------------------------------------------------------------------
+
 
 def iter_all_paragraphs(doc, include_headers_footers: bool = True):
     """Yield every paragraph in body, tables (recursively), headers, footers."""
@@ -111,3 +115,31 @@ def replace_in_paragraph(para, old: str, new: str) -> int:
         count += 1
 
     return count
+
+
+def main(argv=None) -> int:
+    """自述入口：本模块是库，被 import 用；单独运行只打印用法，退出码 0。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="docx_common",
+        description="Shared helpers imported by the other docx scripts "
+                    "(library module, nothing to execute at run time).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="被 docx_edit.py / docx_template.py / docx_comments.py / "
+               "docx_revisions.py import；单独运行只打印自述。",
+    )
+    ap.add_argument("--api", action="store_true",
+                    help="打印导出的函数清单（含首行 docstring）后退出")
+    a = ap.parse_args(argv)
+    if a.api:
+        for fn in (iter_all_paragraphs, iter_part_roots, replace_in_paragraph):
+            first = (fn.__doc__ or "").strip().splitlines()[0] if fn.__doc__ else ""
+            print(f"{fn.__name__}  # {first}")
+        return 0
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

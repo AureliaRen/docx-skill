@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 # --- repo bootstrap: make sibling imports work from any cwd ---------------
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401 — UTF-8 stdio on Windows
+import _bootstrap  # noqa: F401 — UTF-8 stdio on Windows
 # --------------------------------------------------------------------------
 
 import re
@@ -1357,3 +1355,10 @@ def _merge_text(segs: list[dict]) -> list[dict]:
         if cur:
             out.append({"kind": "text", "atoms": cur})
     return out
+
+
+if __name__ == "__main__":
+    print("linear_to_latex is a library module, import it:")
+    print("    from linear_to_latex import find_math_spans, atoms_to_linear, "
+          "linear_to_latex, repair_merged_scripts")
+    raise SystemExit(0)
