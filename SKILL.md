@@ -15,8 +15,8 @@ Output convention differs by script and is deliberate:
   `docx_comments`, `docx_revisions`, `docx_delete`-style machine-readable tools.
   Parse these.
 - **Human-readable text** — `docx_mathify`, `table_width`, `insert_formula`,
-  `template`. These report progress and are meant to be read, with JSON coming
-  later if it proves necessary.
+  `docx_template` (except `fill`, which emits JSON on stdout). These report
+  progress and are meant to be read.
 
 Exit codes are reliable: `0` on success, non-zero on failure. See
 [Exit codes](#exit-codes) for the one historical exception.
@@ -33,9 +33,12 @@ install supplies `MML2OMML.XSL`, which the LaTeX→OMML converter reuses — poi
 
 ## Working on an unpacked document
 
-A few commands (`table_width.py`, `insert_formula.py`, `template.py apply --to`)
-operate on an **unpacked** document — a `.docx` extracted to a directory so its
-XML parts can be edited directly. Produce one with:
+Two commands (`table_width.py`, `insert_formula.py`) operate on an **unpacked**
+document — a `.docx` extracted to a directory so its XML parts can be edited
+directly. `docx_template.py apply --to`, `fix_fonts.py`, and `fix_zoom.py` instead
+take a packaged `.docx` and rewrite it in place through a temporary file, so pass
+the file itself rather than an extracted directory.
+Produce one with:
 
 ```bash
 python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"
@@ -52,7 +55,9 @@ pack("unpacked/", "out.docx", original="in.docx")
 ```
 
 `pack` reuses the original's entry order and compression method, so a
-round-trip that changes nothing produces an equivalent archive.
+round-trip that changes nothing produces an equivalent archive. `unpack` treats
+the archive as untrusted input and refuses entries that would escape the target
+directory — `../`, absolute paths, backslashes — raising `UnsafeArchiveError`.
 
 ## Quick reference
 
@@ -71,8 +76,8 @@ round-trip that changes nothing produces an equivalent archive.
 | Delete a comment | `python scripts/docx_comments.py delete in.docx --id 1` |
 | List / accept / reject revisions | `python scripts/docx_revisions.py list\|accept-all\|reject-all in.docx` |
 | Fill `{{token}}` placeholders | `python scripts/docx_template.py tpl.docx values.json out.docx` |
-| Extract a formatting template | `python scripts/template.py extract tpl.docx -o tpl.json` |
-| Apply a formatting template | `python scripts/template.py apply tpl.json --to in.docx -o out.docx` |
+| Extract a formatting template | `python scripts/docx_template.py extract tpl.docx -o tpl.json` |
+| Apply a formatting template | `python scripts/docx_template.py apply tpl.json --to in.docx -o out.docx` |
 | Diagnose table widths | `python scripts/table_width.py report unpacked/` |
 | Force table widths | `python scripts/table_width.py set unpacked/ --widths 2.4,4.2,4.2` |
 | Batch linear formulas → Office Math | `python scripts/docx_mathify.py in.docx -o out.docx --report conv.md` |
@@ -88,6 +93,10 @@ round-trip that changes nothing produces an equivalent archive.
 | List bookmarks / fields | `python scripts/docx_crossref.py list in.docx` |
 | Write a static table of contents | `python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7` |
 | Measure the displayed page of paragraphs | `python tools/word_accept.py in.docx --page-probe 1,9,43 --json out.json` |
+| Unify fonts (CJK body / Latin Times New Roman) | `python scripts/fix_fonts.py in.docx [more.docx ...]` |
+| Merge two documents | `python scripts/merge_docs.py base.docx src.docx out.docx` |
+| Add the missing `w:percent` to `<w:zoom>` | `python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]` |
+| Export to PDF with the text layer intact | `pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]` |
 
 ## Creating a document
 
@@ -299,11 +308,201 @@ Word resolves column widths in a way that surprises people:
 first to see the current state, then `sync` to copy `tcW` values into the grid,
 or `set --widths` to pin them explicitly.
 
+## Fonts: two rules that Word enforces
+
+`fix_fonts.py` unifies fonts across three layers at once — styles, runs, and
+manual headings — and binds the CJK face to the `eastAsia` slot while
+`ascii` / `hAnsi` / `cs` stay `Times New Roman`. The reason it has to touch the
+XML by hand is the two rules below. Break either one and Word opens the file
+with "the file may be corrupted", not with a warning and not with a silent
+reformat.
+
+1. **Duplicate children inside `w:rPr` are illegal.** `w:rPr` is an
+   `xsd:sequence` and most of its children declare `maxOccurs="1"`, so a second
+   `w:rFonts` is a schema violation even though parsers happily read it. Real
+   Word and WPS both show the repair prompt on a document that carries one.
+   `dedupe_rpr(rpr)` collapses each name to its **last** occurrence before
+   anything else runs, so later attributes win — the same precedence a lenient
+   reader would have applied.
+2. **`w:rFonts` must be the first child of `w:rPr`.** It opens the `CT_RPr`
+   sequence. After deleting the old `rFonts`, the replacement has to go back in
+   with `rpr.insert(0, rf)`; `append` parks it at the tail, which is a legal XML
+   tree and an illegal `w:rPr`, and Word rejects it. That line is
+   `set_fonts(rpr, ea)`.
+
+```
+python scripts/fix_fonts.py in.docx [more.docx ...] [--heading-threshold 14]
+```
+
+Runs are dispatched by whether their paragraph is a heading, and a run with no
+`w:pStyle` whose font size reaches `--heading-threshold` (default 14 pt) is
+treated as a *manual* heading — that is the only way to catch a document whose
+author formatted headings by hand instead of applying `Heading 1`. Formula runs
+inside `m:oMath` are the exception: only `ascii` / `hAnsi` / `cs` are touched,
+`eastAsia` is left alone, because OMML manages its own glyph selection and an
+overwritten `eastAsia` visibly degrades the equation.
+
+Files are rewritten in place through a temporary file and `shutil.move`, so an
+interrupted run leaves the original intact.
+
+## `<w:zoom>` and its required attribute
+
+python-docx emits `<w:zoom w:val="bestFit"/>` on save, without the
+`w:percent` that `CT_Zoom` declares `use="required"`. It is well-formed XML and
+invalid OOXML, so a strict validator stops with
+
+```
+Element '{...}zoom': The attribute '{...}percent' is required but missing.
+```
+
+Word tolerates it; the XSD does not, and any pipeline that validates against the
+schema fails on a document this toolkit just produced.
+
+`docx_create.py` patches this itself, right after `doc.save()`: it calls
+`fix_zoom.fix_docx()`, so a document it produces already carries
+`w:percent="100"` and no manual second pass is needed. Use the CLI directly for
+documents that came from somewhere else — python-docx in your own script, an
+older file, or a template written by another tool:
+
+```
+python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]
+```
+
+Three things the script gets right that a naive patch does not:
+
+- A `<w:zoom>` that already carries `w:percent` is returned untouched. Adding a
+  second `percent` would be a duplicate attribute — malformed XML, worse than
+  missing. It is idempotent: a second run reports `zoom element already valid`.
+- Rewriting the zip reuses the original `ZipInfo` entries, so part order and
+  compression survive the round trip.
+- A package with no `word/settings.xml` is legal, not broken: the script reports
+  `nothing to do` and exits `0`.
+
+The pure entry point is `fix_settings_xml(xml, percent) -> tuple[str, int]`: XML
+in, `(patched_xml, sites_changed)` out. The tests import it directly rather than
+shelling out.
+
+```
+python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]
+```
+
+Three details make it safe to run anywhere:
+
+- A `<w:zoom>` that already carries `w:percent` is returned untouched. Adding a
+  second `percent` would be a duplicate attribute — malformed XML, worse than
+  the original defect.
+- The archive is rebuilt by reusing each original `ZipInfo`, so entry order and
+  timestamps survive and the byte diff stays limited to `settings.xml`.
+- A package with no `word/settings.xml` is legal. The script reports
+  `nothing to do` and exits `0` rather than inventing the part.
+
+The pure entry point is `fix_settings_xml(xml, percent) -> tuple[str, int]`: XML
+in, `(xml, count)` out, no file I/O, which is what the tests import. Re-running
+is a no-op.
+
+## Merging two documents
+
+`merge_docs.py base.docx src.docx out.docx` appends `src` to `base` and keeps
+styles, numbering, and media. Three decisions are deliberate and worth knowing
+before you inspect the result:
+
+- **Page setup comes from `base` only; `src`'s `sectPr` is dropped.** Keeping
+  both would not error — Word takes the last section's geometry, so a merge of a
+  document with 170 mm text width into one with 160 mm silently reflows the
+  whole base document to the wrong measure.
+- **Numbering is deduplicated by `w:numId` as a set union**, together with the
+  `w:abstractNum` those ids depend on. If `base` has no `numbering.xml` at all,
+  the part is copied wholesale plus a `[Content_Types]` override and a
+  relationship entry, since those are what actually make the part reachable.
+- **Styles are deduplicated by `w:styleId`**; a style that already exists in
+  `base` is never overwritten, so the base document's look wins.
+
+Self-checks after a merge: paragraph count equals `base × 2 + 1` (the extra
+paragraph carries the page break), the `word/media/*` count is conserved, and
+exactly one `sectPr` survives with every attribute equal to `base`'s. If a
+merged file looks wrong, those three numbers localise the problem faster than
+reading the XML.
+
+## Exporting to PDF (additional capability)
+
+This is not what the toolkit is for, and the frontmatter says so — it is a
+delivery path for documents this toolkit *produced*, not a general converter.
+
+It exists for one specific case: **the document contains OMML equations.** WPS
+exports those with a broken text layer — the formula area becomes an image or
+disappears, and the text around an equation can no longer be searched in the PDF.
+Word's own exporter keeps the layer intact, so the second prerequisite is
+**Windows with Microsoft Word installed**. Both conditions together, or the
+script is not the right tool.
+
+```powershell
+pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]
+```
+
+It drives Word COM: `Documents.Open($path, $false, $true)` — the third argument
+is `ReadOnly`, so the source file is not held open and picks up no
+"recently opened" state — then `ExportAsFixedFormat($pdf, 17)`, where `17` is
+`wdExportFormatPDF`. Everything sits inside `try` / `finally` with
+`Close($false)` (do not save) and `Quit()`, because a COM exception without the
+`Quit()` leaves a zombie `WINWORD` process holding the file handle, and a locked
+directory is much harder to diagnose than an error message. Pass absolute paths;
+COM resolves relative ones against the process working directory, which is not
+the shell's.
+
+Do not route a document with OMML through WPS.
+
+## Library modules
+
+Nine modules have no CLI and exist to be imported. Scripts reach them by bare
+name, which works because every script bootstraps its own directory onto
+`sys.path` (see [Conventions](#conventions)).
+
+| Module | What it provides |
+|---|---|
+| `linear_to_latex.py` | `find_math_spans` / `atoms_to_linear` / `linear_to_latex` / `repair_merged_scripts`, plus the `UNITS` whitelist |
+| `math_omml.py` | `latex_to_omml_lxml` / `latex_to_omml_string` / `assert_legal` / `apply_math_font` / `find_xslt` |
+| `fix_phasor_dot.py` | `fix_phasor_dots(omml) -> int`; `python scripts/fix_phasor_dot.py` runs its self-check |
+| `docx_pack.py` | `unpack` / `pack` — the round-trip described under [Working on an unpacked document](#working-on-an-unpacked-document) |
+| `docx_utils.py` | `wtag` / `register_all` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`, `FONT_HEITI`, `FONT_SONG` |
+| `docx_common.py` | `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph` (`--api` prints the surface) |
+| `encoding.py` | `_fix_stdio()` — switches stdout and stderr to UTF-8 on Windows |
+| `minidom_compat.py` | `defusedxml.minidom` with a stdlib fallback |
+| `_bootstrap.py` | flat-layout bootstrap: `sys.path` plus the minidom / UTF-8 fallbacks |
+
+`minidom_compat` matters more than it looks. `defusedxml` hardens XML parsing
+against entity expansion, but a bundled interpreter — the DSH runtime, a portable
+Python, a slim container — often has no third-party packages at all, and then
+every script that touches docx XML dies at *import* time. The module installs a
+stand-in built on `xml.dom.minidom` when the real package is missing, so call
+sites stay identical; parsing is simply unhardened, which is an acceptable
+trade for documents this toolkit wrote itself.
+
+`_bootstrap.py` is the single entry that wires all of this up, and **the first
+line of every new script is `import _bootstrap`** — one import covers `sys.path`
+self-location, the minidom fallback, and the UTF-8 stdio switch. `encoding.py`
+is the concrete implementation of that last part; import it directly only when
+you genuinely want the stdio fix without the rest.
+
+## Reference notes
+
+The body of this file covers the decisions. Measured detail — recipes, trap
+lists, schema quotes — lives in `references/`, loaded only when you need it.
+
+| File | Read it when |
+|---|---|
+| `references/formula-guide.md` | writing formula-chain production code, calling `_add_mixed`, debugging Word's "file may be corrupted", handling `%` / `℃` / `～` / absolute-value / compound-unit source traps |
+| `references/table-geometry.md` | column widths not taking effect, deciding between `set` and `sync`, `<w:zoom>` missing `w:percent` |
+| `references/font-scheme.md` | mixed CJK/Latin font conventions, `w:rPr` ordering and dedupe, what `--heading-threshold` means |
+| `references/merge-and-export.md` | after merging: page area / numbering / images wrong; Word COM export details; multi-page PDF via PIL |
+| `references/revisions-and-comments.md` | OOXML representation of comments and tracked changes, and the CLI semantics |
+| `references/toc.md` | building a static TOC: the two-pass recipe (`--page-probe` first, then write entries), tab stops and dot leaders, the full trap list |
+
 ## Layout
 
 ```
-scripts/     every CLI, flat, imported by bare module name
-references/  longer how-to notes, loaded on demand
+scripts/     every CLI, flat, imported by bare module name — 26 .py + 1 .ps1
+references/  longer how-to notes, loaded on demand — 6 files
+tools/       Word COM helper used by docx_toc's --page-probe
 tests/       pytest suite
 ```
 
@@ -328,6 +527,6 @@ you are delivering the result.
   Diagnostics and errors always go to stderr.
 - Exit code reflects the outcome; check it before parsing.
 - Files are read and written as UTF-8 explicitly; stdio is reconfigured to UTF-8
-  on Windows (`encoding_fix.py`).
+  on Windows (`_bootstrap.py`).
 - `requirements.txt` is pure ASCII on purpose — pip reads it with the system
   locale encoding, and a stray em dash breaks the install on a CJK Windows.

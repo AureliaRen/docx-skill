@@ -1,4 +1,6 @@
 # Byte-compiled / cache
+# NOTE: *.py[cod] is a character class -> it already covers .pyc / .pyo / .pyd,
+#       so *.pyc and *.pyo are intentionally not listed as separate lines.
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,6 +9,9 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Packaging metadata
+*.egg-info/
 
 # Test / coverage artifacts
 .pytest_cache/
@@ -32,3 +37,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Deliberately NOT ignored:
+#   *.json  - tpl.json is a product artifact (docx_template.py extract output)
+#   *.docx  - test fixtures and sample documents may be committed

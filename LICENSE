@@ -20,34 +20,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
----
-
-## Third-party notices
-
-The following files under `scripts/` are derived from
-[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent),
-path `skills/productivity/microsoft-office/`, which is released under the MIT
-License, Copyright (c) 2026 Nous Research:
-
-- `docx_common.py` — unchanged
-- `docx_create.py`
-- `docx_edit.py`
-- `docx_read.py`
-- `docx_validate.py`
-- `docx_comments.py`
-- `docx_revisions.py`
-- `docx_template.py`
-
-Local modifications to those files are limited to an added `sys.path`
-bootstrap header, a UTF-8 stdio import, and the portability/bug fixes noted in
-the commit history. The original MIT grant above applies to them unchanged.
-
-The remaining modules are original work:
-
-- `_bootstrap.py`, `encoding_fix.py`, `docx_pack.py`, `docx_utils.py`
-- `linear_to_latex.py`, `math_omml.py`, `docx_mathify.py`, `insert_formula.py`
-- `table_width.py`, `template.py`
-
-`MML2OMML.XSL` is a Microsoft Office component. It is used at runtime from a
-local Office installation and is **not** redistributed here.

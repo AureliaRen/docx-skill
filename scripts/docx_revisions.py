@@ -25,9 +25,7 @@ changes (w:rPrChange etc.) are reported by docx_read.py --revisions but
 not resolved here.
 """
 from __future__ import annotations
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401
+import _bootstrap  # noqa: F401
 
 import argparse
 import json

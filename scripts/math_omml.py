@@ -11,9 +11,7 @@ r"""LaTeX → OMML 共享引擎：latex2mathml + 微软 MML2OMML.XSL。
 from __future__ import annotations
 
 # --- repo bootstrap: make sibling imports work from any cwd ---------------
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401 — UTF-8 stdio on Windows
+import _bootstrap  # noqa: F401 — UTF-8 stdio on Windows
 # --------------------------------------------------------------------------
 
 import os
@@ -233,3 +231,10 @@ def assert_legal(omml, latex: str) -> None:
         elif name == "rad":
             if not any(local(c) == "e" for c in el):
                 raise RuntimeError(f"OMML 非法：<m:rad> 缺少 <m:e>（{latex!r}）。")
+
+
+if __name__ == "__main__":
+    print("math_omml is a library module, import it:")
+    print("    from math_omml import latex_to_omml_lxml, latex_to_omml_string, "
+          "assert_legal, apply_math_font")
+    raise SystemExit(0)

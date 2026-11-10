@@ -485,3 +485,9 @@ FONT_HEITI = {"ascii": "Times New Roman", "hAnsi": "Times New Roman",
 
 FONT_SONG = {"ascii": "Times New Roman", "hAnsi": "Times New Roman",
              "eastAsia": "宋体", "cs": "Times New Roman"}
+
+
+if __name__ == "__main__":
+    print("docx_utils is a library module, import it:")
+    print("    from docx_utils import wtag, parse, write, insert_ordered, FONT_TNR")
+    raise SystemExit(0)

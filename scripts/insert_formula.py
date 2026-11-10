@@ -40,8 +40,7 @@ import argparse
 import sys
 from pathlib import Path
 
-import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix
+import _bootstrap  # noqa: F401
 from docx_utils import (
     ET,
     fix_root,
@@ -54,12 +53,38 @@ from docx_utils import (
     wtag,
 )
 from math_omml import M_NS, latex_to_omml_lxml
+from fix_phasor_dot import fix_phasor_dots
+
+# 上一次 _omml_stdlib() 修掉的相量点数（CLI 用来打印，库调用方也可直接读）。
+_LAST_PHASOR_FIXES = 0
+# 上一次相量点修复抛出的异常描述（None = 没出错）。
+_LAST_PHASOR_ERROR: str | None = None
 
 
 def _omml_stdlib(latex: str, display: bool, raw_spacing: bool = False) -> ET.Element:
-    """lxml 元素 → stdlib ElementTree 元素（本脚本在 stdlib ET 树上改 document.xml）。"""
+    r"""lxml 元素 → stdlib ElementTree 元素（本脚本在 stdlib ET 树上改 document.xml）。
+
+    转换完**立刻**修相量点：``latex2mathml`` 把 ``\dot{X}`` 转成 ``m:limUpp``，
+    Word 里是「大字 + 飘着的点」，正确形态是 ``m:acc``（``\u0307`` 组合点）。
+    不挂这一刀，``\dot{I}`` 就会以丑态落进交付物。
+
+    异常语义：``latex_to_omml_lxml`` 失败仍向上抛（调用方按既有逻辑报错退出）；
+    ``fix_phasor_dots`` 失败**只在本函数内**捕获——公式已经转好了，相量点没修
+    只影响观感，没有理由让整条公式作废。失败信息留在 ``_LAST_PHASOR_ERROR``，
+    由 CLI 打到 stderr。
+
+    统计出口：修了几处写进模块级 ``_LAST_PHASOR_FIXES``（CLI 打印「修正相量点
+    N 处」，库调用方也可直接读该变量）。
+    """
+    global _LAST_PHASOR_FIXES, _LAST_PHASOR_ERROR
     from lxml import etree
     el = latex_to_omml_lxml(latex, display=display, raw_spacing=raw_spacing)
+    _LAST_PHASOR_FIXES = 0
+    _LAST_PHASOR_ERROR = None
+    try:
+        _LAST_PHASOR_FIXES = fix_phasor_dots(el)
+    except Exception as exc:            # 修相量点出事不该让整条公式丢掉
+        _LAST_PHASOR_ERROR = f"{type(exc).__name__}: {str(exc)[:160]}"[:200]
     return ET.fromstring(etree.tostring(el, encoding="unicode"))
 
 
@@ -105,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dump:
         print(ET.tostring(para, encoding="unicode"))
+        if _LAST_PHASOR_FIXES:
+            print(f"# 修正相量点 {_LAST_PHASOR_FIXES} 处（m:limUpp → m:acc）",
+                  file=sys.stderr)
+        if _LAST_PHASOR_ERROR:
+            print(f"# warning: 相量点修复失败：{_LAST_PHASOR_ERROR}", file=sys.stderr)
         return 0
 
     doc_xml = Path(args.unpacked_dir) / "word" / "document.xml"
@@ -135,7 +165,13 @@ def main(argv: list[str] | None = None) -> int:
 
     write(tree, doc_xml)
     fix_root(doc_xml)
-    print(f"Inserted {'display' if args.display else 'inline'} formula: {args.formula}")
+    # 「修正相量点 N 处」只在真修了才追加，没有相量点的公式（常态）输出与旧版
+    # 完全一致，不给下游解析多一个字段。
+    note = f"  修正相量点 {_LAST_PHASOR_FIXES} 处" if _LAST_PHASOR_FIXES else ""
+    print(f"Inserted {'display' if args.display else 'inline'} formula: "
+          f"{args.formula}{note}")
+    if _LAST_PHASOR_ERROR:
+        print(f"warning: 相量点修复失败：{_LAST_PHASOR_ERROR}", file=sys.stderr)
     return 0
 
 
