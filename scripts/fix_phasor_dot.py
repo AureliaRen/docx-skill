@@ -111,7 +111,20 @@ def fix_phasor_dots(omml):
 if __name__ == "__main__":
     # 自检：\dot{} 的回归用例。原版在这里硬编码了本机 formula-chain 绝对路径
     # （硬约束 #38），已清掉——同目录自举由文件顶部的 sys.path.insert 负责。
-    from math_omml import latex_to_omml_lxml
+    #
+    # 需要 MML2OMML.XSL（随 Microsoft Office 安装）。CI 的 hosted runner 没有
+    # Office，`latex_to_omml_lxml()` 会抛 FileNotFoundError——原来这里直接崩，
+    # 于是 `--help` 这类自检在无 Office 的机器上非零退出，把 CI 拉红。
+    # 本模块的修复逻辑本身不依赖 XSL（它是纯 XML 改写），所以缺 XSL 时只跳过
+    # 自检、并以 0 退出，让「模块可用」这件事在无 Office 机器上也能被验证。
+    from math_omml import find_xslt, latex_to_omml_lxml
+
+    try:
+        find_xslt()
+    except Exception as exc:
+        print(f"skip self-test: MML2OMML.XSL unavailable ({type(exc).__name__})")
+        print("fix_phasor_dots() itself needs no stylesheet; import it directly.")
+        raise SystemExit(0)
 
     for t in [r"\dot{I}", r"\dot{U}_{AB}", r"\dot{I}_{L}+\dot{I}_{C}"]:
         el = latex_to_omml_lxml(t)
