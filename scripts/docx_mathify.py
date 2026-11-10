@@ -38,9 +38,7 @@ Usage
 from __future__ import annotations
 
 # --- repo bootstrap: make sibling imports work from any cwd ---------------
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401 — UTF-8 stdio on Windows
+import _bootstrap  # noqa: F401 — UTF-8 stdio on Windows
 # --------------------------------------------------------------------------
 
 import argparse
@@ -59,6 +57,7 @@ from docx.text.paragraph import Paragraph
 
 import linear_to_latex as L
 from math_omml import latex_to_omml_lxml
+from fix_phasor_dot import fix_phasor_dots
 
 XMLSPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
@@ -677,6 +676,44 @@ def _om_or_scripts(tex: str, rpr, stats: dict) -> list | None:
     return runs
 
 
+def _omml_with_phasor(tex: str, stats: dict | None = None):
+    r"""LaTeX→OMML 的统一出口：转换后顺带修相量点（R-1）。
+
+    latex2mathml 把 ``\dot{X}`` 转成 ``m:limUpp``（上限），Word 里相量点会
+    浮在字上方且过大；本包装器在转换后立即调 ``fix_phasor_dots`` 把它就地
+    改写成 accent（``m:acc`` + U+0307）。本文件**全部** LaTeX→OMML 转换都
+    必须从这里过（历史坑：只在单点挂修复会漏 ``rebuild()`` 的分支，
+    见 MERGE-MAP R-1）。
+
+    异常语义（RT-001 修法的关键一条）
+    ----------------------------------
+    两级异常**必须分开**：
+
+    1. ``latex_to_omml_lxml`` 失败 → 原样抛出，由各调用点既有的 try/except
+       处理，记 ``stats["failed"]`` 并回退纯文本。这是「公式没转成」。
+    2. ``fix_phasor_dots`` 失败 → **只在内部捕获**，记进
+       ``stats["phasor_errors"]``，并返回**未修但可用**的 OMML。
+       这是「公式转成了、相量点没修好」，不该被当成转换失败——否则一篇
+       文档里一个 ``\\dot`` 出问题就会让整段公式回退成纯文本，代价远大于收益。
+
+    ``stats`` 非 None 时，修复成功累进 ``stats["phasor_fixes"]``（汇总行、
+    ``--report`` 与测试都读它），失败追加 ``{"latex", "error"}`` 进
+    ``stats["phasor_errors"]``（``error`` 里带异常类型名，便于区分根因）。
+    """
+    om = latex_to_omml_lxml(tex)
+    try:
+        n = fix_phasor_dots(om)
+    except Exception as exc:              # 修相量点出事不该拖垮整篇转换
+        if stats is not None:
+            stats.setdefault("phasor_errors", []).append(
+                {"latex": tex,
+                 "error": f"{type(exc).__name__}: {str(exc)[:160]}"[:200]})
+        return om                         # 返回未修版本：公式本身仍然可用
+    if n and stats is not None:
+        stats["phasor_fixes"] = stats.get("phasor_fixes", 0) + n
+    return om
+
+
 def _om_or_text(tex: str, fallback: str, stats: dict) -> list:
     if not tex:
         return []
@@ -684,7 +721,7 @@ def _om_or_text(tex: str, fallback: str, stats: dict) -> list:
     if runs is not None:
         return runs
     try:
-        return [latex_to_omml_lxml(tex)]
+        return [_omml_with_phasor(tex, stats)]
     except Exception as exc:
         stats["failed"].append({"latex": tex, "error": str(exc)[:200]})
         return [_text_run(None, fallback)]
@@ -834,7 +871,7 @@ def rebuild(p_el, segs: list[dict], stats: dict,
             return
         om = None
         try:
-            om = latex_to_omml_lxml(eqnum["latex"])
+            om = _omml_with_phasor(eqnum["latex"], stats)
         except Exception as exc:                       # 失败 → 退回普通段落
             stats["failed"].append({"latex": eqnum["latex"], "error": str(exc)[:200]})
         if om is not None:
@@ -891,7 +928,7 @@ def rebuild(p_el, segs: list[dict], stats: dict,
                 p_el.append(el)
             continue
         try:
-            om = latex_to_omml_lxml(seg["latex"])
+            om = _omml_with_phasor(seg["latex"], stats)
         except Exception as exc:                       # 失败 → 退回原文
             stats["failed"].append({"latex": seg["latex"], "error": str(exc)[:200]})
             p_el.append(_text_run(seg["atoms"][0]["rpr"],
@@ -979,7 +1016,11 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
              "script_fixes": [], "eqnum": 0, "align_tables": 0,
              "refs": 0, "unit_strings": 0, "bm": 9000,
              "text_scripts": 0, "text_script_rows": [],
-             "plain_no_layout": 0, "plain_no_layout_rows": []}
+             "plain_no_layout": 0, "plain_no_layout_rows": [],
+             # 相量点修复：成功计数 / 失败明细（RT-001 补的两个键）。
+             # 失败项刻意**不**并进 "failed"——那是「公式没转成」的语义，
+             # 而相量点修不好时公式本身是好的，只影响观感。
+             "phasor_fixes": 0, "phasor_errors": []}
     rows: list[dict] = []
 
     # 版心宽度（twips）：编号公式段的居中/右对齐制表位
@@ -1099,6 +1140,7 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
                  f"引用域：{stats.get('refs', 0)}　"
                  f"量纲串：{stats.get('unit_strings', 0)}　"
                  f"免排版降级：{n_plain}　"
+                 f"修正相量点：{stats.get('phasor_fixes', 0)}　"
                  f"失败：{len(stats['failed'])}", "",
                  "| # | 段落 | 原线性写法 | 生成的 LaTeX | 编号 | 量纲串（`/` = 每） |",
                  "|---|---|---|---|---|---|"]
@@ -1134,6 +1176,14 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
         if stats["failed"]:
             lines += ["", "## 转换失败（已保留原文）", ""]
             for f in stats["failed"]:
+                lines.append(f"- `{f['latex']}` → {f['error']}")
+        # 相量点修复失败**不是**转换失败（公式已转成、只是 ``\dot`` 可能仍是
+        # limUpp 形态），所以单列一节，别并进上面那段——两件事混在一起，
+        # 用户会以为公式没转成。
+        perr = stats.get("phasor_errors") or []
+        if perr:
+            lines += ["", "## ⚠️ 相量点未修复（公式已转换，`\\dot` 可能仍是 limUpp 形态）", ""]
+            for f in perr:
                 lines.append(f"- `{f['latex']}` → {f['error']}")
         bad = stats.get("bad_refs") or []
         if bad:
@@ -1203,11 +1253,17 @@ def main(argv: list[str] | None = None) -> int:
           f"编号段 {stats.get('eqnum', 0)}　对齐编号块 {stats.get('align_tables', 0)}　"
           f"引用域 {stats.get('refs', 0)}　量纲串 {stats.get('unit_strings', 0)}　"
           f"失败 {len(stats['failed'])}　"
-          f"修正上下标 {len(stats['script_fixes'])}")
+          f"修正上下标 {len(stats['script_fixes'])}　"
+          f"修正相量点 {stats.get('phasor_fixes', 0)}")
     if out:
         print(f"输出: {out}")
     for f in stats["failed"][:10]:
         print("  FAIL", f["latex"], "->", f["error"][:120])
+    # 相量点没修好**不算转换失败**（公式本身是好的），所以只提示、不改退出码。
+    # 走 stderr：本脚本的 stdout 是给人看的汇总行，诊断一律走另一路。
+    perr = stats.get("phasor_errors") or []
+    for f in perr[:10]:
+        print("  PHASOR-WARN", f["latex"], "->", f["error"], file=sys.stderr)
     if stats["failed"]:
         # Some formulas could not be converted. The document is still written
         # (partial conversion is useful), but the caller must be able to tell:

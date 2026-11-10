@@ -19,9 +19,7 @@ older versions (or when --xml is passed). Listing and deletion always
 work at the XML level so they handle documents from any producer.
 """
 from __future__ import annotations
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401
+import _bootstrap  # noqa: F401
 
 import argparse
 import datetime as _dt

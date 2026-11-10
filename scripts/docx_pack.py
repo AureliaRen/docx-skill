@@ -136,3 +136,9 @@ def pack(src_dir: str | Path, out_path: str | Path,
         if source is not None:
             source.close()
     return out
+
+
+if __name__ == "__main__":
+    print("docx_pack is a library module, import it:")
+    print("    from docx_pack import unpack, pack  # + UnsafeArchiveError")
+    raise SystemExit(0)

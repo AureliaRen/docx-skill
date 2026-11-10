@@ -101,13 +101,13 @@ every field is written with a cached result so the file reads correctly
 before anyone recalculates.
 """
 from __future__ import annotations
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401
+import _bootstrap  # noqa: F401
 
 import argparse
+import contextlib
 import json
 import sys
+from pathlib import Path
 
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
@@ -117,6 +117,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt, RGBColor, Twips
 
+from fix_zoom import fix_docx
 from docx_section import (
     add_page_number_field, add_section_break, apply_page_to_section,
     configure_section, set_hdrftr_text,
@@ -1117,6 +1118,14 @@ def main() -> int:
                          ensure_ascii=False))
         return 1
     doc.save(args.output)
+    # R-11: python-docx writes <w:zoom> without the schema-required w:percent;
+    # patch it right after save so pipeline output is valid without a manual
+    # second pass (see fix_zoom.py). fix_docx prints CLI-style diagnostics to
+    # stdout; this script must keep stdout JSON-only (SKILL.md: "Machine-
+    # readable scripts write JSON to stdout; diagnostics go to stderr"), so
+    # reroute its stdout to stderr for the duration of the call.
+    with contextlib.redirect_stdout(sys.stderr):
+        fix_docx(Path(args.output))
     print(json.dumps({"ok": True, "output": args.output,
                       "blocks": len(spec.get("blocks", [])),
                       "sections": len(doc.sections),

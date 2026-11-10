@@ -152,7 +152,7 @@ def test_create_read_validate_cycle(tmp_path: Path):
 # template extract / apply --to — the off-by-one regression
 # ---------------------------------------------------------------------------
 def test_template_extract_writes_json(simple_docx: Path, tmp_path: Path):
-    from template import _extract
+    from docx_template import _extract
 
     tpl = _extract(simple_docx)
     assert isinstance(tpl, dict)
@@ -160,7 +160,7 @@ def test_template_extract_writes_json(simple_docx: Path, tmp_path: Path):
 
 
 def test_template_apply_to_existing_document(simple_docx: Path, tmp_path: Path):
-    from template import _apply_existing, _extract
+    from docx_template import _apply_existing, _extract
 
     tpl = _extract(simple_docx)
     # Must not raise: the old code computed the repo root one level too high and
