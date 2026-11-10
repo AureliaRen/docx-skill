@@ -32,9 +32,7 @@ title paragraph this module bookmarked) are removed first, so regenerating
 after editing the body never accumulates a second TOC.
 """
 from __future__ import annotations
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import encoding_fix as _encoding_fix  # noqa: F401
+import _bootstrap  # noqa: F401
 
 import re
 

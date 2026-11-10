@@ -121,103 +121,6 @@ the old behaviour" a true statement rather than a nearly-true one. The report
 recomputes the tier-3 reason only when both switches are on, so a report cannot
 claim a downgrade that the document did not get.
 
-## Three output tiers
-
-Recognising a span as a formula is one decision; deciding what to emit for it is
-another. `_om_or_scripts()` in `docx_mathify.py` makes the second decision in a
-fixed order, and each tier has its own test:
-
-| Tier | Test | Output | Example |
-|---|---|---|---|
-| 1. Structural | `structural_reason()` finds a command in `_STRUCTURAL_CMDS` — 43 entries covering fractions, radicals, integrals, big operators, limits, accents, delimiters, environments, and equation tags | OMML via `latex_to_omml_lxml()` | `x^2/16+y^2/9=1`, `v=s/t` |
-| 2. Plain script | no structural command, and the span contains at least one `^` or `_` | ordinary `<w:r>` runs carrying `w:rPr/w:vertAlign` | `a=9.8m/s2`, `10^-7` |
-| 3. No layout needed | no structural command, no `^`/`_`, exactly one `=`, a single ASCII letter (optionally with a trailing `'`) on the left, a signed decimal on the right, and an optional unit tail | ordinary text runs, original `rPr` preserved | `s=10km`, `t=2h`, `m=5kg`, `v=3m/s` |
-
-The order matters and is not interchangeable. Tier 3 requires the *absence* of
-`^`/`_`; tier 2 requires their *presence*. They are mutually exclusive by
-construction, and `no_layout_reason()` is a pure function so the switch is
-applied only at the call site, never inside the test.
-
-### Why tier 2 exists at all
-
-Word stores a real superscript as `<w:rPr><w:vertAlign w:val="superscript"/>`,
-which is what `Ctrl+Shift+=` toggles and what restores the character to full size
-when toggled back. An OMML `m:sSup` cannot do that: its raised glyph is a
-formula-engine layout, `Font.Superscript` reports `0`, and pressing the shortcut
-on it stacks a second superscript on already-shrunken type. Tier 2 emits the run
-form so the shortcut behaves the way a Word user expects.
-
-### Why tier 3 costs the italic, and why that is settled
-
-Tier 2 and tier 3 both lose the math italic that OMML would have supplied. For a
-span that genuinely needs scripts, that is the price of getting real scripts. For
-tier 3 the accounting was revisited and the cost accepted on 2026-11-07: where
-nothing needs two-dimensional layout, a thing expressible as text should not
-become an equation object.
-
-The reasoning is about the object, not the glyph. An equation object in a body
-paragraph means opening the formula editor to change one character, losing shape
-when copied into other software, and a line box the formula engine stretches.
-Against that, `s=10km` has no fraction, no radical, no script — nothing the
-object is for. So the span is emitted as text and `s` comes out upright.
-
-The correct remedy when the italic is wanted is to change the *input*, not to
-push the span back up a tier:
-
-- write the form with a script — `a=9.8m/s2` becomes tier 2 and keeps a real
-  superscript run;
-- or, building a document from a spec, mark the runs explicitly with
-  `vert_align` (`superscript` / `subscript`; the `superscript` and `subscript`
-  booleans are accepted as aliases, and an explicit `vert_align` wins over
-  them) in `docx_create`.
-
-`w:i` is not the answer: it is run-wide italic, so `18` and `g/mol` would be
-slanted along with the quantity symbol.
-
-### What tier 3 refuses, and why
-
-The unit tail is a whitelist rather than "any letters". `_is_unit_tail()` splits
-on `/`, `·`, `⋅` and requires every factor to be a member of
-`linear_to_latex.UNITS`, or `%`. Two consequences worth stating outright:
-
-- `y=2x` stays an equation. A permissive tail would read it as "2 metres" and
-  flatten a function relation to upright text.
-- `n=2t` stays an equation. `t` is deliberately absent from `UNITS` (it must not
-  shadow time as a quantity symbol), so `v=s/t` keeps its real fraction, and
-  `n=2t` is refused by the same rule.
-
-Also refused, all conservatively — the span keeps its equation object:
-
-| Input | Refused at | Reason |
-|---|---|---|
-| `F=ma`, `U=IR` | right-hand side | not a pure number |
-| `f(x)=0`, `A=(-1,3)` | left-hand side | not a single letter |
-| `n\geq 2` | `=` count | no equation sign |
-| `m=\rho V=1.2\times 60=72kg` | `=` count | chained equality |
-| `a=9.8\,\mathrm{m/s^{2}}` | `^`/`_` | tier 2 picks it up instead |
-| `y=2x`, `n=2t` | unit whitelist | see above |
-| `s=10m/`, `s=10/x` | unit whitelist | incomplete or non-unit factor |
-
-Two current limits, recorded as behaviour rather than as guarantees: `T=25℃`
-stays an equation because `℃` is not in `UNITS`, and a Greek quantity symbol such
-as `η=80%` stays an equation because the left-hand side must be a single ASCII
-letter. Both err toward keeping the equation object, so neither can mangle text.
-
-### The two switches
-
-Both are module-level constants in `docx_mathify.py`:
-
-| Constant | Default | `False` |
-|---|---|---|
-| `MIXED_SUPERSCRIPT` | `True` | every span goes to OMML — the master switch |
-| `NO_LAYOUT_NEEDED` | `True` | only tier 3 stops; tier 2 still applies |
-
-`NO_LAYOUT_NEEDED` is contained by `MIXED_SUPERSCRIPT`. Turning the master switch
-off stops both tiers, which is what makes "`MIXED_SUPERSCRIPT = False` restores
-the old behaviour" a true statement rather than a nearly-true one. The report
-recomputes the tier-3 reason only when both switches are on, so a report cannot
-claim a downgrade that the document did not get.
-
 ## Why the conversion goes through Microsoft's stylesheet
 
 The obvious approach — hand-building OMML XML — produces documents Word rejects
@@ -234,6 +137,23 @@ the output correct by construction. Do not hand-build OMML.
 - a `<m:oMath>` appearing inside any of
   `m:num` / `m:den` / `m:e` / `m:sub` / `m:sup` / `m:deg` / `m:fName` / `m:lim`
 - a `<m:rad>` with no `<m:e>` child
+
+That first list is the set `ARG_TAGS` in `math_omml.py` — `num`, `den`, `e`,
+`sub`, `sup`, `deg`, `fName`, `lim`, eight argument containers. Each of them
+holds runs and nested constructs: an `<m:e>` may contain an `m:f`, an `m:rad`,
+an `m:nary`, all day long. What it may not contain is a whole equation, because
+`m:oMath` is the outermost element of the construct, not an argument of it.
+Word's reader parses the nesting without complaint and then declines to lay the
+document out, which is why the failure surfaces to the user as "the file may be
+corrupted" instead of as a parse error pointing at the offending byte. The
+missing `<m:e>` fails the same way: a radical with nothing under it has no
+layout, so the whole body is abandoned.
+
+Both checks run inside `latex_to_omml_lxml()`, immediately after the stylesheet
+returns and before the font injection, which is the only point where the tree is
+still the stylesheet's output. `assert_legal()` quotes the LaTeX source in the
+error, so the message names the input you wrote rather than a byte offset in a
+part you never edited by hand.
 
 ## Locating MML2OMML.XSL
 
@@ -281,6 +201,22 @@ Two details worth knowing:
   `w:rPr/w:rFonts` block, including runs nested inside `m:f`/`m:rad`/`m:nary`
   argument containers. There is no residue on Cambria Math in the visible text.
 
+The count is the cheap way to check a document after conversion. On the smoke
+fixture, which is the regression baseline this chain is measured against:
+
+```
+_smoke/in.docx          → 4 formulas / 0 failures / TNR=80 / limUpp=0
+```
+
+`out_tnr.docx` is that baseline's recorded output. `TNR=80` is the number of
+`w:rFonts` attributes set to Times New Roman — 20 `<m:r>` runs times four
+attributes each — and it is the number that regresses first if injection ever
+stops reaching a nesting level. `limUpp=0` says no phasor dot survived in its
+wrong form. The count moves with the content: a document with a phasor that the
+patch rewrites legitimately loses runs, because the three runs of an `m:limUpp`
+collapse into one `m:acc`. Compare run counts between documents only after
+accounting for that.
+
 ## What the span detector refuses to convert
 
 `find_math_spans()` is deliberately conservative, because false positives are far
@@ -305,6 +241,133 @@ Accepting a span is not the same as emitting an equation object for it — the t
 split decides that. Of that list, `U=IR`, `ΣI=0`, and the two subscripted forms
 stay OMML; `f=50Hz` lands in tier 3 as plain text, because it is a quantity
 symbol, one `=`, a number, and a whitelisted unit.
+
+## Marking spans yourself with `$...$`
+
+Everything above assumes the author wrote linear notation and left the detector to
+find it. The detector is conservative by design, so it will sometimes decline a
+span you know is a formula — and no amount of tuning fixes the general case,
+because the information it lacks is *intent*, which only you have.
+
+The escape hatch is to mark the span yourself. `$...$` is not LaTeX in the
+document sense and pandoc will not see it; it is a convention this chain honours,
+and the rule is one line: whatever sits between the dollars goes to the converter
+as LaTeX, verbatim, and the text around it stays text.
+
+```python
+def _add_mixed(p, text):
+    pos = 0
+    for m in re.finditer(r"\$([^$]+)\$", text):
+        if m.start() > pos:
+            _run(p, text[pos:m.start()])
+        tex = m.group(1)
+        try:
+            el = latex_to_omml_lxml(tex)
+            fix_phasor_dots(el)      # 手写调用方必补，否则点会浮大
+            p._p.append(el)
+        except Exception as exc:     # noqa: BLE001
+            FAILS.append((tex, str(exc)[:150]))   # 记账回退，绝不静默丢公式
+            _run(p, tex)
+        pos = m.end()
+    if pos < len(text):
+        _run(p, text[pos:])
+```
+
+Three things in that loop carry weight:
+
+- the regex is `\$([^$]+)\$`, non-greedy by construction — an empty span matches
+  nothing, and an unterminated `$` is left as literal text rather than swallowing
+  the rest of the paragraph;
+- `fix_phasor_dots(el)` is called by hand, because this loop is itself a
+  hand-written caller — nothing below it in the chain will do the repair (see
+  "Phasor dots need their own accent");
+- the `except` branch does not drop the formula. It records `(latex, error)` in
+  `FAILS` and falls back to emitting the source text, so a formula that fails to
+  convert shows up as its own LaTeX on the page — visible, greppable, and listed
+  in the run summary. Silently losing an equation is the one outcome worth this
+  much code to prevent.
+
+The trade-off is honest: a `$` in prose now has to be written `\$`, and the
+detector's opinion no longer applies inside the markers. In exchange you get
+exactly the equations you meant, in exactly the places you meant them.
+
+## Phasor dots need their own accent
+
+`\dot{X}` looks like one operator, but `latex2mathml` reads it as an accent applied
+to a base, and emits the accent through `m:limUpp` — the limits-upper construct,
+which is what an over-something operator becomes when its content is not
+recognised as a combining mark. Word lays `m:limUpp` out as a stacked limit: the
+dot sits above the letter at full size, off-centre, and stays put when you retype
+the base. The dot of a phasor is not a limit; it is a diacritic, and Word has an
+element for that: `m:acc` with the combining dot above, `\u0307`.
+
+`fix_phasor_dots()` rewrites one into the other. It walks the tree, finds every
+`m:limUpp` whose body is a single letter carrying exactly one dot, and replaces
+it with `m:acc` + `m:chr[val="\u0307"]`, deep-copying the base run's `w:rPr` into
+the new `m:e` so the Times New Roman injection survives the move. It is
+deliberately narrow — a single-letter base and a single dot on top. A genuine
+`\lim` has a multi-character body and is passed through untouched, so the same
+tree can hold both a phasor and a limit.
+
+Measured on three inputs, counting `m:acc` and `m:limUpp` occurrences in the
+serialised OMML:
+
+```
+'\dot{I}'                    fixed 1   acc=2  limUpp=0
+'\dot{U}_{AB}'               fixed 1   acc=2  limUpp=0
+'\dot{I}_{L}+\dot{I}_{C}'    fixed 2   acc=4  limUpp=0
+```
+
+`acc=2` for a single dot is not a double application: `m:acc` contributes an
+opening tag and a closing one, and the counter matches both.
+
+`latex_to_omml_lxml()` does **not** fix this, on purpose. It is a pure converter —
+LaTeX in, OMML out, no post-processing — and `\dot{I}` through it still measures
+`acc=0 limUpp=1`. The repair is applied by the layer above: in `docx_mathify.py`
+every conversion goes through `_omml_with_phasor()`, which is the single exit for
+the whole module, and in `insert_formula.py` the fix runs immediately after the
+conversion inside `_omml_stdlib()`.
+
+Both CLIs report the count, and a failure to repair never sinks the run:
+
+| Where | What you see |
+|---|---|
+| `docx_mathify.py` summary line | `修正相量点 N` |
+| `docx_mathify.py --report` | a summary row plus, when there were failures, a detail block |
+| `docx_mathify.py` stderr | `PHASOR-WARN <latex> -> <ExceptionType>: ...`, one per failure |
+| `insert_formula.py` stdout | `修正相量点 N 处`, appended only when N > 0 |
+
+`stats["phasor_fixes"]` is initialised to `0` and `stats["phasor_errors"]` to
+`[]`, so a run with no phasors reports a zero rather than omitting the field.
+`_omml_with_phasor()` wraps the repair in `try/except`: an exception is recorded
+in `phasor_errors` (with the exception type name) and the **unrepaired but usable**
+OMML is returned, so a broken accent never drags the whole document down into
+`stats["failed"]`. `insert_formula.py` mirrors this with the module-level
+`_LAST_PHASOR_FIXES` / `_LAST_PHASOR_ERROR` pair and prints the failure to stderr.
+
+That makes the count a supported output you can read — the summary line and the
+report are the contract, so a regression in the repair shows up as a number that
+stops moving. Diagnostics go to stderr and never mix into stdout.
+
+If you are a **hand-written caller** — your own script doing
+`from math_omml import latex_to_omml_lxml` and appending the result yourself —
+call `fix_phasor_dots(el)` before you place it. That return value is the count the
+repair hands back, and asserting on the tree afterwards is how you prove it
+happened:
+
+```python
+el = latex_to_omml_lxml(tex)
+fix_phasor_dots(el)
+assert '<m:limUpp' not in etree.tostring(el, encoding="unicode")
+```
+
+One more line from the same measurement run is worth explaining so it does not
+look like a defect. `\dot{I}_{L}+\dot{I}_{C}` written alone, with no relation
+sign anywhere in the span, is not converted at all — no OMML, nothing to fix.
+That is the span detector behaving as designed: `find_math_spans()` requires a
+relation character or one of the strong symbols, and `+` is an operator, not a
+relation, so it is not in `OP_CHARS`. Add `= \dot{I}` and the whole thing becomes
+one span with two accents.
 
 ## Merged scripts
 
@@ -381,3 +444,69 @@ while writing the source text, not afterwards:
 
 `--dry-run` reports conversions without writing, which is the cheap way to audit
 a large document before committing to the change.
+
+## Command line
+
+Two entry points. `docx_mathify.py` handles a whole document; `insert_formula.py`
+handles one equation at a known anchor.
+
+```
+python docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
+python insert_formula.py unpacked/ "E=mc^2" --after "marker"
+```
+
+### `docx_mathify.py`
+
+| Flag | Effect |
+|---|---|
+| `input` | the source `.docx`, opened read-only |
+| `-o`, `--out` | where to write the converted document |
+| `--inplace` | overwrite the source, after copying it to `<name>.bak.docx` |
+| `--report` | write a Markdown table of original notation ↔ generated LaTeX |
+| `--tex` | write a deduplicated list of the LaTeX the run produced |
+| `--no-merged-script-fix` | leave merged sub/superscripts alone (`\omega_{0L}` stays one script) |
+| `--dry-run` | report only; no document is written |
+| `--number-align` | number the rows of an `align`/`gather` that carry no `\tag` |
+
+Exactly one of `-o`, `--inplace`, `--dry-run` is required. Passing none of them is
+not a silent no-op: the script prints what is missing and exits `2`. That is a
+deliberate choice — a batch rewrite that quietly does nothing looks identical to
+one that succeeded, and the difference only surfaces when someone opens the
+document expecting formulas.
+
+`--report` and `--tex` are worth running together. The report is for reading: it
+pairs each original notation with the LaTeX that came out, one row per span,
+which is how you spot a span that was converted but converted wrongly. The `.tex`
+file is for diffing: it is a deduplicated list, so on a re-run a change in it means
+the converter's output changed, not that the document did.
+
+### `insert_formula.py`
+
+The first positional argument is `unpacked_dir` — a directory you have already
+extracted from the `.docx`, not the `.docx` itself, because the script edits
+`word/document.xml` in place and expects to hand the tree back to a packer.
+The second is the LaTeX.
+
+| Flag | Effect |
+|---|---|
+| `--after MARKER` | place the equation after the paragraph containing that text |
+| `--before MARKER` | place it before that paragraph |
+| `--display` | emit `m:oMathPara` — a centred display equation rather than inline |
+| `--raw-spacing` | keep `\quad`, `\,`, `\;`, `\:` as written |
+| `--dump` | print the generated OMML and write nothing |
+
+`--after` and `--before` are mutually exclusive, and a marker that is not found is
+an error (`exit 1`), not a fallback to the end of the document. A formula in the
+wrong place is harder to notice than a command that refused.
+
+Two things the script does for you:
+
+- An inline equation that would otherwise be the only content of its paragraph
+  gets a zero-width space run appended (`\u200b`). Without it Word promotes the
+  `m:oMath` to a display equation and the layout changes under you — the same
+  problem pandoc records as issue #11674.
+- Spacing commands are rewritten before conversion. `\quad`, `\,`, `\;`, `\:`
+  and `\!` do not survive the trip through MathML and the stylesheet; the
+  characters are dropped and the formula closes up. `keep_spacing()` rewrites each
+  of them to `\ `, a control space, which does survive. `--raw-spacing` turns the
+  rewrite off, and is only useful when you are inspecting what the XSLT drops.

@@ -57,7 +57,7 @@ $py = (Get-Command python).Source
 | XML | `probe_xml(path) -> dict` | 只用 stdlib（`zipfile` + `xml.etree`） | CI 可跑；结构 / 书签 / 域码 / `w:hyperlink` 包裹 / `numPr`+`lvlText` / TOC 页码 / 样式普查 |
 | Word | `probe_word(...) -> dict` | `pywin32` + Office | 只有 Word 才知道的：页数、节几何、渲染后的编号串、超链接**目标**、域**结果**、PDF、PNG |
 
-`probe_xml` **刻意不 import `scripts/` 下任何东西**（含 `encoding_fix`），
+`probe_xml` **刻意不 import `scripts/` 下任何东西**（含 `_bootstrap`），
 `tools/word_accept.py` 里自带一份 6 行的 `_fix_stdio`。这样即使 `scripts/` 正在被并行改写，
 验收器照常可用。同理 `win32com` / `fitz` 都只在函数内延迟导入——
 `tests/test_word_accept_xml.py` 用 `ast` 把这条钉死了。

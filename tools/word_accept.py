@@ -176,7 +176,8 @@ def qm(local: str) -> str:
 def _fix_stdio() -> None:
     """Reconfigure stdout/stderr to UTF-8 on Windows.
 
-    A standalone copy of ``scripts/encoding_fix.py``: this tool must keep
+    A standalone copy of the stdio fix from ``scripts/_bootstrap.py``: this tool
+    must keep
     working when ``scripts/`` is mid-edit, so it imports nothing from there.
     """
     if __import__("os").name != "nt":

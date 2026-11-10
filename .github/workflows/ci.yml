@@ -71,21 +71,206 @@ jobs:
           echo "requirements.txt is ASCII-only"
 
       - name: Every CLI answers --help
+        # Why this step is not the two lines it used to be. Three ways the old
+        # version was decorative rather than protective:
+        #
+        #   1. FALSE GREEN. `python "$f" --help > /dev/null || fail=1` only sees
+        #      the exit code. minidom_compat.py is a pure library (no argparse,
+        #      no __main__), so it printed nothing and exited 0 -- and the gate
+        #      that was meant to prove "this is a working CLI" proved nothing at
+        #      all. Silence now counts as failure.
+        #   2. MISSED COVERAGE. docx_common.py does expose a real CLI but was
+        #      hardcoded into the skip list, so the one gate covering CLIs
+        #      never looked at it. (It is now in `checked` like every other CLI.
+        #      Its earlier `--api` special case is gone too: that existed only
+        #      because docx_common.py was the one CLI without the `import
+        #      _bootstrap` UTF-8 stdio fix, which made `--help` die on cp1252.
+        #      The import was added, so `--help` is now platform-invariant.)
+        #   3. HARDCODED LIST. The skip list was six filenames while the tree
+        #      actually ships seven pure libraries (_bootstrap.py was only
+        #      excluded by the `_*` glob). The next library added would have
+        #      been silently dragged into the loop and turned the build red, or
+        #      the next CLI deleted would have gone unnoticed.
+        #
+        # NOTE on the current split: the pure libraries that ship a one-line
+        # `__main__` self-description (docx_pack / docx_utils / encoding /
+        # linear_to_latex / math_omml / minidom_compat) are classified as CLIs
+        # by rule B, and deliberately so -- they now answer `--help` with a real
+        # message, which is exactly what this gate should confirm. Only
+        # _bootstrap.py remains in the library bucket, via rule A.
+        #
+        # The list is now derived, the two rules are unioned, and the derived
+        # set is cross-checked against an independent probe so drift fails loudly.
         shell: bash
         run: |
-          set -e
+          set -uo pipefail
           fail=0
+
+          # --- derived classification -------------------------------------
+          # Rule A (`_*`): private modules are imported by the CLIs before
+          #   argument parsing, so executing them is never meaningful.
+          # Rule B (no `__main__` guard): a module that cannot run itself
+          #   cannot be a CLI, so `--help` cannot validate it either.
+          # The two rules are UNIONED. Rule B alone would drag _bootstrap.py
+          # into the loop (it is a pure library too, and it prints nothing).
+          is_pure_lib() {
+            case "$(basename "$1")" in _*) return 0 ;; esac
+            ! grep -qE '^[[:space:]]*if[[:space:]]+__name__[[:space:]]*==' "$1"
+          }
+
+          # Independent probe of the same intent, used only for the cross-check.
+          # Deliberately a different (looser) expression than the anchored grep
+          # in is_pure_lib: if either side drifts, the diff below fires.
+          probed=$(grep -L 'if __name__' scripts/*.py || true)
+
+          skipped=()
+          checked=()
           for f in scripts/*.py; do
-            case "$(basename "$f")" in
-              _*|docx_common.py|docx_utils.py|encoding_fix.py|linear_to_latex.py|math_omml.py|docx_pack.py) continue ;;
-            esac
-            echo "--- $f"
-            python "$f" --help > /dev/null || { echo "FAILED: $f"; fail=1; }
+            if is_pure_lib "$f"; then skipped+=("$f"); else checked+=("$f"); fi
           done
+
+          if [ "${#checked[@]}" -eq 0 ]; then
+            echo "::error::no CLI scripts found under scripts/ -- the gate would verify nothing"
+            exit 1
+          fi
+
+          # --- consistency self-check (both directions) --------------------
+          # Direction 1: anything the probe calls a library must be excluded.
+          # If not, it is "checked" by a gate that cannot detect its silence.
+          for f in $probed; do
+            is_pure_lib "$f" || {
+              echo "::error file=$f::$f has no __main__ but is NOT excluded; the probe and the exclusion list disagree"
+              fail=1
+            }
+          done
+          # Direction 2: anything excluded must be justified by `_*` or the probe.
+          # This is what catches a hardcoded filename creeping back in.
+          for f in "${skipped[@]}"; do
+            case "$(basename "$f")" in _*) continue ;; esac
+            printf '%s\n' "$probed" | grep -qxF "$f" || {
+              echo "::error file=$f::$f is excluded but has a __main__ guard; exclusion is not justified by the rules"
+              fail=1
+            }
+          done
+
+          echo "pure libraries (excluded, ${#skipped[@]}):"
+          for f in "${skipped[@]}"; do echo "  $f"; done
+          echo "CLIs (checked, ${#checked[@]}):"
+          for f in "${checked[@]}"; do echo "  $f"; done
+
+          # --- the gate itself ---------------------------------------------
+          # Non-empty output is required: a silent exit 0 is exactly the
+          # false green this step exists to prevent.
+          #
+          # Every script in `checked` gets the same `--help` probe. There used
+          # to be a per-file exception for docx_common.py, which had to be
+          # probed with `--api` because it was the only CLI without the
+          # `import _bootstrap` UTF-8 stdio fix: its argparse epilog is Chinese,
+          # so on a leg whose redirected stdout is cp1252 (windows-latest)
+          # `--help` died with UnicodeEncodeError. That gap is now closed --
+          # docx_common.py imports _bootstrap like every other CLI -- so the
+          # exception is gone and the gate is uniformly stricter. Re-measured
+          # both ways under PYTHONIOENCODING=cp1252: `--help` exits 0.
+          for f in "${checked[@]}"; do
+            arg=--help
+            out=$(mktemp)
+            echo "--- $f $arg"
+            if ! python "$f" "$arg" > "$out" 2>&1; then
+              echo "::error file=$f::python $f $arg exited non-zero"
+              fail=1
+            elif [ ! -s "$out" ]; then
+              echo "::error file=$f::$f $arg produced no output (silent exit 0 proves nothing)"
+              fail=1
+            else
+              head -n 1 "$out"
+            fi
+            rm -f "$out"
+          done
+
           exit $fail
 
       - name: Run tests
         # Formula round-trip tests need MML2OMML.XSL from a local Office install,
         # which the hosted runners do not have. Those tests skip themselves when
         # the stylesheet is absent; everything else must pass.
-        run: python -m pytest tests/ -v
+        #
+        # Exit code alone is not enough: pytest exits 0 when a whole block of
+        # tests has been turned into skips. The counts are asserted below.
+        #
+        # The numbers are the hosted-runner reality, not this workstation:
+        #   passed  >= 1297, skipped <= 366
+        # Re-measured on a simulated runner after the P3-4 rework tickets landed
+        # (no Office -> no MML2OMML.XSL, no _smoke/ in the parent dir, no
+        # work/r7_final/): 1297 passed / 365 skipped / collect 1662.
+        #
+        # How that number is built, so the next person can audit it instead of
+        # just bumping it:
+        #   A1 baseline (before RT-001/002/007/008/009)      1293 / 359
+        #   + RT-009 test_fonts.py   9 -> 13 tests           +4  /   0   (they run
+        #                                            without Office: no OMML)
+        #   + RT-002 test_insert_formula.py 6 tests          +0  /  +6   (all six
+        #                                            skip without the XSL)
+        #   =                                                1297 / 365
+        # A developer machine with Office reports ~1423 passed / 239 skipped
+        # because 119 OMML tests and 1 _smoke test really execute there -- do
+        # NOT use that number here.
+        #
+        # skipped is bounded above, not pinned: the count moves whenever a spec
+        # file is added or _smoke starts shipping. A *rise* past the bound means
+        # a block of tests stopped running and needs a human look; a *drop* is
+        # fine. The headroom is deliberately small (1) -- if a new test file
+        # adds skip-on-CI cases, this bound must be raised in the same commit.
+        shell: bash
+        run: |
+          set -uo pipefail
+          log=$(mktemp)   # not ./pytest.log: keep the checkout clean for later steps
+          python -m pytest tests/ --tb=short -q > "$log" 2>&1
+          status=$?
+          tail -n 30 "$log"
+          if [ "$status" -ne 0 ]; then
+            rm -f "$log"
+            echo "::error::pytest exited $status"
+            exit 1
+          fi
+          python - "$log" <<'PY'
+          import pathlib, re, sys
+
+          MIN_PASSED = 1297   # simulated-runner measurement, not a local number
+          MAX_SKIPPED = 366   # 365 measured + 1 headroom; breakdown in the step comment
+
+          log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+
+          # The summary is the last line carrying a duration, e.g.
+          #   "1293 passed, 359 skipped in 29.63s"
+          summary = None
+          for line in log.splitlines():
+              if re.search(r"\bin\s+\d+(?:\.\d+)?s", line) and re.search(r"\d+ (?:passed|failed|error)", line):
+                  summary = line
+          if summary is None:
+              print("::error::no pytest summary line found; cannot verify the counts")
+              sys.exit(1)
+          print(f"summary: {summary.strip()}")
+
+          def count(word):
+              m = re.search(r"(\d+) " + word, summary)
+              return int(m.group(1)) if m else 0
+
+          passed, skipped, failed, errors = count("passed"), count("skipped"), count("failed"), count("errors?")
+          bad = 0
+          if failed or errors:
+              print(f"::error::{failed} failed / {errors} error -- failures are never allowed")
+              bad = 1
+          if passed < MIN_PASSED:
+              print(f"::error::passed={passed} is below the floor {MIN_PASSED}; tests were lost, not fixed")
+              bad = 1
+          if skipped > MAX_SKIPPED:
+              print(f"::error::skipped={skipped} exceeds the ceiling {MAX_SKIPPED}; a block of tests stopped running")
+              bad = 1
+          print(f"passed={passed} (>= {MIN_PASSED}), skipped={skipped} (<= {MAX_SKIPPED}), failed={failed}")
+          sys.exit(1 if bad else 0)
+          PY
+          # Re-exit with the parser's status: a trailing `rm` would otherwise
+          # become the step's exit code and mask a real failure.
+          rc=$?
+          rm -f "$log"
+          exit $rc
