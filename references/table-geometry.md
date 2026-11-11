@@ -42,6 +42,17 @@ Word/WPS 实测（2026-10-27）：
 | `sync` | `sync mydoc/` | 把第一行 tcW 抄进 grid 再钉死 |
 | `auto` | `auto mydoc/ --content-width 14.6` | 文本宽按列均分（默认 14.6 cm） |
 
+**`--widths` 个数与列数不等时，两个方向的处理并不对称**（2026-11-11 实测，2 列表）：
+
+- **多于列数 → exit 2，零写入**：`set --widths 2.4,4.2,2.4,5.6`（4 个值给 2 列）报
+  `error: table 1: --widths has 4 values but the table has 2 columns; refusing to drop the extra 2`，
+  退出码 `2`，`word/document.xml` 的 SHA256 不变。丢多余的宽度等于静默改写调用方的意图，所以拒收。
+- **少于列数 → 补末列，但 stderr 必须说明**：`set --widths 3.0`（1 个值给 2 列）退出 `0`、
+  两列都写成 3.00 cm，同时 stderr 打
+  `warning: table 1: --widths has 1 values but the table has 2 columns; padded 1 column(s) with 3.00 cm`。
+  补末列本身是刻意保留的便利（模板常只量第一列），但**不申报的补全就是在发明调用方没给的宽度**，
+  所以补齐一定留痕。
+
 `report` 还会做 tcW vs gridCol 比对（容差 `TOL = 20` dxa ≈0.35 mm），超过打
 `! col N: tcW=… != gridCol=…`；若同时 `fixed` 再补 `tblLayout=fixed ignores tcW`，提示跑 `sync`。
 
@@ -50,7 +61,20 @@ Word/WPS 实测（2026-10-27）：
 本来正确的比例一起改掉。
 
 `set` 的 `--widths` 须全解析成 float，否则报 `--widths must be comma-separated numbers in cm`
-+ exit 1；缺 `--widths` 报 `'set' requires --widths`。
++ exit 1；缺 `--widths` 报 `'set' requires --widths`（同样 exit 1）。
+
+**退出码实测矩阵**（2026-11-11，全部在仓储根跑）：
+
+| 场景 | 退出码 | stderr |
+|---|---|---|
+| `report` 一份真没有表格的文档 | `0` | 无（stdout `no tables found`）—— 读到一个空结果是真答案 |
+| `set` / `sync` / `auto` 打一份没有表格的文档 | `1` | `no tables found; nothing written`（一个宽度都没写，`0` 会让调用方以为钉住了） |
+| `--widths` 多于列数 | `2` | 见上，且零写入 |
+| `--widths` 不是数字 / 缺 `--widths` | `1` | `--widths must be comma-separated numbers in cm` / `'set' requires --widths` |
+
+> 一处口径不一致，留待实现方：`scripts/table_width.py` 的 docstring 把「`word/document.xml`
+> 缺失」归到 exit `2`，实测该分支 `return 1`（`error: …\word\document.xml not found`）。
+> 本文按实测写；`scripts/` 不在本轮文档修订范围内。
 
 `sync` 的 `_read_tcw()` 从**第一行**读 `<w:tcW>`（`w:type` 须为 `None`/`dxa`，`gridSpan > 1`
 按 `v / span` 均摊），拿不到退回 `_read_grid()`；两者都空则 `skip table N` 并跳过。
@@ -79,9 +103,9 @@ Word/WPS 实测（2026-10-27）：
 `Element '{...}zoom': The attribute '{...}percent' is required but missing.`
 
 ```
-python fix_zoom.py file.docx                # 就地修复
-python fix_zoom.py file.docx -o out.docx    # 写到别处
-python fix_zoom.py file.docx --percent 120  # 非默认缩放
+python scripts/fix_zoom.py file.docx                # 就地修复
+python scripts/fix_zoom.py file.docx -o out.docx    # 写到别处
+python scripts/fix_zoom.py file.docx --percent 120  # 非默认缩放
 ```
 
 正则必须是这条：
@@ -121,5 +145,5 @@ for i, tbl in enumerate(root.iter(W + "tbl"), 1):
 ```
 
 失败基本就三种：gridCol 没写、tblW 是 `auto` 不是 `dxa`、`gridSpan` 格的 tcW 没累加。
-再跑 `python docx_validate.py out.docx`——它是**健康检查不是 XSD 校验**，`w:zoom` 缺
-`w:percent` 这类问题抓不到，那件事归 `fix_zoom.py`。
+再跑 `python scripts/docx_validate.py out.docx`——它是**健康检查不是 XSD 校验**，`w:zoom` 缺
+`w:percent` 这类问题抓不到，那件事归 `scripts/fix_zoom.py`。

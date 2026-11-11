@@ -123,9 +123,13 @@ docx_toc.build_static_toc(doc, levels=(1, 2), title="目录", insert_at=1)
 静态目录的页码只有一处可信来源：**让 Word 排版，然后问它"这一页上印的是几"**。
 
 ```powershell
-$py = (Get-Command python).Source
-& $py tools/word_accept.py paper.docx --page-probe 7,10,13,16 --quiet
+python tools/word_accept.py paper.docx --page-probe 7,10,13,16 --quiet
 ```
+
+在仓库根执行。I,J,... 换成你文档里真实的标题段落序号（§8.2 就是怎么算出来的）。序号越界
+不会报错，只会降级：在只有 3 段的文档上跑这一行，四个序号全越界，
+`paragraph_pages_source` 变成 `"none"`、`displayed_text` 全 `null`，`warnings` 里逐条
+`page_probe_indices: paragraph 7 out of range 1..3`；部分越界才是 `"word-partial"`。
 
 `--page-probe I,J,...` 收的是 **Word 的段落序号（1-based）**，不是 XML 的 `w:p` 序号——
 Word 给每一行表格额外算一个段落，两者天然不等。每个序号两次 COM 往返，所以是 opt-in，
@@ -444,8 +448,9 @@ for para in Document(str(target)).paragraphs:
 
 ### 8.3 命令行复现（PowerShell，可移植）
 
+下面整段已于 2026-11-11 在仓库根端到端复跑（本机 Word 16.0），逐条退出码 `0`。
+
 ```powershell
-$py = (Get-Command python).Source
 $work = Join-Path $env:TEMP 'toc-demo'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
@@ -454,18 +459,18 @@ Set-Location <skill-root>
 
 # paper_spec.json / toc_build.py 放到 $work 下（内容见 §8.1、§8.2）
 
-& $py scripts\docx_create.py "$work\paper_spec.json" "$work\paper.docx"
+python scripts/docx_create.py "$work\paper_spec.json" "$work\paper.docx"
 
 # 两趟：第一趟占位 + 问 Word 页码 + 第二趟回填
-& $py "$work\toc_build.py" (Get-Location).Path "$work\paper.docx"
+python "$work\toc_build.py" (Get-Location).Path "$work\paper.docx"
 
 # 只想看页码真相（I,J,... 是 Word 的 1-based 段落序号）
-& $py tools\word_accept.py "$work\paper.docx" --page-probe 8,10,12,14 --quiet
+python tools/word_accept.py "$work\paper.docx" --page-probe 8,10,12,14 --quiet
 
 # 目录质量自检（--word off，不需要 Office）
-& $py tools\word_accept.py "$work\paper.docx" --word off --json "$work\audit.json" --quiet |
+python tools/word_accept.py "$work\paper.docx" --word off --json "$work\audit.json" --quiet |
   Out-Null
-& $py -c "import json;print(json.dumps(json.load(open(r'$work\audit.json',encoding='utf-8'))['toc_audit'],ensure_ascii=False,indent=2))"
+python -c "import json;print(json.dumps(json.load(open(r'$work\audit.json',encoding='utf-8'))['toc_audit'],ensure_ascii=False,indent=2))"
 ```
 
 `docx_create.py` 打印的是一行 JSON（`{"ok": true, "output": ..., "blocks": 13, ...}`），
@@ -516,6 +521,36 @@ pass 2   {"entries": 4, "dropped_entries": 4, "dropped_titles": 1, ...}
 ```
 
 `摘要` 那行写的是 `i` 而不是 `2`——这就是 §3 那张表的意思。
+
+### 8.4 CLI 的 `--pages` 必须一条目一值（Python API 反而宽容）
+
+`docx_toc.py --pages` 是**按序**落位的：第 n 个值写进第 n 个条目。所以个数不等就是打错，
+不是风格问题——多出来的被丢弃、缺的留成空槽，两者都静默，而交付文件里夹一个空页码与
+"压根没填页码"看起来一模一样。因此 CLI 在**动文档之前**先数条目：
+
+```powershell
+python scripts/docx_toc.py paper.docx -o out.docx --title 目录 --levels 1,2 --pages 1,1,1
+```
+
+```
+{"entries": 3, "levels": [1, 2], "styles": ["toc 1", "toc 2"], "tab_pos_mm": 170.0, ...}
+```
+
+给错个数（这里是同一份文档，默认 `--levels` 为 1,2,3 → 4 个条目）：
+
+```powershell
+python scripts/docx_toc.py paper.docx -o out.docx --title 目录 --pages 1,3,7
+```
+
+```
+error: --pages has 3 value(s) but the TOC has 4 entries; give exactly one page number
+per entry, or omit --pages to leave the slots empty
+```
+
+退出码 `2`，`out.docx` **不生成**。要点：数的是**当前 `--levels` 选中的条目数**，不是
+文档里所有标题数——上面 `--levels 1,2` 就是 3 条、默认 `1,2,3` 就是 4 条。Python 侧
+`build_static_toc(pages=[...])` 故意保持宽容（缺的留空槽、多的不用），因为"故意只填一部分"
+是调用方的合法意图，与 shell 用户少打一个逗号不是一回事。
 
 ## 9. 右制表位：`tab_pos_mm` 与 `tab_pos_source`
 

@@ -6,9 +6,9 @@ A skill for agents and humans alike: small, single-purpose Python CLIs that each
 do one thing to a `.docx` and print JSON. No Office installation required for the
 core operations — only `python-docx` and `lxml`.
 
-> Chinese version: [README.zh-CN.md](README.zh-CN.md) — a mirror kept at the same
-> level of detail. English is the published edition; script names, flags, and XML
-> element names stay untranslated in both.
+> Chinese version: [README.zh-CN.md](README.zh-CN.md) — the same sections in the
+> same order, kept at the same level of detail. English is the published edition;
+> script names, flags, and XML element names stay untranslated in both.
 
 ## Why another docx toolkit
 
@@ -77,7 +77,7 @@ diffed, or opened by a tool that has no Office engine — the entries have to be
 ordinary paragraphs. `scripts/docx_toc.py` writes them that way:
 
 ```bash
-python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
+python scripts/docx_toc.py in.docx -o toc1.docx --title 目录
 ```
 
 Each line is `title<TAB>page` in Word's own `toc 1/2/3` styles, with a
@@ -85,6 +85,23 @@ right-aligned dot-leader tab stop at the text-block width. Page numbers are
 *measured*, never guessed: `tools/word_accept.py --page-probe` reports the glyph
 the reader sees (`Information(WD_ACTIVE_END_ADJUSTED_PAGE)`), which is not the
 physical page order — a `lowerRoman` section prints `i` on page eight.
+
+**Page numbers are measured, never guessed — which makes this a two-pass job:**
+
+1. First pass, the command above: `--pages` omitted, so the entries go in and the
+   page slots stay empty. That is a real artefact, not a dry run — it is what step 2
+   measures.
+2. `python tools/word_accept.py toc1.docx --page-probe 1,3 --json probe.json` lets
+   Word lay the document out, then reads back `paragraph_pages[].displayed_text`
+   for those 1-based word-paragraph indices. `1,3` is what this demo document
+   needs, not a universal constant, and every index costs two COM round trips.
+3. Second pass with the measured numbers, exactly one per entry — a different count
+   is a usage error (exit `2`):
+   `python scripts/docx_toc.py toc1.docx -o toc-final.docx --pages 1`
+
+Never deliver a number whose `source` is `computed`: that is the structural
+estimate produced without Word (`basis: section-start`), and it is wrong the moment
+a section restarts its numbering.
 
 Two prerequisites it will not invent for you: the heading styles need
 `outline_level` in the spec (a style that merely *looks* like a heading is body
@@ -118,8 +135,8 @@ third. See [SKILL.md](SKILL.md#three-output-tiers).
 | Item | Requirement |
 |---|---|
 | Python | **3.10 or newer** — the CI floor; the matrix runs 3.10 and 3.12 on both Linux and Windows |
-| Dependencies | `python-docx`, `lxml` — `python -m pip install -r requirements.txt` |
-| Tests | additionally `pypdfium2` and `pytest`; no script imports either one |
+| Dependencies | `python-docx`, `lxml`, `latex2mathml` — `python -m pip install -r requirements.txt` (that file also carries `pypdfium2`; see Testing) |
+| Tests | additionally `pypdfium2` (listed in `requirements.txt`) and `pytest` (**not** listed — it sits commented out there; install it yourself, `python -m pip install pytest`); no script imports either one |
 | Formula chain | **Windows** + Microsoft Office: needs `MML2OMML.XSL` (ships with Office; `math_omml.find_xslt()` probes the Windows install paths, `MML2OMML_XSL` overrides) |
 | PDF export | **Windows** + Microsoft Word (COM). **Not WPS**: WPS drops the text layer of a document that carries OMML |
 | Template `apply` (building a new document from a template) | Node.js with the `docx` package |
@@ -142,6 +159,11 @@ cross-references, static TOC, sections, table geometry, fonts, merge, template
 `extract` / `fill`, and `docx_pack` — is pure `python-docx` + `lxml` and runs
 with no Office installed at all.
 
+Neither boundary stops a Linux or macOS run from going green: the affected **tests**
+skip themselves — the formula ones with `needs latex2mathml + MML2OMML.XSL`, the
+Word COM ones the same way — so a green suite there means "green minus the formula
+and COM tests", not "the formula chain works".
+
 Legacy `.doc` (binary) files are not supported — save as `.docx` first, or use
 LibreOffice externally.
 
@@ -162,8 +184,16 @@ python -m pip install -r requirements.txt
 ```
 
 Python **3.10** or newer. `requirements.txt` carries exactly three hard
-requirements — `python-docx`, `lxml`, `latex2mathml`; it also lists `pypdfium2`
-and `pytest` for the test suite, but no script imports either one.
+requirements — `python-docx`, `lxml`, `latex2mathml` — plus `pypdfium2`, which only
+the PDF text-layer assertions need. `pytest` is **not** installed by it: line 19 is
+`# pytest>=7.4`, a comment, because it is dev-only tooling. A plain
+`pip install -r requirements.txt` therefore leaves you without a test runner, and
+`python -m pytest` answers `No module named pytest`. Install it in the same breath —
+which is exactly what `ci.yml` does:
+
+```powershell
+python -m pip install -r requirements.txt pytest
+```
 
 Optional extras:
 
@@ -193,24 +223,73 @@ python scripts/docx_create.py --help
 python scripts/docx_read.py --help
 ```
 
-A minimal round trip:
+`docx_create.py` takes two **positional** arguments —
+`python scripts/docx_create.py <spec> <output>`. It has no `--spec` / `--output`
+flags, and passing them is a usage error, not a silent no-op:
+
+```text
+docx_create.py: error: unrecognized arguments: --spec --output   (exit 2)
+```
+
+A minimal round trip. The spec comes from the repo, so nothing has to be quoted at
+a shell prompt:
 
 ```bash
-# create
-cat > spec.json <<'JSON'
-{"blocks": [
-  {"type": "heading",   "text": "Report", "level": 1},
-  {"type": "paragraph", "text": "Ohm's law: U=IR"}
-]}
-JSON
-python scripts/docx_create.py spec.json report.docx
+# create — examples/formulas.json ships with the repo and holds 5 convertible lines
+python scripts/docx_create.py examples/formulas.json report.docx
 
 # inspect
 python scripts/docx_read.py report.docx --structure
 
-# convert the formula into native Office Math
+# convert the formulas into native Office Math
 python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
 ```
+
+`examples/basic.json` is the wider tour — every common block type, a table, a page
+break — if block coverage is what you want to see first; `examples/formulas.json`
+is the one worth feeding to `docx_mathify`.
+
+**Writing your own spec under PowerShell.** The bash heredoc
+`cat > spec.json <<'JSON' … JSON` is a parse error in both `powershell.exe` and
+`pwsh` — `ParserError: 重定向运算符后缺少文件规范` ("missing file specification after
+redirection operator"), exit `1`. Use a here-string instead:
+
+```powershell
+$spec = @'
+{"blocks": [
+  {"type": "heading",   "text": "Report", "level": 1},
+  {"type": "paragraph", "text": "Ohm's law: U=IR"}
+]}
+'@
+Set-Content -Path spec.json -Value $spec -Encoding utf8
+python scripts/docx_create.py spec.json report.docx
+```
+
+Five operations that cover most of the day-to-day work:
+
+```bash
+# 1. every linear formula in the document -> native OMML, with a conversion report
+python scripts/docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
+
+# 2. one display formula, anchored after the paragraph containing "marker"
+python scripts/insert_formula.py unpacked/ "\frac{-b+\sqrt{b^2-4ac}}{2a}" --display --after "marker"
+
+# 3. table geometry: read what is there, then pin four columns in cm
+python scripts/table_width.py report unpacked/
+python scripts/table_width.py set unpacked/ --table 1 --widths 2.4,4.2,2.4,5.6
+
+# 4. merge two documents, then export the result to PDF
+python scripts/merge_docs.py base.docx src.docx merged.docx
+pwsh scripts/pdf_export.ps1 -DocxPath merged.docx -PdfPath merged.pdf
+
+# 5. fill {{token}} placeholders, failing loudly on any token left behind
+python scripts/docx_template.py fill template.docx values.json out.docx --strict
+```
+
+Steps 2 and 3 read an **unpacked** directory, so produce one first with
+`python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`.
+`--after "marker"` needs a paragraph that actually contains `marker`; the widths in
+step 3 need a table with exactly four columns.
 
 Full command table in [SKILL.md](SKILL.md).
 
@@ -219,9 +298,18 @@ to **stdout as JSON** — `docx_create`, `docx_read`, `docx_edit`, `docx_validat
 `docx_comments`, `docx_revisions`, `docx_section`, `docx_numbering`,
 `docx_crossref`, `docx_toc`. The rest write human-readable text that is meant to be
 read: `docx_mathify`, `table_width`, `insert_formula`, `docx_template` (`fill`
-excepted — it emits JSON). Diagnostics always go to stderr, and exit codes are
-reliable: `0` success, non-zero failure, and `docx_mathify` returning `3` means
-the document was written but at least one formula did not convert.
+excepted — it emits JSON). Diagnostics always go to stderr, and the exit code is
+worth branching on rather than testing against zero:
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `1` | expected failure — missing file, marker not found, bad spec |
+| `2` | usage error — argparse, or a required mode flag missing |
+| `3` | partial success — `docx_mathify` wrote the document but at least one formula is still linear text |
+
+`3` only ever comes from `docx_mathify`, and it is deliberate: the output file is
+valid and mostly converted, so check the code before you deliver it.
 
 ## Scripts
 
@@ -299,6 +387,11 @@ unpack("in.docx", "unpacked/")
 pack("unpacked/", "out.docx", original="in.docx")
 ```
 
+That is Python, not a shell line: `docx_pack` lives in `scripts/`, so pasting it
+into an interpreter at the repo root gives `ModuleNotFoundError`. Either `cd scripts`
+first, or put the directory on `sys.path` — as a one-liner,
+`python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`.
+
 Passing `original` is what lets `pack` reuse the source archive's entry order and
 compression, so a no-op round trip produces an equivalent archive rather than a
 re-zipped approximation. `unpack` refuses archive entries that would escape the
@@ -346,7 +439,7 @@ and is loaded only when you need it:
 ## Testing
 
 ```bash
-python -m pytest tests/ -v
+python -X utf8 -m pytest tests -q
 ```
 
 The suite drives the argparse CLIs through `subprocess`, generates its fixtures on
@@ -354,16 +447,34 @@ the spot, and writes artifacts to a temp directory. Tests that need
 `latex2mathml` **and** `MML2OMML.XSL` (`test_formula`, `test_units`,
 `test_mixed_superscript`) skip themselves with an explicit reason —
 `needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)` — so a machine
-without Office gets a **green run with a larger skip count, not a red one**.
-Measured on the whole suite with `MML2OMML_XSL` pointed at a nonexistent file, i.e.
-no Office anywhere: **1357 passed / 370 skipped / 0 failed**. Everything else
-follows `requirements.txt`: `pypdfium2` backs the PDF text-layer assertions and
-`pytest` is the runner; neither is a runtime dependency. Word COM tests skip exactly
-the same way when Word is absent.
+without Office gets a **green run with a larger skip count, not a red one**. Two
+runs, same commit, different machines; the numbers differ only because the skips do:
+
+| Where | Result |
+|---|---|
+| Developer machine, local Office installed | **1576 passed / 239 skipped / 0 failed** (1815 collected) |
+| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file) — the row `ci.yml` gates on | **1441 passed / 374 skipped / 0 failed** (1815 collected) |
+
+The gap is exactly 135 tests — the ones that need `latex2mathml` **and**
+`MML2OMML.XSL`: they run in the first row and skip in the second. Neither row is a
+number to chase by editing a constant; `ci.yml` gates `passed >= 1441` and
+`skipped <= collected / 4`.
+
+`tests/` holds 46 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
+backs the PDF text-layer assertions and `pytest` is the runner; neither is a runtime
+dependency. Word COM tests skip exactly the same way when Word is absent.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+**Local increments** — written here rather than adapted from upstream:
+`linear_to_latex.py`, `math_omml.py`, `fix_phasor_dot.py`, `docx_mathify.py`,
+`insert_formula.py` (the formula chain), `table_width.py`, `fix_zoom.py`,
+`fix_fonts.py`, `merge_docs.py`, `pdf_export.ps1` (the six locally ported
+capabilities live in that batch — `fix_fonts`, `merge_docs`, `pdf_export`,
+`fix_zoom`, `minidom_compat`, `encoding`), plus `docx_numbering.py`,
+`docx_crossref.py`, `docx_toc.py`, `docx_section.py`, and `docx_pack.py`.
 
 The formula engine reuses Microsoft's `MML2OMML.XSL` from a local Office
 installation at runtime; that file is not redistributed here.
@@ -375,6 +486,21 @@ clean-room MIT implementations in
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
 (`skills/productivity/microsoft-office`), originally written from functional
 specs against `python-docx` and friends.
+
+Files derived from that base: `docx_create` / `docx_edit` / `docx_read` /
+`docx_validate` / `docx_comments` / `docx_revisions` / `docx_template` /
+`docx_common` / `docx_numbering` / `docx_crossref` / `docx_toc` /
+`docx_section` — twelve in all. **The authoritative marker is the file header:
+each of them carries `# MIT License. Part of the Hermes docx skill.`** Local
+changes are limited to the `sys.path` bootstrap header, UTF-8 stdio, and
+portability/defect fixes, plus (`docx_common`) an `--api` self-description entry
+and a replacement-iteration budget so a replacement value containing the needle
+cannot loop forever.
+
+**Written here, not derived** (no Hermes header): the formula chain —
+`linear_to_latex`, `math_omml`, `fix_phasor_dot`, `docx_mathify`,
+`insert_formula` — plus `table_width`, `fix_zoom`, `fix_fonts`, `merge_docs`,
+`pdf_export.ps1`, and `docx_pack`.
 
 Per-file provenance and the list of local changes are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). That file also records what this

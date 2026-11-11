@@ -41,3 +41,8 @@ desktop.ini
 # Deliberately NOT ignored:
 #   *.json  - tpl.json is a product artifact (docx_template.py extract output)
 #   *.docx  - test fixtures and sample documents may be committed
+
+# Scratch file some examples write into the repo root (spec for docx_create).
+/spec.json
+/out.docx
+/out.json

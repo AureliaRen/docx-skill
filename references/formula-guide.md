@@ -451,9 +451,13 @@ Two entry points. `docx_mathify.py` handles a whole document; `insert_formula.py
 handles one equation at a known anchor.
 
 ```
-python docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
-python insert_formula.py unpacked/ "E=mc^2" --after "marker"
+python scripts/docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
+python scripts/insert_formula.py unpacked/ "E=mc^2" --after "marker"
 ```
+
+Both run from the repository root — the `scripts/` prefix is part of the command.
+Dropping it (`python docx_mathify.py …`) fails with `can't open file …docx_mathify.py`
+and exit `1`, because the script is not in the working directory.
 
 ### `docx_mathify.py`
 
@@ -468,11 +472,74 @@ python insert_formula.py unpacked/ "E=mc^2" --after "marker"
 | `--dry-run` | report only; no document is written |
 | `--number-align` | number the rows of an `align`/`gather` that carry no `\tag` |
 
-Exactly one of `-o`, `--inplace`, `--dry-run` is required. Passing none of them is
-not a silent no-op: the script prints what is missing and exits `2`. That is a
-deliberate choice — a batch rewrite that quietly does nothing looks identical to
-one that succeeded, and the difference only surfaces when someone opens the
-document expecting formulas.
+At least one landing flag is required, but the three flags are **not** three
+interchangeable choices — `-o` and `--inplace` are mutually exclusive, and
+`--dry-run` overrides whichever of them is present. Measured 2026-11-11 on the
+same input document (SHA256 checked before and after each run):
+
+| Flags | Exit | What is written |
+|---|---|---|
+| `-o out.docx` | `0` | `out.docx`; the source is untouched; no `.bak` |
+| `--inplace` | `0` | the source is rewritten after a copy to `<name>.bak.docx` |
+| `--dry-run` | `0` | nothing at all |
+| `-o out.docx --dry-run` | `0` | **no** document (dry-run wins); `out.docx` is not created |
+| `--inplace --dry-run` | `0` | nothing, and **no** `.bak` (dry-run wins, `--inplace` is ignored) |
+| `--inplace -o out.docx` | **`2`** | nothing; neither file is touched, no `.bak` |
+| none of the three | **`2`** | nothing |
+
+The `--inplace` + `-o` case is a usage error, not a silent choice between them:
+writing to one path and overwriting another is a contradiction the script refuses
+to resolve on the caller's behalf. It is rejected **before any read or write**, so
+the input is byte-identical afterwards. That is a deliberate choice — a batch
+rewrite that quietly does nothing, or one that picks a destination you did not
+mean, looks identical to success until someone opens the document expecting
+formulas.
+
+`-o` together with `--dry-run` stays legal: `-o` only names the path the report
+displays, and no document is written. `--inplace` together with `--dry-run` is
+tolerated rather than refused (dry-run wins) — the one remaining silent
+combination, recorded here so nobody relies on the reverse.
+
+### Exit codes, and `3` in particular
+
+| Code | Meaning |
+|---|---|
+| `0` | the document was written (or `--dry-run` wrote nothing, as asked) and no span failed |
+| `1` | expected failure: the input file does not exist |
+| `2` | usage error, decided **before** any read or write: `--inplace` with `-o`, or none of the three landing flags |
+| `3` | **partial success**: the document was written, but at least one formula did not convert and that span stays as its source text |
+
+`3` is the only exit that combines an artifact with a non-zero code, so a caller
+must check it — a silent `0` would let a document with broken equations ship as
+finished. It is emitted when any span reaches the converter and fails: a missing
+or unparseable `MML2OMML.XSL`, a `latex2mathml` rejection, an XSLT failure, or
+`assert_legal()` catching an illegal OMML shape.
+
+A `latex2mathml` rejection is the cheapest way to see it, and needs no broken
+environment — write the span `F=x/y` with `%` as a real superscript run, so the
+linear form reads `F=x/y%`:
+
+```python
+# spec for docx_create: the % must be a superscript run, not a literal caret
+{"type": "paragraph", "runs": [{"text": "F=x/y"},
+                               {"text": "%", "vert_align": "superscript"}]}
+```
+
+```
+python scripts/docx_mathify.py pct.docx -o pct-out.docx
+```
+
+Measured: exit `3`; stderr `error: 1 formula(s) failed to convert` plus
+`FAIL F=\frac{x}{y^{%}} -> latex2mathml 转换失败`; and `pct-out.docx` **is still
+written** with that span left as source text. `%` is LaTeX's comment character, so
+the group never closes and the converter refuses the whole span — which is exactly
+the partial-success shape `3` exists to report.
+
+Missing `MML2OMML.XSL` is not a synonym for `3`: a document whose spans all
+degrade to plain text runs never touches the stylesheet and still exits `0`; only
+a span that needs an equation object (a fraction, a radical, …) reaches the
+failure. `3` belongs to `docx_mathify.py` alone — no other script in `scripts/`
+returns it.
 
 `--report` and `--tex` are worth running together. The report is for reading: it
 pairs each original notation with the LaTeX that came out, one row per span,
@@ -498,6 +565,22 @@ The second is the LaTeX.
 `--after` and `--before` are mutually exclusive, and a marker that is not found is
 an error (`exit 1`), not a fallback to the end of the document. A formula in the
 wrong place is harder to notice than a command that refused.
+
+The other three refusals are usage errors (`exit 2`, decided before anything is
+read or written), because each one used to be a silent swallow:
+
+- `--dump` together with `--after`/`--before` — `--dump` only prints the OMML, so
+  the anchor would be dropped on the floor;
+- `--after` together with `--before`;
+- an **empty** marker (`--after ""`) — it would append the formula at the end of
+  the document instead of anchoring it.
+
+On success the stdout carries the anchor the script *measured* after inserting,
+not the argument echoed back: `Inserted inline formula: E=mc^2  at body[1]`
+(`at body[0]`-style indices are the container's own child order, and `at tc[i]`
+appears when the marker sits inside a table cell). A marker that is missing
+reports the searchable range instead of staying vague:
+`error: marker not found: 'x' — searched 3 body paragraph(s) (0-based [0, 2]) and 1 table cell(s)`.
 
 Two things the script does for you:
 

@@ -12,9 +12,21 @@
 | | `fix_fonts.py`（本文主角） | `docx_create.py`（`add_styles` 一族） |
 |---|---|---|
 | 时机 | **事后修**既有 `.docx`：遍历 `styles.xml` / `document.xml` 就地改写 | **生成时建**样式：spec 里一次写定 |
-| 绑定函数 | `set_fonts(rpr, ea)`（`scripts/fix_fonts.py:89`）——删旧 `w:rFonts` 后 `rpr.insert(0, rf)` | `_set_style_fonts(style, latin, east_asia)`（`scripts/docx_create.py:211`）——`rpr.insert_element_before(rf, "w:b", …)` |
-| 怎么表达 | CLI 参数 `--heading-threshold` + 三层判定 | spec 键 `font` / `font_east_asia`（`SKILL.md` L112） |
+| 绑定函数 | `set_fonts(rpr, ea)`（`scripts/fix_fonts.py:89`）——删旧 `w:rFonts` 后 `rpr.insert(0, rf)` | `_set_style_fonts(style, latin, east_asia)`（`scripts/docx_create.py:222`）——`rpr.insert_element_before(rf, "w:b", …)` |
+| 怎么表达 | CLI 参数 `--heading-threshold` + 三层判定 | spec 键 `font` / `font_east_asia`（`SKILL.md` 的 `## Creating a document` 一节） |
 | 测试锚点 | 本文「解包自检」的 `(dup, not_first, total)` 判据 | `tests/test_style_fonts.py`（5 条） |
+
+> **怎么定位（2026-11-11 复核）**：`styles[]` 的键清单在 `SKILL.md` 的
+> `## Creating a document` 一节里，原文是「styles[] entries take font, font_east_asia,
+> size_pt, bold, italic, color, base, and outline_level」。**别引行号**：本文早前引的
+> 「L112」是 Quick reference 表里的 `fix_fonts` 命令行，根本不是 spec 键；而 `SKILL.md`
+> 当天正在增补小节，同一句话实测先在 L135、几十分钟后漂到 L246 —— 行号在这个文件里
+> 不可靠。要定位就 `grep -n font_east_asia SKILL.md`。
+>
+> 上表的两个脚本行号同理，只是**当天**快照：`grep -n 'def set_fonts' scripts/fix_fonts.py`、
+> `grep -n 'def _set_style_fonts' scripts/docx_create.py`。`docx_create.py:211` 这条已经
+> 失效过一次（spec 校验新增 ~400 行后真身挪到 L222，L211 只剩一段 docstring 尾巴），
+> `fix_fonts.py:89` 复核仍准。
 
 **两条铁律跨入口都成立**——换个入口，约束不换：
 
@@ -76,8 +88,9 @@ eastAsia**。`FONT_TNR` 的 `eastAsia` 是**微软雅黑**——它指"西文用
 
 ## fix_fonts.py 的三层判定
 
-`python fix_fonts.py <docx> [<docx2> ...] [--heading-threshold 14]`，就地改写（临时文件 +
-`shutil.move`，中断不损原文件）。
+`python scripts/fix_fonts.py <docx> [<docx2> ...] [--heading-threshold 14]`，就地改写（临时文件 +
+`shutil.move`，中断不损原文件）。**在仓库根执行**——`scripts/` 前缀不能省，裸写
+`python fix_fonts.py` 会因为 `fix_fonts.py` 不在 cwd 而 `can't open file` 退出 1。
 
 **第 1 层 样式层** —— 遍历 `styles.xml` 的 `w:style`：`Normal` → 宋体；`heading*` 或 `Title` →
 雅黑；其余不碰。`docDefaults` 存在则 `dedupe_rpr` + `set_fonts(…, "宋体")`。

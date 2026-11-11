@@ -23,10 +23,11 @@ python-docx 做不了跨包合并（styles / numbering / media 关系各自独�
 操作：
 
 ```
-python merge_docs.py <base.docx> <src.docx> <out.docx>
+python scripts/merge_docs.py <base.docx> <src.docx> <out.docx>
 ```
 
-base 是基底（页面设置与样式以它为准），src 整段追加。任一输入不存在 → exit 1。
+base 是基底（页面设置与样式以它为准），src 整段追加。任一输入不存在 → exit 1
+（`error: … not found`）。在仓库根执行，`scripts/` 前缀不能省。
 
 **1 样式** —— 按 `w:styleId` 并集去重，base 优先：已有的不动，src 独有的整段 `deepcopy` 补进来。
 
@@ -78,9 +79,13 @@ for tag in ("pgSz", "pgMar"):                          # 逐属性等于 base
 ## PDF 导出：必须走 Word COM
 
 ```
-.\pdf_export.ps1 -DocxPath <path.docx>                  # 输出同目录同名 .pdf
-.\pdf_export.ps1 -DocxPath <path.docx> -PdfPath <out.pdf>
+pwsh scripts/pdf_export.ps1 -DocxPath <path.docx>                  # 输出同目录同名 .pdf
+pwsh scripts/pdf_export.ps1 -DocxPath <path.docx> -PdfPath <out.pdf>
 ```
+
+在仓库根执行，路径带 `scripts/`；裸写 `.\pdf_export.ps1` 会因为仓储根没有这个文件而
+`术语 '.\pdf_export.ps1' 不会被识别为 cmdlet`。跑通的输出是四行：`docx: …` / `pdf : …` /
+`exported OK` / `pdf_export done`，退出码 0。
 
 **为什么不用 WPS（硬约束 #43）**：WPS 导出带 OMML 的 docx → PDF **文本层残缺**，公式变图或整段
 被丢，搜不到公式附近文字。生产验证过一次：10 份 40 页 A4、463 个 OMML 的交付物曾在 WPS 上翻车。

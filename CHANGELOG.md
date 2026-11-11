@@ -5,6 +5,72 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Everything below changes what a caller *sees* on the command line. No document
+content changes: what changes is that an ambiguous invocation is refused instead
+of silently doing something else.
+
+### Changed
+
+- **Usage errors exit `2` with one readable line on stderr and never a traceback.**
+  That now covers a negative or out-of-range `--index` (`docx_crossref.py`, and
+  `docx_edit.py insert`), an input path that is not a readable `.docx`, an unknown
+  `--bookmark-span` / `--vert-align`, and a malformed JSON spec. A negative
+  `--index` used to be read as "counted from the end", so a caption or bookmark
+  landed on the wrong paragraph and still reported success. Document-state
+  failures — an unknown bookmark, a bookmark name already taken — stay on `1`,
+  and `3` remains `docx_mathify.py`'s partial-success code alone.
+- **`table_width.py --widths` refuses more values than the table has columns** —
+  exit `2`, nothing written — instead of dropping the extras on the floor. Fewer
+  values still pad with the last one, but the pad is now announced on stderr
+  (`warning: table 1: --widths has 1 values but the table has 2 columns; padded 1
+  column(s) with 3.00 cm`). `report` on a genuinely table-free document still
+  exits `0`; a *mutating* action on one exits `1` with `no tables found; nothing
+  written`, because not one width was written.
+- **`docx_toc.py --pages` must carry exactly one value per entry** at the levels
+  selected by `--levels`; a different count exits `2` and writes no file. Surplus
+  values used to be dropped and missing ones left as blank slots, both silently,
+  and a TOC with a blank page number in the middle reads exactly like one that was
+  never paginated. The Python API stays tolerant on purpose — a caller filling
+  only some slots is a different thing from a mistyped comma.
+- **An unknown key in a `docx_create` spec is rejected before anything is
+  written**: exit `2`, `{"ok": false, …}` on stdout, and one stderr line naming the
+  offending key plus the nearest legitimate spelling. A misspelt key used to build
+  a document with the content missing and exit `0`. Nested objects are checked too
+  — block fields, `runs[]`, `tab_stops[]`, `page`, `page.margins_mm`, `styles[]`,
+  `footer_page_numbers` — and out-of-range values are reported with their real
+  range instead of being clamped.
+- **`docx_mathify.py --inplace` together with `-o` is a usage error** — exit `2`,
+  both files untouched, no `.bak`. `--inplace` used to win silently: the `-o` path
+  was never created and the *input* file was overwritten instead. `-o` with
+  `--dry-run` stays legal, and a run with none of the three landing flags still
+  exits `2`. `insert_formula.py` follows the same rule for `--dump` with
+  `--after`/`--before` and for an empty marker, and now prints the anchor it
+  measured (`… at body[1]`, `at tc[i]` inside a table cell) rather than echoing
+  the argument.
+- **`docx_template.py --fix-formulas` and `--no-fix-formulas` are mutually
+  exclusive** (argparse exit `2`). Both used to be accepted and took effect as an
+  AND: the default marker pass switched off while the OMML pass received raw
+  `_xx_` markers, the conversion failed, and the CLI still exited `0`.
+- **`docx_edit.py page-numbers` is idempotent.** A footer that already carries a
+  `PAGE`/`NUMPAGES` field — either the complex `fldChar` form or the
+  `w:fldSimple` one — is reported `{"changed": false, …}`, and an in-place re-run
+  writes nothing at all, so plan → apply → apply no longer staples a second
+  "Page 1 of 1" onto the first.
+- **`docx_pack.unpack` refuses two more entry shapes.** Windows reserved device
+  names (`NUL`, `CON`, `PRN`, `AUX`, `COM0`-`COM9`, `LPT0`-`LPT9`, `CONIN$`,
+  `CONOUT$`, extension ignored) and a last component with a trailing dot or space.
+  `NUL` accepted the write and discarded it, so `unpack` reported success for a
+  part that never reached the disk; `evil.txt ` is created as `evil.txt`, so two
+  distinct entries collide on one file.
+
+### Notes
+
+- `docx_mathify.py --inplace --dry-run` is still tolerated rather than refused:
+  `--dry-run` wins and no backup is written. It is the one remaining silent
+  combination, recorded so nobody relies on the reverse.
+
 ## [1.0.0] - 2026-11-11
 
 First tagged release. The toolkit itself had been published earlier on `main`;
@@ -35,15 +101,17 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 
 ### Added
 
-- 65 tests across four new or extended files:
-  - `tests/test_docx_edit_subcommands.py` — all eight `docx_edit` subcommands,
+- 71 tests across four new or extended files (`pytest <files> --collect-only`:
+  38 + 14 + 7 + 12):
+  - `tests/test_docx_edit_subcommands.py` — 38, all eight `docx_edit` subcommands,
     including cross-run `replace` and a `normalize` case that asserts the merged
     runs keep every character.
-  - `tests/test_docx_pack_safety.py` — drive-prefix, POSIX-absolute and relative
-    traversal, each asserting both the refusal and that nothing was written.
-  - `tests/test_docx_template_output.py` — `-o` honoured, source untouched,
+  - `tests/test_docx_pack_safety.py` — 14, drive-prefix, POSIX-absolute and
+    relative traversal, each asserting both the refusal and that nothing was
+    written.
+  - `tests/test_docx_template_output.py` — 7, `-o` honoured, source untouched,
     `.bak` on in-place writes.
-  - `tests/test_insert_formula.py` — the `--display`, `--dump` and
+  - `tests/test_insert_formula.py` — 12, the `--display`, `--dump` and
     `--raw-spacing` switches and a forward `--before` case.
 - `## Requirements` in the English README, and a platform-boundary note in both
   languages: the formula chain needs `MML2OMML.XSL` from a local Microsoft

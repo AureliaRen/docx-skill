@@ -2,7 +2,7 @@
 
 基于 `python-docx` + `lxml` 的**纯离线** Word 工具集：创建/编辑/读取/校验/批注/修订/模板套用之外，带两项自研能力——**LaTeX → OMML 原生公式链**（不进 Word、不依赖 pandoc/LaTeX 发行版）与**表格几何三处一致**（`tblW` / `gridCol` / `tcW`）。
 
-> 本文是 [README.md](README.md) 的中文镜像，与英文版信息量同构；英文版为发布主版，两份如有措辞差异以英文版为准。命令、脚本名、参数名、XML 元素名一律保留原文，不做翻译。
+> 本文是 [README.md](README.md) 的中文镜像：同一批 H2/H3 章节、同一顺序、同一信息量（`### 不止于此` ↔ `### Beyond the basics`，`### 长文档笔记` ↔ `### Reference notes`）。英文版为发布主版，两份如有措辞差异以英文版为准。命令、脚本名、参数名、XML 元素名一律保留原文，不做翻译。
 
 ## 为什么还要再造一个 docx 工具链
 
@@ -22,13 +22,69 @@
 - **编号是真自动编号**：写 `<w:abstractNum>` / `<w:num>` / `<w:numPr>`，而不是套那个不带 `numPr` 的 `List Number` 样式，所以 `[1] … [14]` 真的会渲染出来。
 - **表格列宽真的生效**：把 `tblLayout` / `gridCol` / `tcW` 三者的相互作用讲清楚并改对。
 
+### 不止于此
+
+上面那几个硬骨头不是唯一一类"最后一句话往往是『于是我打开 Word 点了一下』"的活儿。另有六项能力覆盖剩下的部分——五项修复，加一条导出通道：
+
+- **`fix_fonts`**——扛得住中英混排的字体统一。`w:rPr` 上有两条硬约束：每个子元素最多出现一次，且 `w:rFonts` 必须是第一个子元素。中文字体要绑到 `eastAsia` 槽，不是 `ascii`，否则 Word 会静默替换掉，不告诉你。
+- **`merge_docs`**——把一份文档接在另一份后面，动手检查结果之前值得先知道三条裁定：页面设置取 `base` 的，`src` 的 `sectPr` 被丢掉；`numbering` 按 `w:numId` 取并集；`styles` 按 `w:styleId` 取并集，`base` 已有的样式绝不覆盖。
+- **`fix_zoom`**——python-docx 会写出 `<w:zoom w:val="bestFit"/>`，没有 `w:percent`；严格 XSD 校验器直接拒收，Word 的缩放控件打开是一片空白。`docx_create` 已经自己打补丁了，所以这个 CLI 是给别处来的文档用的，一遍就改好。
+- **`minidom_compat` + `_bootstrap`**——`defusedxml` 能加固 XML 解析，但多数随包解释器里没有它，于是每个脚本都死在 **import 阶段**。`minidom_compat` 提供 stdlib 兜底，`_bootstrap` 则是把 `sys.path`、这个兜底和 UTF-8 stdio 串起来的那一行。
+- **`encoding`**——Windows 下把 stdout/stderr 切到 UTF-8：默认控制台代码页会把中文输出揉成谁也读不了的字节。
+
+还有一项属于**附加能力**而非核心操作。`pdf_export.ps1` 给本工具链产出的文档提供一条不掉公式的 PDF 导出路径：Word 自己的导出器会把 OMML 文本层完整保留，公式仍可搜索、不会退化成图片。**它不是通用的 docx→PDF 转换器**，两个前提必须成立——**文档里真有 OMML 公式**，且**跑在装了 Microsoft Word 的 Windows 上**，因为它驱动的是 Word COM。详见 [Exporting to PDF](SKILL.md#exporting-to-pdf-additional-capability)。
+
+## 不依赖 Word 也能读对的静态目录
+
+`{ TOC \o "1-3" }` 是一个**域**：条目在有人按下 `F9` 之前根本不存在，而手工塞进域里的缓存结果会在按下 `F9` 的瞬间被丢掉。凡是交付物——要转 PDF 的、要进 diff 的、要交给没有 Office 引擎的工具读的——目录都必须是**普通段落**。
+
+`docx_toc.py` 就是这么写的：
+
+```bash
+python scripts/docx_toc.py in.docx -o toc1.docx --title 目录
+```
+
+每个条目是 `标题<TAB>页码`，用 Word 自己那套 `toc 1/2/3` 样式，右侧制表位停在正文块宽度上、带点引线。制表位宽度取自 `docx_create.content_width_mm(section)`，不许写死：六个实测卷的正文宽度本来就是 170 mm 与 160 mm 两种。
+
+`w:tab` 是这里的关键——页码靠一个真正的制表符推到右边界，而不是靠空格对齐。
+
+`build_static_toc()` 返回的 report 字段：`entries` / `levels` / `styles` / `tab_pos_mm` / `tab_pos_source` / `dropped_entries` / `dropped_titles` / `adopted` / `section_index` / `inserted_at`。重建是幂等且安全的：每个条目段落带一个 `_DocxTocEntry…` 书签，`drop_existing_toc` 只删本模块写过的东西；用户自带的、用内置 `toc 1` 样式写的那份目录不动，除非显式传 `adopt_unmarked=True`。
+
+**页码必须实测，不能猜。** 这是**两遍法**：
+
+1. 第一遍不传 `--pages`——只把条目写进去，页码槽留空（就是上面那条命令的产物，它是要被量的真文件，不是 dry-run）；
+2. `python tools/word_accept.py toc1.docx --page-probe 1,3 --json probe.json` 让 Word 排完版，再读回 `paragraph_pages[].displayed_text`。`1,3` 是这份演示文档需要的 1-based Word 段落序号，不是通用常数；每多探一个序号就多两趟 COM 往返；
+3. 带着实测页码跑第二遍，**每条目录项正好一个数**——数量对不上算用法错误（exit `2`）：`python scripts/docx_toc.py toc1.docx -o toc-final.docx --pages 1`
+
+页码为什么不能算：`displayed_text` 取自 `Information(WD_ACTIVE_END_ADJUSTED_PAGE)`，是**读者眼睛看到的字形**，不等于物理页序。一份"封面无页码 + 前置小写罗马 + 正文从 1 重开"的文档，物理第 8 页在那一节里印的是 `i`；不同 Word 版本与字体回退会让流式排版落到不同页，任何"按段落序号推页码"的算法都会在真机上错。所以 `source` 字段为 `computed` 的那些行（无 Word 时的估算，`basis: section-start`）**不得当作交付页码**。
+
+两个前提它不会替你造：标题样式必须带 `outline_level`（只是"长得像标题"的样式在 Word 眼里是正文，导航窗格空的、`TOC \o` 也收不到东西）；页码来自对成品文件的第二遍读取。配方、坑单与实测限制见 [references/toc.md](references/toc.md)。
+
+## 公式不是同一种东西
+
+把所有"看起来像公式"的串统统变成公式对象，是最容易做、也最容易做错的做法。本工具链把每个识别出的片段分成**三阶**：
+
+| 片段是什么 | 产出 | 例子 |
+|---|---|---|
+| **结构式**——含 `\frac`、`\sqrt`、`\int`、`\sum`、`\begin{`、`\left`、`\overline` 等结构命令（`_STRUCTURAL_CMDS`，43 条） | 真 **OMML** 公式对象 | `x^2/16+y^2/9=1`、`v=s/t` |
+| **纯上下标**——不含结构命令，但至少有一个 `^` 或 `_` | 普通 run + `w:vertAlign`，即 Word 自己 `Ctrl+Shift+=` 做出来的真上下标，字号可还原 | `a=9.8m/s2`、`10^-7` |
+| **免排版**——无结构命令、无 `^`/`_`、恰好一个 `=`、左侧单个 ASCII 字母、右侧数字加可选单位 | 普通文本 run | `s=10km`、`t=2h`、`m=5kg`、`v=3m/s` |
+
+第三阶靠 `docx_mathify.py` 里的 `no_layout_reason()` 判定，单位尾巴是**白名单**而不是"随便什么字母"：每个因子都必须命中 `linear_to_latex.UNITS`。所以 `y=2x`、`n=2t` 仍然是公式（它们是函数关系，不是"2 米""2 吨"），而 `v=s/t` 仍是真分式（`t` 被刻意排除在 `UNITS` 之外）。`x=3` 也落在这一阶，记为 `plain_equation` 而不是 `plain_quantity`。当前的保守边界：`T=25℃`（`UNITS` 里没有 `℃`）与希腊字母量符号 `η=80%` 都还留在公式对象里。
+
+为什么要分阶：公式对象在不需要二维排版的地方**是成本而不是收益**——改一个字符要开公式编辑器、粘到别的程序里掉形、行高被公式引擎撑开。代价是这一阶会丢掉数学斜体（`s=10km` 的 `s` 是正体），这是刻意的取舍：要斜体就给输入写成带上下标的形式（落进第二阶），或在 `docx_create` 的 spec 里显式设 `vert_align`。
+
+两档都可关，开关在 `docx_mathify.py` 的模块级常量：`NO_LAYOUT_NEEDED` 单独管第三阶，`MIXED_SUPERSCRIPT` 是覆盖第二、三阶的总闸（关掉它两档一起停，从而保住"关掉总闸 = 老行为"这条口径）。
+
+公式字体默认 **Times New Roman**，可用 `MATH_FONT` 覆盖（`MATH_FONT="Cambria Math"` 还原 Word 默认观感，`MATH_FONT=""` 完全不注入）。细节见 [references/formula-guide.md](references/formula-guide.md)，三阶的表在 [SKILL.md 的三阶输出表](SKILL.md#three-output-tiers)。
+
 ## 环境要求
 
 | 项 | 要求 |
 |---|---|
 | Python | 3.10+（CI 下限） |
 | 依赖 | `python-docx`、`lxml`、`latex2mathml` |
-| 测试 | 另需 `pypdfium2`、`pytest` |
+| 测试 | 另需 `pypdfium2`（已列入 `requirements.txt`）与 `pytest`（**未列入**——它在 `requirements.txt` 里是注释行，得自己装：`python -m pip install pytest`） |
 | 公式链 | Windows + Microsoft Office：需要 `MML2OMML.XSL`（随 Office 安装，`math_omml.find_xslt()` 自动探测，`MML2OMML_XSL` 可覆盖） |
 | PDF 导出 | Windows + Microsoft Word（COM）。**不走 WPS**：WPS 导出带 OMML 的 docx 会丢文本层 |
 | 模板 apply（从模板造新文档） | Node.js + `docx` 包 |
@@ -60,7 +116,11 @@ cd docx-skill
 python -m pip install -r requirements.txt
 ```
 
-Python **3.10** 或更新。`requirements.txt` 里只有 `python-docx`、`lxml`、`latex2mathml` 三条必需项，测试用的 `pypdfium2` 与 `pytest` 在里面但脚本本身不 import。
+Python **3.10** 或更新。`requirements.txt` 里只有 `python-docx`、`lxml`、`latex2mathml` 三条必需项，外加只有 PDF 文本层断言才用得到的 `pypdfium2`。`pytest` **不在其中**：第 19 行是 `# pytest>=7.4`，一条注释，因为它是纯开发工具。所以 `pip install -r requirements.txt` 之后跑 `python -m pytest` 会得到 `No module named pytest`，顺手一起装——`ci.yml` 就是这么装的：
+
+```powershell
+python -m pip install -r requirements.txt pytest
+```
 
 两项可选依赖：
 
@@ -76,6 +136,100 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 ```
 
 `docx_mathify.py` 与 `insert_formula.py` 共用同一个探测函数，只有公式功能才需要它——其余脚本在没有 Office 的机器上照跑。
+
+## 典型用法
+
+18 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——逐文件清单见下一节「脚本清单」的末列：
+
+```bash
+python scripts/docx_create.py --help
+python scripts/docx_read.py --help
+```
+
+`docx_create.py` 吃两个**位置参数**：`python scripts/docx_create.py <spec> <output>`。它没有 `--spec` / `--output` 开关，传了是用法错误，不会被静默忽略：
+
+```text
+docx_create.py: error: unrecognized arguments: --spec --output   (exit 2)
+```
+
+`table_width.py` 与 `insert_formula.py` 操作的是**解包目录**（把一个 `.docx` 展成目录直接改 XML），先解包、改完再打包：
+
+```python
+from docx_pack import unpack, pack
+unpack("in.docx", "unpacked/")
+# ... 改 unpacked/ 下的 XML ...
+pack("unpacked/", "out.docx", original="in.docx")
+```
+
+上面这段是 **Python**，不是 shell：`docx_pack` 在 `scripts/` 里，所以在仓根直接贴进解释器会 `ModuleNotFoundError`。要么先 `cd scripts`，要么先把目录塞进 `sys.path`——一条命令版是 `python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`。
+
+`pack` 沿用原件的条目顺序与压缩方式，所以"什么都没改"的往返产出等价归档。
+
+`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠、以及 Windows 盘符形式（如 `D:/x.txt`）一律拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
+
+五个常用动作：
+
+```bash
+# 1. 整篇线性公式批量转原生 OMML，并出转换报告
+python scripts/docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
+
+# 2. 插单条行间公式（锚定在 "marker" 段落之后）
+python scripts/insert_formula.py unpacked/ "\frac{-b+\sqrt{b^2-4ac}}{2a}" --display --after "marker"
+
+# 3. 表格几何：读现状 → 按 cm 写死四列
+python scripts/table_width.py report unpacked/
+python scripts/table_width.py set unpacked/ --table 1 --widths 2.4,4.2,2.4,5.6
+
+# 4. 合并并导 PDF
+python scripts/merge_docs.py base.docx src.docx merged.docx
+pwsh scripts/pdf_export.ps1 -DocxPath merged.docx -PdfPath merged.pdf
+
+# 5. 占位符填充（--strict：有 token 没填就报错，不静默放过）
+python scripts/docx_template.py fill template.docx values.json out.docx --strict
+```
+
+第 2、3 步吃的都是**解包目录**，先按上面那条 `python -c "…unpack('in.docx','unpacked/')"` 造一个；`--after "marker"` 要求文档里真有一个含 `marker` 的段落，第 3 步的四列宽度也要求那张表正好四列。
+
+最小往返（造 → 读 → 转公式）。spec 直接用仓里的，不用在命令行里拼 JSON：
+
+```bash
+# 造——examples/formulas.json 是仓里自带的示例，含 5 条可转公式
+python scripts/docx_create.py examples/formulas.json report.docx
+
+# 读
+python scripts/docx_read.py report.docx --structure
+
+# 转公式
+python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
+```
+
+`examples/basic.json` 是覆盖面更广的那份（十种常用块 + 表格 + 分页），想看块类型先看它；`examples/formulas.json` 才是该喂给 `docx_mathify` 的那份。
+
+**在 PowerShell 里写自己的 spec**：bash 的 heredoc `cat > spec.json <<'JSON' … JSON` 在 `powershell.exe` 与 `pwsh` 下都直接解析失败——`ParserError: 重定向运算符后缺少文件规范`，exit `1`。改用 here-string：
+
+```powershell
+$spec = @'
+{"blocks": [
+  {"type": "heading",   "text": "Report", "level": 1},
+  {"type": "paragraph", "text": "Ohm's law: U=IR"}
+]}
+'@
+Set-Content -Path spec.json -Value $spec -Encoding utf8
+python scripts/docx_create.py spec.json report.docx
+```
+
+完整命令表在 [SKILL.md](SKILL.md)（中文版 [SKILL.zh-CN.md](SKILL.zh-CN.md)）。
+
+还有一个面向 agent 的往返：结构性结果一律走 **stdout 的 JSON**——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_section` / `docx_numbering` / `docx_crossref` / `docx_toc`；其余出人读文本（`docx_mathify` / `table_width` / `insert_formula` / `docx_template`，`fill` 除外，它出 JSON）。诊断信息一律走 stderr。退出码别只判「是不是 0」，按四档分：
+
+| 码 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `1` | 预期内失败——文件不存在、锚点段没找到、spec 不合法 |
+| `2` | 用法错误——argparse 拦下，或某个必需的模式开关没给 |
+| `3` | 部分成功——`docx_mathify` 把文档写出去了，但至少还有一条公式是线性文本 |
+
+`3` 只会从 `docx_mathify` 出来，且是刻意的：产物有效、绝大多数已转换，所以交付前要看一眼退出码。
 
 ## 脚本清单（`scripts/`，27 个文件）
 
@@ -120,7 +274,7 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 | `_bootstrap.py` | 平铺布局自举：`sys.path` + 运行时兜底 | 库 |
 | `pdf_export.ps1` | docx → PDF（Word COM，`ExportAsFixedFormat(17)`，ReadOnly） | PS |
 
-### 仓内目录与 import 纪律
+## 仓内目录与 import 纪律（Layout）
 
 ```
 scripts/    所有 CLI，平铺，按裸模块名 import —— 27 个文件（25 个 CLI + 1 个纯库 + 1 个 .ps1）
@@ -134,60 +288,7 @@ examples/   示例 spec（basic.json / formulas.json）
 
 所有脚本共用一条 import 纪律：**先把自身所在目录塞进 `sys.path`，再 import 同级模块**。于是 `python scripts/x.py`、在 `scripts/` 里 `python x.py`、以及从别的目录用绝对路径调用，三种方式都能跑——没有一条 `__init__.py` 链要维护，也就没有一处会写错。
 
-## 典型用法
-
-18 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——见上表末列：
-
-```bash
-python scripts/docx_create.py --help
-python scripts/docx_read.py --help
-```
-
-`table_width.py` 与 `insert_formula.py` 操作的是**解包目录**（把一个 `.docx` 展成目录直接改 XML），先解包、改完再打包：
-
-```python
-from docx_pack import unpack, pack
-unpack("in.docx", "unpacked/")
-# ... 改 unpacked/ 下的 XML ...
-pack("unpacked/", "out.docx", original="in.docx")
-```
-
-`pack` 沿用原件的条目顺序与压缩方式，所以"什么都没改"的往返产出等价归档。
-
-`unpack` 把归档当**不可信输入**：条目名里的 `../`、绝对路径、反斜杠、以及 Windows 盘符形式（如 `D:/x.txt`）一律拒绝，不让压缩包写到解包目录之外，命中即抛 `UnsafeArchiveError`。
-
-五个常用动作：
-
-```bash
-# 1. 整篇线性公式批量转原生 OMML，并出转换报告
-python scripts/docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
-
-# 2. 插单条行间公式（锚定在 "marker" 段落之后）
-python scripts/insert_formula.py unpacked/ "\frac{-b+\sqrt{b^2-4ac}}{2a}" --display --after "marker"
-
-# 3. 表格几何：读现状 → 按 cm 写死四列
-python scripts/table_width.py report unpacked/
-python scripts/table_width.py set unpacked/ --table 1 --widths 2.4,4.2,2.4,5.6
-
-# 4. 合并并导 PDF
-python scripts/merge_docs.py base.docx src.docx merged.docx
-pwsh scripts/pdf_export.ps1 -DocxPath merged.docx -PdfPath merged.pdf
-
-# 5. 占位符填充
-python scripts/docx_template.py fill template.docx values.json out.docx --strict
-```
-
-最小往返（造 → 读 → 转公式）：
-
-```bash
-python scripts/docx_create.py spec.json report.docx
-python scripts/docx_read.py report.docx --structure
-python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
-```
-
-完整命令表在 [SKILL.md](SKILL.md)（中文版 [SKILL.zh-CN.md](SKILL.zh-CN.md)）。
-
-还有一个面向 agent 的往返：结构性结果一律走 **stdout 的 JSON**——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_section` / `docx_numbering` / `docx_crossref` / `docx_toc`；其余出人读文本（`docx_mathify` / `table_width` / `insert_formula` / `docx_template`，`fill` 除外，它出 JSON）。诊断信息一律走 stderr。退出码可靠：`0` 成功，非零失败；`docx_mathify` 返回 `3` 表示文档写出去了但有公式没转成功。
+### 长文档笔记（Reference notes）
 
 六篇长文档笔记按需查（都在 `references/`）：
 
@@ -200,67 +301,32 @@ python scripts/docx_mathify.py report.docx -o report-math.docx --report conv.md
 | [references/font-scheme.md](references/font-scheme.md) | 样式层 + run 层字体统一、标题放大阈值的判定 |
 | [references/merge-and-export.md](references/merge-and-export.md) | 两份 docx 合并与 PDF 导出的注意事项 |
 
-## 不依赖 Word 也能读对的静态目录
-
-`{ TOC \o "1-3" }` 是一个**域**：条目在有人按下 `F9` 之前根本不存在，而手工塞进域里的缓存结果会在按下 `F9` 的瞬间被丢掉。凡是交付物——要转 PDF 的、要进 diff 的、要交给没有 Office 引擎的工具读的——目录都必须是**普通段落**。
-
-`docx_toc.py` 就是这么写的：
-
-```bash
-python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
-```
-
-每个条目是 `标题<TAB>页码`，用 Word 自己那套 `toc 1/2/3` 样式，右侧制表位停在正文块宽度上、带点引线。制表位宽度取自 `docx_create.content_width_mm(section)`，不许写死：六个实测卷的正文宽度本来就是 170 mm 与 160 mm 两种。
-
-`w:tab` 是这里的关键——页码靠一个真正的制表符推到右边界，而不是靠空格对齐。
-
-`build_static_toc()` 返回的 report 字段：`entries` / `levels` / `styles` / `tab_pos_mm` / `tab_pos_source` / `dropped_entries` / `dropped_titles` / `adopted` / `section_index` / `inserted_at`。重建是幂等且安全的：每个条目段落带一个 `_DocxTocEntry…` 书签，`drop_existing_toc` 只删本模块写过的东西；用户自带的、用内置 `toc 1` 样式写的那份目录不动，除非显式传 `adopt_unmarked=True`。
-
-**页码必须实测，不能猜。** 这是**两遍法**：
-
-1. 第一遍先跳过页码（`--pages` 留空），只把条目写进去；
-2. 用 `tools/word_accept.py --page-probe`（`python tools/word_accept.py in.docx --page-probe 9,12,14,17 --json out.json`）让 Word 排完版，读回 `paragraph_pages[].displayed_text`；
-3. 第二遍带着实测页码重跑一次，覆盖成终稿。
-
-页码为什么不能算：`displayed_text` 取自 `Information(WD_ACTIVE_END_ADJUSTED_PAGE)`，是**读者眼睛看到的字形**，不等于物理页序。一份"封面无页码 + 前置小写罗马 + 正文从 1 重开"的文档，物理第 8 页在那一节里印的是 `i`；不同 Word 版本与字体回退会让流式排版落到不同页，任何"按段落序号推页码"的算法都会在真机上错。所以 `source` 字段为 `computed` 的那些行（无 Word 时的估算，`basis: section-start`）**不得当作交付页码**。
-
-两个前提它不会替你造：标题样式必须带 `outline_level`（只是"长得像标题"的样式在 Word 眼里是正文，导航窗格空的、`TOC \o` 也收不到东西）；页码来自对成品文件的第二遍读取。配方、坑单与实测限制见 [references/toc.md](references/toc.md)。
-
-## 公式不是同一种东西
-
-把所有"看起来像公式"的串统统变成公式对象，是最容易做、也最容易做错的做法。本工具链把每个识别出的片段分成**三阶**：
-
-| 片段是什么 | 产出 | 例子 |
-|---|---|---|
-| **结构式**——含 `\frac`、`\sqrt`、`\int`、`\sum`、`\begin{`、`\left`、`\overline` 等结构命令（`_STRUCTURAL_CMDS`，43 条） | 真 **OMML** 公式对象 | `x^2/16+y^2/9=1`、`v=s/t` |
-| **纯上下标**——不含结构命令，但至少有一个 `^` 或 `_` | 普通 run + `w:vertAlign`，即 Word 自己 `Ctrl+Shift+=` 做出来的真上下标，字号可还原 | `a=9.8m/s2`、`10^-7` |
-| **免排版**——无结构命令、无 `^`/`_`、恰好一个 `=`、左侧单个 ASCII 字母、右侧数字加可选单位 | 普通文本 run | `s=10km`、`t=2h`、`m=5kg`、`v=3m/s` |
-
-第三阶靠 `docx_mathify.py` 里的 `no_layout_reason()` 判定，单位尾巴是**白名单**而不是"随便什么字母"：每个因子都必须命中 `linear_to_latex.UNITS`。所以 `y=2x`、`n=2t` 仍然是公式（它们是函数关系，不是"2 米""2 吨"），而 `v=s/t` 仍是真分式（`t` 被刻意排除在 `UNITS` 之外）。`x=3` 也落在这一阶，记为 `plain_equation` 而不是 `plain_quantity`。当前的保守边界：`T=25℃`（`UNITS` 里没有 `℃`）与希腊字母量符号 `η=80%` 都还留在公式对象里。
-
-为什么要分阶：公式对象在不需要二维排版的地方**是成本而不是收益**——改一个字符要开公式编辑器、粘到别的程序里掉形、行高被公式引擎撑开。代价是这一阶会丢掉数学斜体（`s=10km` 的 `s` 是正体），这是刻意的取舍：要斜体就给输入写成带上下标的形式（落进第二阶），或在 `docx_create` 的 spec 里显式设 `vert_align`。
-
-两档都可关，开关在 `docx_mathify.py` 的模块级常量：`NO_LAYOUT_NEEDED` 单独管第三阶，`MIXED_SUPERSCRIPT` 是覆盖第二、三阶的总闸（关掉它两档一起停，从而保住"关掉总闸 = 老行为"这条口径）。
-
-公式字体默认 **Times New Roman**，可用 `MATH_FONT` 覆盖（`MATH_FONT="Cambria Math"` 还原 Word 默认观感，`MATH_FONT=""` 完全不注入）。细节见 [references/formula-guide.md](references/formula-guide.md)，三阶的表在 [SKILL.md 的三阶输出表](SKILL.md#three-output-tiers)。
-
 ## 测试
 
 ```bash
 python -X utf8 -m pytest tests -q
 ```
 
-`tests/` 用 `subprocess` 调 argparse CLI，fixture 现场生成、产物写临时目录。依赖 `latex2mathml` **加** `MML2OMML.XSL` 的用例（`test_formula` / `test_units` / `test_mixed_superscript`）**自己 skip**，并写明原因 `needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)`——所以没有 Office 的机器得到的是**绿跑 + 更大的 skip 数**，不是红灯。全量实测（把 `MML2OMML_XSL` 指向一个不存在的文件来模拟「整机没有 Office」）：**1357 passed / 370 skipped / 0 failed**。
+`tests/` 用 `subprocess` 调 argparse CLI，fixture 现场生成、产物写临时目录。依赖 `latex2mathml` **加** `MML2OMML.XSL` 的用例（`test_formula` / `test_units` / `test_mixed_superscript`）**自己 skip**，并写明原因 `needs latex2mathml + Microsoft MML2OMML.XSL (local Office install)`——所以没有 Office 的机器得到的是**绿跑 + 更大的 skip 数**，不是红灯。
 
-其余按 `requirements.txt` 走：`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
+同一个 commit、两台机器，数字不同只因为 skip 不同：
+
+| 环境 | 结果 |
+|---|---|
+| 开发机，本机装了 Office | **1576 passed / 239 skipped / 0 failed**（collected 1815） |
+| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件）——`ci.yml` 卡的就是这一行 | **1441 passed / 374 skipped / 0 failed**（collected 1815） |
+
+差的就是那 135 条：需要 `latex2mathml` **加** `MML2OMML.XSL` 的用例在第一行真跑、在第二行 skip。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1441` 与 `skipped <= collected / 4`。
+
+`tests/` 里是 46 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 
 ## 授权
 
 MIT，见 [LICENSE](LICENSE)。第三方来源与运行期组件单独记在 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
-本项目的骨架来自 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT，`skills/productivity/microsoft-office`）里的 clean-room 实现：`docx_create` / `docx_edit` / `docx_read` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_template` / `docx_common` 这几个文件由它衍生，本地改动限于 `sys.path` 自举头、UTF-8 stdio 与若干可移植性/缺陷修复（`docx_common.py` 另加 `--api` 自述入口与替换迭代预算，防替换值本身含查找串时死循环）。上游 MIT 授权对它们原样适用。
+本项目的骨架来自 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT，`skills/productivity/microsoft-office`）里的 clean-room 实现：`docx_create` / `docx_edit` / `docx_read` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_template` / `docx_common` / `docx_numbering` / `docx_crossref` / `docx_toc` / `docx_section` 这 12 个文件由它衍生（**判据是各文件头部的 `# MIT License. Part of the Hermes docx skill.` 标记，那是权威来源标记**），本地改动限于 `sys.path` 自举头、UTF-8 stdio 与若干可移植性/缺陷修复（`docx_common.py` 另加 `--api` 自述入口与替换迭代预算，防替换值本身含查找串时死循环）。上游 MIT 授权对它们原样适用。
 
-**自研增量**：`linear_to_latex.py`、`math_omml.py`、`fix_phasor_dot.py`、`docx_mathify.py`、`insert_formula.py`（公式链）、`table_width.py`、`fix_zoom.py`、`fix_fonts.py`、`merge_docs.py`、`pdf_export.ps1`（本地移植的 6 项能力即 `fix_fonts` / `merge_docs` / `pdf_export` / `fix_zoom` / `minidom_compat` / `encoding` 所在的那批），以及 `docx_numbering.py`、`docx_crossref.py`、`docx_toc.py`、`docx_section.py`、`docx_pack.py`。
+**自研增量**（头部不带上面那个 Hermes 标记的那批）：`linear_to_latex.py`、`math_omml.py`、`fix_phasor_dot.py`、`docx_mathify.py`、`insert_formula.py`（公式链）、`table_width.py`、`fix_zoom.py`、`fix_fonts.py`、`merge_docs.py`、`pdf_export.ps1`（本地移植的 6 项能力即 `fix_fonts` / `merge_docs` / `pdf_export` / `fix_zoom` / `minidom_compat` / `encoding` 所在的那批），以及 `docx_pack.py`。
 
 **不随本仓库分发**的组件：`MML2OMML.XSL` 是 Microsoft Office 的一部分，运行时从本机 Office 读取；`pdf_export.ps1` 通过 COM 驱动本机 Word，脚本本身不含微软代码。`latex2mathml`、`python-docx`、`lxml` 也由用户自行安装，不 vendor 进来。上游早期版本的 `LICENSE.txt` 属专有条款，未随本仓库分发。
 
