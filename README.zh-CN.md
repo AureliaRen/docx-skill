@@ -314,9 +314,9 @@ python -X utf8 -m pytest tests -q
 | 环境 | 结果 |
 |---|---|
 | 开发机，本机装了 Office | **1576 passed / 239 skipped / 0 failed**（collected 1815） |
-| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件）——`ci.yml` 卡的就是这一行 | **1441 passed / 374 skipped / 0 failed**（collected 1815） |
+| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件，**且必须在仓库的 clone 里跑**——开发树的上层目录有 `_smoke/`，会让其中一条用例从 skip 变成 pass）——`ci.yml` 卡的就是这一行 | **1440 passed / 375 skipped / 0 failed**（collected 1815） |
 
-差的就是那 135 条：需要 `latex2mathml` **加** `MML2OMML.XSL` 的用例在第一行真跑、在第二行 skip。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1441` 与 `skipped <= collected / 4`。
+差的就是那 135 条：需要 `latex2mathml` **加** `MML2OMML.XSL` 的用例在第一行真跑、在第二行 skip。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1440` 与 `skipped <= collected / 4`。
 
 `tests/` 里是 46 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 

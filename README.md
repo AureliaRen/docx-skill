@@ -453,11 +453,11 @@ runs, same commit, different machines; the numbers differ only because the skips
 | Where | Result |
 |---|---|
 | Developer machine, local Office installed | **1576 passed / 239 skipped / 0 failed** (1815 collected) |
-| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file) — the row `ci.yml` gates on | **1441 passed / 374 skipped / 0 failed** (1815 collected) |
+| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file, **run on a clone of this repository** — the parent of a development checkout holds `_smoke/`, which flips one test from skip to pass) — the row `ci.yml` gates on | **1440 passed / 375 skipped / 0 failed** (1815 collected) |
 
 The gap is exactly 135 tests — the ones that need `latex2mathml` **and**
 `MML2OMML.XSL`: they run in the first row and skip in the second. Neither row is a
-number to chase by editing a constant; `ci.yml` gates `passed >= 1441` and
+number to chase by editing a constant; `ci.yml` gates `passed >= 1440` and
 `skipped <= collected / 4`.
 
 `tests/` holds 46 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
