@@ -75,7 +75,24 @@ L158-164  insert_near(...) / marker not found: return 1        ← marker 检查
     run，raw 路径该 run 被 XSLT 丢掉）——默认 ``m:r`` 数比 raw 多 1；
 11. 表格单元格内 marker：``--after`` 命中 ``w:tc`` 里的文字时**真插进那个单元格**
     （tc 内多出一段带 oMath 的 ``w:p``），body 直接子元素序列不变；
-12. ``--after`` + ``--dump`` 同时给：``--dump`` 先返回、**只读**，不是互斥报错。
+12. ``--after`` + ``--dump`` 同时给：**明确报错退 2**（用法错误），文档零改动。
+    ⚠️ **本条在 P6-FIX-C2 被反转**：它此前锁的是「``--dump`` 先 return 0、静默把
+    ``--after`` 吞掉」，而那正是 P5-AUDIT-QUALITY §5.7 的缺陷本体。锁住缺陷的
+    用例不是回归保护，是缺陷的保鲜膜 —— 报名见 `docs\reports\P6-FIX-C2.md`。
+
+## P6-FIX-C2 补测（13～17 条）：静默说谎类缺陷
+
+13. 空 marker（``--after ""`` / ``--before " "``）→ exit 2（旧版 rc=0 且**静默追加到
+    文末**），文档零改动；
+14. marker 找不到的报错里给出**实际可搜范围**（``0-based [0, N-1]`` + 单元格数），
+    且 N 必须取**插入前**快照（``insert_near`` 的 fallback 会先追加再返回 False，
+    事后数会多 1 —— 写这条用例时实测抓到的）；
+15. 落点回显 ``at body[i]`` 的下标**就是**该段落在 ``<w:body>`` 直接子元素序列里的
+    实测下标（旧版完全没有回显 → 红），并与「marker 下标 + 1」交叉核对；
+16. 边界：``--before`` 首段 → ``at body[0]``；``--after`` 末段（下标 N-1）→
+    ``at body[N]``；
+17. 容器：表格单元格内 marker → ``at tc[2]``（**不是** body 下标；下标口径含
+    ``w:tcPr``）。
 
 Run:  python -m pytest tests/test_insert_formula.py -q
 """
@@ -84,6 +101,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -237,6 +255,34 @@ def index_of_paragraph_containing(paras: list, needle: str) -> int:
     raise AssertionError(
         f"fixture 里找不到含 {needle!r} 的段落；实际段落 = "
         f"{[para_text(p) for p in paras]}")
+
+
+# ------------------------------------------------- P6-FIX-C2 新增的小工具
+def body_children(unpacked: Path) -> list:
+    """``<w:body>`` 的**全部**直接子元素（含 ``w:tbl`` / ``w:sectPr``）。
+
+    ``body_paragraphs()`` 只留 ``w:p``，下标记的是"第几段"；而 CLI 回显的
+    ``at body[i]`` 报的是**容器直接子元素的下标**（含 ``w:sectPr``）。两者在
+    ``--after 末段`` 这种边界上会差 1（公式段落在 ``sectPr`` 之前，段序里是末段、
+    子元素序列里下标还得数上 ``sectPr`` 前面的东西）。要核真值就必须用子元素序列，
+    不能拿段序凑。
+    """
+    root = xml_root(unpacked)
+    body = root.find(w("body"))
+    assert body is not None, "<w:body> 不见了"
+    return list(body)
+
+
+ECHO_RE = re.compile(r"at (body|tc)\[(\d+)\]")
+
+
+def echo_of(stdout: str) -> tuple[str, int]:
+    """从成功 stdout 里取落点回显 ``at body[i]`` / ``at tc[i]``。"""
+    found = ECHO_RE.search(stdout)
+    assert found, (
+        "成功输出里没有落点回显（`at body[i]` / `at tc[i]`）；"
+        f"stdout={stdout!r}")
+    return found.group(1), int(found.group(2))
 
 
 # ===========================================================================
@@ -843,29 +889,33 @@ def test_after_marker_inside_table_cell_inserts_into_that_cell(tmp_path: Path):
 
 
 # ===========================================================================
-# P5-A1 · 12) --after 与 --dump 同时给：--dump 先返回，是只读而非互斥
+# P5-A1 · 12) 【P6-FIX-C2 反转】--after 与 --dump 同时给：用法错误 exit 2
 # ===========================================================================
-@needs_omml
-def test_after_with_dump_is_readonly_not_mutually_exclusive(tmp_path: Path):
-    r"""``--after`` + ``--dump`` 同时给 → **rc=0 且不写文件**，不是互斥报错。
+def test_after_with_dump_is_rejected_as_usage_error(tmp_path: Path):
+    r"""``--after`` + ``--dump`` → **exit 2 + 明确报错**，文档零改动。
 
-    源码顺序（``main()``）：
+    ## 这条用例此前锁的是缺陷本体（之所以反转，别当成随手改）
 
-    ```
-    L131  if args.dump:  print(...); return 0      ← 先返回
-    L152  if args.after and args.before: ... return 1   ← 互斥检查在 dump 之后
-    ```
+    P5-A1 版把它写成「``--dump`` 先 ``return 0``、``--after`` 被完全忽略，rc=0」，
+    并称之为「``--dump`` 的只读优先级高于锚点参数」这一既有语义。但 P5-AUDIT-QUALITY
+    §5.7 的判定是：这是**静默丢弃参数**——调用方给了锚点、拿到 rc=0，会以为公式插在
+    了锚点旁边，实际连文档都没打开。锁住缺陷的用例会把它变成"特性"，比没有用例更糟。
 
-    也就是说 ``--dump`` 抢在互斥检查与 ``insert_near`` 之前返回：``--after`` 被
-    **完全忽略**（连 marker 是否存在都不查）。实测：给一个**存在**的 marker，
-    rc=0、``document.xml`` 的 SHA256 与段落数不变、stdout 是 ``<w:p>``。
+    修法选「明确互斥退 2」而不是「两个都生效」：``--dump`` 的语义是**只打印不写文件**，
+    ``--after`` 的语义是**决定写在哪儿**——在不写文件的前提下，锚点没有任何可生效的
+    落点，所以"两个都生效"不存在，只剩"明确报错"这一条诚实的路（任务书也允许二选一）。
 
-    这条锁的是「``--dump`` 的只读优先级高于锚点参数」这一既有语义。它也是个
-    容易看走眼的地方：`--after` 与 `--dump` 在 ``argparse`` 里**都不是**互斥组，
-    有人会以为该报错；实际行为是静默只读。按实测写断言，不按直觉。
+    ## 为什么这条**不再**挂 ``@needs_omml``
 
-    额外断言 stdout 里**没有** ``Inserted`` 字样：出现了就说明它穿过了 dump 分支、
-    真去写了文件（此时 SHA 断言也会红，两条互为交叉验证）。
+    用法校验现在排在 ``build_para()`` **之前**（旧版是 ``--dump`` 的 ``return 0``
+    抢在最前）：矛盾参数在需要 XSL 之前就退 2，所以这条用例在没装 Office 的机器上
+    也能跑，不再 skip。这也是修法的一个副产品——用法错误不该依赖转换环境。
+
+    断言四层（缺一层都挡不住一类退化）：
+    * rc == 2（``!= 0`` 不够：exit 1 是运行期错误的码，用法错误必须可区分）；
+    * stderr 点出「锚点会被忽略」而不是笼统 usage；
+    * ``document.xml`` SHA + 段落数不变（报错的同时落盘是最坏结果）；
+    * stdout 既没有 OMML（``<w:p``）也没有 ``Inserted``（没写文件也没打印）。
     """
     up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
 
@@ -876,22 +926,291 @@ def test_after_with_dump_is_readonly_not_mutually_exclusive(tmp_path: Path):
     stdout = proc.stdout.decode("utf-8", "replace")
     stderr = proc.stderr.decode("utf-8", "replace")
 
-    assert proc.returncode == 0, (
-        "--dump 与 --after 被当成互斥报错（实测应为 dump 先返回 rc=0）："
-        f"rc={proc.returncode} stdout={stdout[:200]!r} stderr={stderr[:200]!r}")
-    assert "mutually exclusive" not in stderr.lower(), (
-        f"--dump 分支没抢在互斥检查之前返回：{stderr!r}")
+    assert proc.returncode == 2, (
+        "--after + --dump 必须退 2（用法错误）：rc=%s stdout=%r stderr=%r"
+        % (proc.returncode, stdout[:200], stderr[:300]))
+    assert "cannot be combined" in stderr, (
+        f"报错没说明两个参数互斥：{stderr!r}")
+    assert "--after" in stderr and "--dump" in stderr, (
+        f"报错没指名是哪两个参数：{stderr!r}")
+    assert "silently ignored" in stderr, (
+        f"报错没说清「给了会怎样」（锚点被静默忽略）：{stderr!r}")
 
     assert doc_sha(up) == sha_before, (
-        "--after + --dump 改写了 document.xml（dump 的只读语义被破坏）："
+        "报错的同时改写了 document.xml："
+        f"改前 {sha_before[:12]} → 改后 {doc_sha(up)[:12]}")
+    assert len(body_paragraphs(up)) == paras_before, "报错的同时增删了段落"
+    assert omath_in(xml_root(up)) == 0, "报错的同时把公式写进了文档"
+
+    assert "<w:p" not in stdout, (
+        f"互斥时不该还打印 OMML（说明 --dump 分支先跑了）：{stdout[:200]!r}")
+    assert "Inserted" not in stdout, f"stdout 出现了写入分支的措辞：{stdout[:200]!r}"
+
+# ===========================================================================
+# P6-FIX-C2 · 13) 空 marker：旧版 rc=0 且静默追加到文末 → 现在用法错误 exit 2
+# ===========================================================================
+def test_empty_marker_is_rejected_instead_of_appending_at_end(tmp_path: Path):
+    r"""``--after ""`` / ``--before " "`` → **exit 2**，文档零改动。
+
+    ## 缺陷形态（旧版实测，P6-FIX-C2 §缺陷亲验 S3）
+
+    ``--after ""`` 在旧版里走到的是「**没有锚点**」这条分支，而不是「锚点为空」：
+
+    ```
+    marker = args.after or args.before      # "" 是 falsy → marker == ""
+    anchored = insert_near(body, "", ...)   # `if marker:` 也是 falsy → 直接 fallback
+    if marker and not anchored:             # marker 为 "" → 这个防护根本不进
+        ...
+    ```
+
+    于是**三个守卫全部被空串绕过**：公式被追加到文末、rc=0、stdout 打印
+    ``Inserted inline formula: E=mc^2``。调用方传了锚点、拿到成功，公式却在文末
+    ——正是任务书点名的「静默说谎」。空串不是"没要求"，它是"要求了一个空串"。
+
+    ## 断言口径
+
+    两种写法都测（``--after ""`` 与 ``--before " "``，后者连空白-only 也覆盖）：
+    必须 rc=2、stderr 出现 ``empty marker``、``document.xml`` SHA 与段落数不变。
+    段数断言是承重的：旧版这条正好多出 1 段（公式段），只断 rc 的话，
+    把错误码改对但仍先追加再报错的实现能混过去。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    sha_before = doc_sha(up)
+    paras_before = len(body_paragraphs(up))
+
+    for flag, value in (("--after", ""), ("--before", " ")):
+        proc = run_insert(up, "E=mc^2", flag, value)
+        stderr = proc.stderr.decode("utf-8", "replace")
+        assert proc.returncode == 2, (
+            f"{flag} {value!r} 必须退 2（用法错误），否则就是静默追加到文末："
+            "rc=%s stdout=%r stderr=%r"
+            % (proc.returncode, proc.stdout.decode("utf-8", "replace")[:200],
+               stderr[:300]))
+        assert "empty marker" in stderr, (
+            f"{flag} {value!r} 的报错没点明是空 marker：{stderr!r}")
+        assert "silently append" in stderr, (
+            f"{flag} {value!r} 的报错没说清后果（会被静默追加到文末）：{stderr!r}")
+
+    assert doc_sha(up) == sha_before, (
+        "空 marker 的失败路径仍改写了 document.xml："
         f"改前 {sha_before[:12]} → 改后 {doc_sha(up)[:12]}")
     assert len(body_paragraphs(up)) == paras_before, (
-        f"段落数被改：{paras_before} → {len(body_paragraphs(up))}")
+        f"空 marker 仍往文档里塞了段落：改前 {paras_before} 段 → 改后 "
+        f"{[para_text(p) for p in body_paragraphs(up)]}")
+    assert omath_in(xml_root(up)) == 0, "空 marker 仍把公式写进了文档"
 
-    assert "Inserted" not in stdout, (
-        f"stdout 出现了写入分支的措辞，说明它真去写文件了：{stdout[:200]!r}")
-    dumped = etree.fromstring(stdout.encode("utf-8"))
-    assert etree.QName(dumped).localname == "p", (
-        f"--dump 的 stdout 不是 <w:p>：{etree.QName(dumped).localname}")
-    assert omath_in(dumped) == 1, (
-        f"dump 出来的段落里 oMath 数不是 1：{omath_in(dumped)}")
+
+# ===========================================================================
+# P6-FIX-C2 · 14) marker 找不到：报错必须给出实际可搜范围
+# ===========================================================================
+@needs_omml      # build_para() 先于 marker 校验，见模块 docstring
+def test_marker_not_found_reports_actual_search_range(tmp_path: Path):
+    r"""marker 未命中的报错里必须写清**实际范围** ``0-based [0, N-1]``。
+
+    「marker not found: 'x'」这种只报事实、不报范围的消息，让人没法判断是自己
+    拼错了、还是文档根本不是那份（3 段还是 300 段，处理方式完全不同）。这一条
+    把范围披露钉进契约——也正是「越界索引要报实际范围 [0, N-1]」这条要求在
+    insert_formula 上的对应物（本脚本没有 ``--index``，见 P6-FIX-C2 报告 §1.1）。
+
+    ## 这里的 N 必须是**插入前**的段数（写这条用例时踩到的真坑）
+
+    ``insert_near()`` 在 marker 未命中时的实现是：**先把公式段追加到文末、再返回
+    False**。旧实现若在 ``insert_near()`` **之后**数段数，会数出 4 段（3 段正文 +
+    刚落进去的公式段），报出 ``[0, 3]`` —— 一个比真相大 1 的假范围。实测抓到这个
+    形态后才改成插入前取快照。所以这里断死 ``3 body paragraph(s)`` 与 ``[0, 2]``：
+    报大了就说明范围是在插入之后数的。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    sha_before = doc_sha(up)
+    paras_before = len(body_paragraphs(up))
+    assert paras_before == 3, f"fixture 段落数不对：{paras_before}"
+
+    proc = run_insert(up, "E=mc^2", "--after", "no-such-marker")
+    stderr = proc.stderr.decode("utf-8", "replace")
+
+    assert proc.returncode == 1, (
+        "marker 未命中仍是 exit 1（运行期错误，与用法错误的 2 区分开）："
+        "rc=%s stderr=%r" % (proc.returncode, stderr))
+    assert "[0, 2]" in stderr, (
+        f"报错没给出实际可搜范围 [0, 2]：{stderr!r}")
+    assert "3 body paragraph" in stderr, (
+        f"报错没给出段数（且必须是插入前的 3）：{stderr!r}")
+    assert "table cell" in stderr, (
+        f"报错没说明还搜过单元格：{stderr!r}")
+
+    assert doc_sha(up) == sha_before, (
+        "marker 未命中的路径仍改写了 document.xml："
+        f"改前 {sha_before[:12]} → 改后 {doc_sha(up)[:12]}")
+    assert len(body_paragraphs(up)) == paras_before, "失败路径仍增删了段落"
+
+
+# ===========================================================================
+# P6-FIX-C2 · 15) 落点回显 = 插入后反查到的实测下标（不是入参、不是猜测）
+# ===========================================================================
+@needs_omml
+def test_position_echo_reports_actual_body_index(tmp_path: Path):
+    r"""成功输出里的 ``at body[i]`` 必须**等于**公式段在 ``<w:body>`` 里的真实下标。
+
+    旧版什么都不回显（``Inserted inline formula: E=mc^2`` 就完了），调用方无从校对
+    公式落在哪儿——这正是 ``docx_edit insert`` 那个「``inserted_at`` 回显入参 8、
+    实际落在第 4 位」缺陷的**同族**（P5-AUDIT-QUALITY §2.5）。
+
+    新回显由**插入后到树上反查**得到（``_locate()`` 按对象身份在下标上找），所以它
+    天然是真值。但要防两种退化：
+    * 回显改成"入参回显"（比如把 marker 段的下标当结果）→ 与实测下标不符就红；
+    * 回显永远报 0 / 报固定值 → 与实测下标不符就红。
+
+    三条断言：① stdout 里有且只有一处回显；② 该下标对应的 body 子元素就是含 oMath
+    的段落；③ 该下标 == marker 段下标 + 1（交叉核对方向没反、也没偏差）。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    proc = run_insert(up, "E=mc^2", "--after", "marker here")
+    assert proc.returncode == 0, (
+        "插入失败：rc=%s stderr=%r" % (proc.returncode,
+                                     proc.stderr.decode("utf-8", "replace")))
+    stdout = proc.stdout.decode("utf-8", "replace")
+
+    hits = ECHO_RE.findall(stdout)
+    assert len(hits) == 1, f"落点回显应恰好一处，实际 {len(hits)} 处：{stdout!r}"
+
+    kind, idx = echo_of(stdout)
+    assert kind == "body", f"body 层的落点被报成了 {kind}：{stdout!r}"
+
+    kids = body_children(up)
+    assert 0 <= idx < len(kids), (
+        f"回显下标 {idx} 越界（body 直接子元素 {len(kids)} 个）：{stdout!r}")
+    target = kids[idx]
+    assert etree.QName(target).localname == "p", (
+        f"回显的 body[{idx}] 不是段落而是 {etree.QName(target).localname}：{stdout!r}")
+    assert omath_in(target) == 1, (
+        f"回显的 body[{idx}] 里没有 oMath —— 回显的位置不是公式真正落点："
+        f"各子元素 = {[etree.QName(c).localname for c in kids]}")
+
+    marker_i = [i for i, c in enumerate(kids)
+                if c.tag == w("p") and "marker here" in para_text(c)]
+    assert marker_i, "fixture 里找不到 marker 段"
+    assert idx == marker_i[0] + 1, (
+        f"回显 body[{idx}] 与「marker 下标 + 1 = {marker_i[0] + 1}」不符：{stdout!r}")
+
+
+# ===========================================================================
+# P6-FIX-C2 · 16) 边界：首段（0）与末段（N-1）
+# ===========================================================================
+@needs_omml
+def test_anchor_boundaries_first_and_last_paragraph(tmp_path: Path):
+    r"""两端边界各验一次：``--before`` 首段 → ``body[0]``；``--after`` 末段 → ``body[N]``。
+
+    没有 ``--index`` 的脚本，锚点越界的极端形态就是**贴着文档两端**：第一个段落
+    之前（下标 0，前面没有任何位置可退）和最后一个段落之后（下标 N，后面只剩
+    ``w:sectPr``）。这两处最容易出「差一位」，而差一位恰恰是 ``--index`` 类缺陷的
+    典型症状（``crossref`` 0-based 与 ``docx_toc`` 1-based 混用就是这么来的）。
+
+    实测（三段 fixture，body 子元素 = ``[p, p, p, sectPr]``）：
+
+    * ``--before "alpha one"`` → 回显 ``at body[0]``，公式段成为**第一段**；
+    * ``--after "omega three"``（末段下标 2 = N-1）→ 回显 ``at body[3]``，即 N，
+      公式段落在 ``sectPr`` 之前、成为**最后一段正文**。
+
+    第二条同时锁死「下标口径 = body 直接子元素下标」：若把 ``sectPr`` 排除在外去数
+    （只数段落），末段之后会报 ``body[3]`` 与 ``body[2]`` 之争——这里断死 3。
+    """
+    # ---- 边界 0：--before 首段
+    d1 = tmp_path / "first"
+    d1.mkdir()
+    up1 = make_unpacked(d1, ["alpha one", "marker here", "omega three"])
+
+    p1 = run_insert(up1, "E=mc^2", "--before", "alpha one")
+    assert p1.returncode == 0, (
+        "插入失败：rc=%s stderr=%r" % (p1.returncode,
+                                     p1.stderr.decode("utf-8", "replace")))
+    kind, idx = echo_of(p1.stdout.decode("utf-8", "replace"))
+    assert (kind, idx) == ("body", 0), (
+        f"--before 首段应报 at body[0]，实际 {kind}[{idx}]")
+    kids1 = body_children(up1)
+    assert omath_in(kids1[0]) == 1, (
+        "公式没落在 body[0]："
+        f"{[etree.QName(c).localname for c in kids1]}")
+
+    # ---- 边界 N-1：--after 末段
+    d2 = tmp_path / "last"
+    d2.mkdir()
+    up2 = make_unpacked(d2, ["alpha one", "marker here", "omega three"])
+    assert len(body_children(up2)) == 4, (
+        f"fixture body 子元素数不对：{[etree.QName(c).localname for c in body_children(up2)]}")
+
+    p2 = run_insert(up2, "E=mc^2", "--after", "omega three")
+    assert p2.returncode == 0, (
+        "插入失败：rc=%s stderr=%r" % (p2.returncode,
+                                     p2.stderr.decode("utf-8", "replace")))
+    kind, idx = echo_of(p2.stdout.decode("utf-8", "replace"))
+    assert (kind, idx) == ("body", 3), (
+        f"--after 末段（N-1=2）应报 at body[3]（= N），实际 {kind}[{idx}]")
+    kids2 = body_children(up2)
+    assert [etree.QName(c).localname for c in kids2] == ["p", "p", "p", "p", "sectPr"], (
+        f"公式段没落在 sectPr 之前：{[etree.QName(c).localname for c in kids2]}")
+    assert omath_in(kids2[3]) == 1, "body[3] 不是公式段（回显与实测不符）"
+
+
+# ===========================================================================
+# P6-FIX-C2 · 17) 表格单元格内的落点必须报 tc[i]，不许报成 body 下标
+# ===========================================================================
+@needs_omml
+def test_position_echo_inside_table_cell_reports_tc_index(tmp_path: Path):
+    r"""marker 在单元格里 → 回显 ``at tc[i]``，且 i 是该 ``w:tc`` 直接子元素的下标。
+
+    这是「回显不许撒谎」最硬的一条：``insert_near()`` 会到 ``w:tc`` 里查找锚点，
+    公式段落因此落在**单元格内部**、body 层的段落数不变。若回显偷懒写死成
+    ``body[...]``，用户按那个下标去 body 里找公式会**找不到**——报一个必然对不上
+    的坐标，比不报更糟。
+
+    实测（body = ``p(alpha one)`` / ``tbl`` / ``p(omega three)``，单元格文字
+    ``cell marker inside``）：``tc`` 的直接子元素由 ``['tcPr', 'p']`` 变成
+    ``['tcPr', 'p', 'p']``，回显 ``at tc[2]`` —— 下标口径含 ``w:tcPr``，所以是 2
+    而不是 1。这个数字是刻意断死的：它同时说明「下标 = 容器直接子元素下标」这条
+    口径在 tc 上也成立（不是"第几段"）。
+
+    同时断 body 段落数不变：回显说 tc、公式却漏到 body 层，是另一种"坐标撒谎"。
+    """
+    d = docx.Document()
+    d.add_paragraph("alpha one")
+    table = d.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "cell marker inside"
+    d.add_paragraph("omega three")
+    src = tmp_path / "tbl.docx"
+    d.save(str(src))
+    freeze_docx(src)
+
+    up = tmp_path / "unpacked_tbl"
+    unpack(src, up)
+
+    proc = run_insert(up, "E=mc^2", "--after", "cell marker inside")
+    assert proc.returncode == 0, (
+        "单元格内 marker 未命中：rc=%s stderr=%r"
+        % (proc.returncode, proc.stderr.decode("utf-8", "replace")))
+
+    stdout = proc.stdout.decode("utf-8", "replace")
+    kind, idx = echo_of(stdout)
+    assert kind == "tc", (
+        f"落点在单元格里，回显却报 {kind}[{idx}] —— 拿这个坐标去 body 里找不到公式："
+        f"{stdout!r}")
+
+    body = xml_root(up).find(w("body"))
+    cells = list(body.iter(w("tc")))
+    assert len(cells) == 1, f"表格单元格数不是 1：{len(cells)}"
+    tc_children = list(cells[0])
+    assert idx == 2, (
+        f"tc 直接子元素下标应为 2（tcPr / marker 段 / 公式段），实际报 {idx}："
+        f"{[etree.QName(c).localname for c in tc_children]}")
+    assert etree.QName(tc_children[idx]).localname == "p", (
+        f"tc[{idx}] 不是段落：{[etree.QName(c).localname for c in tc_children]}")
+    assert omath_in(tc_children[idx]) == 1, (
+        f"tc[{idx}] 里没有 oMath（回显的单元格下标不是真落点）："
+        f"{[etree.QName(c).localname for c in tc_children]}")
+
+    body_paras = [c for c in body if c.tag == w("p")]
+    assert len(body_paras) == 2, (
+        "公式段落漏到了 body 层（回显说 tc、实际在 body）："
+        f"{[para_text(p) for p in body_paras]}")

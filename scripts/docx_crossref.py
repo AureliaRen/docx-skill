@@ -82,7 +82,10 @@ Examples:
   docx_crossref.py renumber in.docx -o out.docx
   docx_crossref.py list in.docx
 
-Exit codes: 0 success, 1 expected failure (unknown bookmark), 2 usage error.
+Exit codes: 0 success, 1 expected failure (unknown bookmark, bookmark name
+already taken), 2 usage error (``--index`` outside the document, an input path
+that is not a readable .docx, an unknown ``--bookmark-span``/``--vert-align``).
+Nothing a caller can get wrong on the command line produces a traceback.
 """
 from __future__ import annotations
 import _bootstrap  # noqa: F401
@@ -90,10 +93,13 @@ import _bootstrap  # noqa: F401
 import argparse
 import copy
 import json
+import os
 import re
 import sys
+from zipfile import BadZipFile
 
 from docx import Document
+from docx.opc.exceptions import PackageNotFoundError
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
@@ -909,9 +915,86 @@ def _vert_from_args(args) -> str | None:
         return "superscript"
     name = getattr(args, "vert_align", None) or "normal"
     if name not in VERT_ALIGN:
-        raise SystemExit(f"unknown --vert-align: {name} "
-                         f"(known: {sorted(VERT_ALIGN)})")
+        raise UsageError(f"unknown --vert-align: {name} "
+                         f"(known: {', '.join(sorted(VERT_ALIGN))})")
     return VERT_ALIGN[name]
+
+
+# ---- argument guards --------------------------------------------------------
+#
+# ``doc.paragraphs`` is a plain list, so ``doc.paragraphs[999]`` raised
+# ``IndexError: list index out of range`` and the CLI answered with a fourteen
+# line traceback (audit §5.2).  A negative index is the worse half of the same
+# bug: Python reads ``-1`` as "the last paragraph", so ``caption --index -1``
+# wrote the caption onto the wrong paragraph and reported success — a silently
+# corrupted document instead of a crash.
+#
+# Both are *usage* errors, not runtime failures, so they exit 2 with one line
+# on stderr, exactly like argparse already does for a non-numeric ``--index``.
+# The documented exit-1 failures (unknown bookmark, bookmark name already
+# taken) stay exit 1: the command line was fine, the document state was not.
+
+
+class UsageError(SystemExit):
+    """A rejected argument: exit 2, one readable line on stderr, no traceback.
+
+    Subclasses ``SystemExit`` on purpose: the guards in this module replaced
+    bare ``raise SystemExit("…")`` calls and a loose ``IndexError``, and both
+    the library API and the existing tests catch ``SystemExit``.  ``main``
+    catches this subclass first and turns it into exit 2, so the CLI contract
+    changes while every ``except SystemExit`` caller keeps working unchanged.
+    """
+
+
+def open_docx(path: str):
+    """``Document(path)``, turning an unreadable input into a usage error.
+
+    A typo in the path used to surface as a ``PackageNotFoundError`` traceback;
+    the operator gets the same one-line treatment as a bad ``--index`` instead.
+    The two ``os.path`` checks come first because python-docx reports *any*
+    path it cannot treat as a package — missing file, directory, plain text
+    file — as the same ``PackageNotFoundError``, which would make the message
+    useless.
+    """
+    if os.path.isdir(path):
+        raise UsageError(f"is a directory, not a .docx file: {path}")
+    if not os.path.exists(path):
+        raise UsageError(f"no such file: {path}")
+    try:
+        return Document(path)
+    except PackageNotFoundError:
+        raise UsageError(f"not a .docx package (no [Content_Types].xml "
+                         f"inside): {path}") from None
+    except BadZipFile:
+        raise UsageError(f"not a .docx package (broken zip): {path}") from None
+    except OSError as exc:
+        raise UsageError(f"cannot read {path}: {exc}") from None
+
+
+def paragraph_at(doc, index, what: str = "--index"):
+    """``doc.paragraphs[index]``, or a usage error naming the legal range.
+
+    Rejecting a negative *index* is deliberate, and it is a behaviour change:
+    it used to select a paragraph counted from the end (``-1`` = the last one),
+    which put captions, references and bookmarks on the wrong paragraph while
+    still reporting ``ok: true``.
+    """
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise UsageError(
+            f"{what} must be an integer, got {type(index).__name__}: {index!r}")
+    total = len(doc.paragraphs)
+    if total == 0:
+        raise UsageError(
+            f"{what} {index}: this document has no paragraphs to address")
+    if index < 0:
+        raise UsageError(
+            f"{what} {index} is negative: this document has {total} "
+            f"paragraph(s), legal range is 0..{total - 1}")
+    if index >= total:
+        raise UsageError(
+            f"{what} {index} is out of range: this document has {total} "
+            f"paragraph(s), legal range is 0..{total - 1}")
+    return doc.paragraphs[index]
 
 
 # ---- subcommands ------------------------------------------------------------
@@ -925,7 +1008,7 @@ def cmd_caption(doc, args) -> dict:
     updated in place so hand-applied formatting (bold label, coloured text,
     hyperlinks) is not silently lost.
     """
-    target = doc.paragraphs[args.index]
+    target = paragraph_at(doc, args.index)
     p = target._p
     label = args.label
     rpr = _para_rpr(target)
@@ -951,8 +1034,8 @@ def cmd_caption(doc, args) -> dict:
 
     span = getattr(args, "bookmark_span", None) or "number"
     if span not in ("number", "paragraph"):
-        raise SystemExit(f"unknown --bookmark-span: {span} "
-                         "(known: ['number', 'paragraph'])")
+        raise UsageError(f"unknown --bookmark-span: {span} "
+                         "(known: number, paragraph)")
 
     want_ref = bool(getattr(args, "ref_bookmark", False))
     pstyle = getattr(args, "pstyle", None)
@@ -1116,7 +1199,7 @@ def cmd_ref(doc, args) -> dict:
     vert = _vert_from_args(args)
     use_hyperlink = not getattr(args, "no_hyperlink", False)
 
-    target = doc.paragraphs[args.index]
+    target = paragraph_at(doc, args.index)
     rpr = _para_rpr(target)
     cached = _cached_for(doc, args, fmt)
     merge = not getattr(args, "no_mergeformat", False)
@@ -1196,7 +1279,7 @@ def check_crossref_anchors(doc) -> dict:
 
 
 def cmd_bookmark(doc, args) -> dict:
-    target = doc.paragraphs[args.index]
+    target = paragraph_at(doc, args.index)
     names = all_bookmarks(doc)
     name = args.name
     if name in names:
@@ -1378,14 +1461,20 @@ def main() -> int:
     common(p)
 
     args = ap.parse_args()
-    doc = Document(args.path)
-    result = {
-        "caption": lambda: cmd_caption(doc, args),
-        "ref": lambda: cmd_ref(doc, args),
-        "bookmark": lambda: cmd_bookmark(doc, args),
-        "renumber": lambda: cmd_renumber(doc, args),
-        "list": lambda: cmd_list(doc),
-    }[args.cmd]()
+    # usage errors -> exit 2 with one line on stderr; a traceback is never the
+    # answer to something the caller could simply have typed differently.
+    try:
+        doc = open_docx(args.path)
+        result = {
+            "caption": lambda: cmd_caption(doc, args),
+            "ref": lambda: cmd_ref(doc, args),
+            "bookmark": lambda: cmd_bookmark(doc, args),
+            "renumber": lambda: cmd_renumber(doc, args),
+            "list": lambda: cmd_list(doc),
+        }[args.cmd]()
+    except UsageError as exc:
+        print(f"docx_crossref.py: error: {exc}", file=sys.stderr)
+        return 2
 
     if args.cmd != "list":
         out = args.output or args.path

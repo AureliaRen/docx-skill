@@ -656,3 +656,271 @@ class TestFields:
         footers = "".join(z.read(n).decode("utf-8") for n in z.namelist()
                           if n.startswith("word/footer"))
         assert "NUMPAGES" in footers
+
+
+# ------------------------------------------------- spec validation (P6-FIX-C5E)
+#
+# ``docx_create`` reads every key with ``dict.get`` and never complained, so the
+# only possible outcome of a misspelt key was silence: ``{"blockz": [...]}``
+# built a valid, empty document, reported ``"blocks": 0`` and exited 0.  The
+# author had no way to see that the content never went in.
+#
+# The contract these tests pin down:
+#
+#   0  the document was written (JSON on stdout)
+#   1  it was built but is not deliverable (dangling reference, bad bookmark)
+#   2  the *spec* was rejected before anything was written — one readable line
+#      on stderr, no traceback, and no file on disk to mistake for output
+
+
+def _create_raw(tmp_path: Path, spec, name: str = "spec.json"):
+    """Run ``docx_create.py`` on *spec* (a dict, or raw text); return (proc, out).
+
+    ``spec`` as a string is written verbatim, which is how the malformed-JSON
+    case gets its breakage past ``json.dumps``.
+    """
+    spec_path = tmp_path / name
+    if isinstance(spec, str):
+        spec_path.write_text(spec, encoding="utf-8")
+    else:
+        spec_path.write_text(json.dumps(spec, ensure_ascii=False),
+                             encoding="utf-8")
+    out = tmp_path / (name + ".docx")
+    return run_raw("docx_create.py", spec_path, out), out
+
+
+def _create_error(tmp_path: Path, spec, name: str = "spec.json") -> str:
+    """Assert the spec is *rejected* (exit 2, no traceback, no file); return why."""
+    proc, out = _create_raw(tmp_path, spec, name)
+    stderr = proc.stderr.decode("utf-8", "replace")
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert proc.returncode == 2, "expected exit 2, got %d\nstdout: %s\nstderr: %s" \
+        % (proc.returncode, stdout, stderr)
+    assert "Traceback" not in stderr, (
+        "a rejected spec must not raise a traceback:\n" + stderr)
+    assert stderr.strip(), "exit 2 must say what is wrong on stderr"
+    payload = json.loads(stdout)          # stdout stays machine-readable
+    assert payload["ok"] is False
+    assert payload["output"] is None
+    assert not out.exists(), (
+        "exit 2 promises nothing was written, but %s exists" % out)
+    return payload["error"]
+
+
+class TestSpecValidation:
+    """Unknown keys, unknown types and out-of-range values are errors, not no-ops."""
+
+    def test_unknown_top_level_key_is_rejected(self, tmp_path: Path):
+        # The exact failure mode from the audit: ``blocks`` misspelt, so the
+        # whole document was silently empty.
+        error = _create_error(tmp_path, {
+            "blockz": [{"type": "paragraph", "text": "第一章"}],
+        })
+        assert "blockz" in error
+        assert 'did you mean "blocks"' in error, error
+        assert "valid keys here" in error
+
+    def test_unknown_block_key_is_rejected_and_suggests(self, tmp_path: Path):
+        # Both typos in one run: the message must name each one, say which block
+        # it is in, and suggest the real spelling — one fix pass, not two.
+        error = _create_error(tmp_path, {"blocks": [
+            {"type": "heading", "text": "第一章", "levl": 1},
+            {"type": "paragraph", "text": "正文", "stylish": "Body"},
+        ]})
+        assert "blocks[0]" in error and "heading" in error
+        assert "levl" in error and 'did you mean "level"' in error
+        assert "blocks[1]" in error
+        assert "stylish" in error and 'did you mean "style"' in error
+
+    def test_unknown_nested_key_is_rejected(self, tmp_path: Path):
+        # Not only top level / block level: page margins, styles, runs and tab
+        # stops are the same trap, one level deeper.
+        error = _create_error(tmp_path, {
+            "page": {"margins_mm": {"top": 25, "tp": 25}},
+            "blocks": [],
+        })
+        assert "margins_mm" in error and '"tp"' in error, error
+
+    def test_bad_json_is_rejected_without_traceback(self, tmp_path: Path):
+        # Truncated file: json.load used to propagate JSONDecodeError.
+        error = _create_error(
+            tmp_path, '{\n  "blocks": [\n    {"type": "paragraph", "text": "x"}\n',
+            name="broken.json")
+        assert "not valid JSON" in error
+        assert "line" in error and "column" in error
+
+    def test_unknown_block_type_is_rejected(self, tmp_path: Path):
+        error = _create_error(tmp_path, {"blocks": [
+            {"type": "paragraph", "text": "第一段"},
+            {"type": "callout", "text": "未知块类型"},
+        ]})
+        assert "blocks[1]" in error
+        assert "callout" in error
+        # the message lists the vocabulary that would have worked
+        assert "paragraph" in error and "heading" in error
+
+    def test_heading_level_out_of_range_is_rejected(self, tmp_path: Path):
+        # python-docx takes 0..9; 12 used to surface as its own ValueError with
+        # a traceback.  Reported with the range, and *not* clamped.
+        error = _create_error(tmp_path, {"blocks": [
+            {"type": "heading", "text": "越界标题", "level": 12},
+        ]})
+        assert "out of range" in error and "12" in error
+        assert "0..9" in error, error
+        assert "not clamped" in error
+
+    def test_non_numeric_heading_level_is_rejected(self, tmp_path: Path):
+        error = _create_error(tmp_path, {"blocks": [
+            {"type": "heading", "text": "第一章", "level": "1"},
+        ]})
+        assert "whole number" in error, error
+
+    def test_table_row_wider_than_header_is_rejected(self, tmp_path: Path):
+        # ``cells[i]`` used to raise IndexError on the third cell of a 2-column
+        # table — a bare traceback for a one-character spec mistake.
+        error = _create_error(tmp_path, {"blocks": [
+            {"type": "table", "header": ["A", "B"], "rows": [["1", "2", "3"]]},
+        ]})
+        assert "rows[0]" in error and "3 cells" in error
+        assert "2 column" in error
+
+    def test_valid_spec_still_exits_zero(self, tmp_path: Path):
+        """Guard: the strictness must not reject a spec that was always legal."""
+        png = tmp_path / "pic.png"
+        make_png(png)
+        spec = {
+            "page": {"width_mm": 210, "height_mm": 297,
+                     "margins_mm": {"top": 25, "bottom": 25,
+                                    "left": 20, "right": 20}},
+            "header": "Header",
+            "footer_page_numbers": True,
+            "styles": [{"name": "Note", "base": "Normal", "font": "Arial",
+                        "size_pt": 11, "italic": True,
+                        "outline_level": 2}],
+            "blocks": [
+                {"type": "heading", "text": "Title", "level": 1},
+                {"type": "paragraph", "style": "Note", "text": "Body.",
+                 "first_line_indent_chars": 2, "line_spacing": 1.5},
+                {"type": "bullet_list", "items": ["a", "b"]},
+                {"type": "numbered_list", "items": ["one", "two"],
+                 "num_text": "[%1]", "bookmark_prefix": "ref_"},
+                {"type": "table", "header": ["H1", "H2"],
+                 "rows": [["1", "2"]], "header_bold": True},
+                {"type": "image", "path": str(png), "width_mm": 20},
+                {"type": "page_break"},
+            ],
+        }
+        proc, out = _create_raw(tmp_path, spec, name="ok.json")
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+        payload = json.loads(proc.stdout.decode("utf-8"))
+        assert payload["ok"] is True and payload["blocks"] == 7
+        assert out.exists()
+        text = run("docx_read.py", out, "--text")
+        assert "Body." in "\n".join(text["body"])
+
+    def test_every_documented_block_key_is_accepted(self, tmp_path: Path):
+        """Whitelist reconciliation: every documented key, every block type.
+
+        This is the half of the contract that protects existing specs — the
+        strict check must not mistake a legitimate key for a typo.  Every key
+        named in the module docstring (and read by the builder) appears here at
+        least once; if one is ever dropped from ``BLOCK_KEYS`` this test turns
+        red instead of a user's spec turning red.
+        """
+        png = tmp_path / "ks.png"
+        make_png(png)
+        spec = {
+            "page": {"width_mm": 210, "height_mm": 297, "orient": "portrait",
+                     "margins_mm": {"top": 25, "bottom": 25, "left": 20,
+                                    "right": 20, "header": 12, "footer": 12,
+                                    "gutter": 0}},
+            "header": "Header",
+            "footer": "Footer",
+            # ``font`` / ``size_pt`` / ``bold`` on the page-number field are
+            # documented but currently blow up inside docx_section._rpr
+            # (``qn("ascii")`` without the ``w:`` prefix) — a separate defect,
+            # so the vocabulary test uses the switches that work.
+            "footer_page_numbers": {"template": "page_of", "fmt": "decimal",
+                                    "start": 1, "align": "center",
+                                    "total": "numpages", "prefix": "p ",
+                                    "suffix": " / ",
+                                    "page_type": "default"},
+            "styles": [{"name": "KS", "base": "Normal", "font": "Arial",
+                        "font_east_asia": "SimSun", "size_pt": 12,
+                        "bold": False, "italic": False, "color": "1F4E79",
+                        "outline_level": 2}],
+            "blocks": [
+                {"type": "heading", "text": "第一章", "level": 1,
+                 "alignment": "left", "keep_with_next": True,
+                 "bookmark": "h_book"},
+                {"type": "paragraph", "style": "KS", "text": "正文",
+                 "indent_left_mm": 5, "indent_right_mm": 5,
+                 "first_line_indent_chars": 2, "char_width_pt": 12,
+                 "first_line_indent_font_pt": 12, "line_spacing": 1.5,
+                 "space_before_pt": 3, "space_after_pt": 3,
+                 "alignment": "justify", "keep_with_next": False,
+                 "page_break_before": False, "bookmark": "p_book",
+                 "tab_stops": [{"pos_mm": 100, "align": "right",
+                                "leader": "dot"},
+                               {"pos_cm": 5.0, "align": "left",
+                                "leader": "none"}],
+                 "bottom_border": {"style": "single", "size": 8, "space": 1,
+                                   "color": "000000",
+                                   "sides": ["bottom"]}},
+                {"type": "paragraph", "runs": [
+                    {"text": "plain "},
+                    {"text": "biu", "bold": True, "italic": True,
+                     "underline": True},
+                    {"text": "sup", "vert_align": "superscript"},
+                    {"text": "sup2", "superscript": True},
+                    {"text": "sub", "subscript": True}]},
+                {"type": "bullet_list", "items": ["alpha", {"text": "beta"}],
+                 "style": "List Bullet"},
+                {"type": "numbered_list", "items": ["one", "two"],
+                 "num_text": "[%1]", "num_fmt": "decimal", "start": 1,
+                 "indent_left": 425, "hanging": 425,
+                 "bookmark_prefix": "ref_", "ilvl": 0},
+                {"type": "caption", "label": "图", "text": "示意",
+                 "style": "Caption", "bookmark": "cap_book",
+                 "bookmark_span": "number", "ref_bookmark": True,
+                 "drop_text": False},
+                {"type": "table_caption", "label": "表", "text": "表格题注",
+                 "bookmark": "tcap_book"},
+                {"type": "crossref", "target": "cap_book", "prefix": "如图",
+                 "suffix": "", "format": "default", "cached": "1",
+                 "superscript": True, "vert_align": "superscript",
+                 "hyperlink": True, "own_paragraph": True},
+                {"type": "table", "header": ["列一", "列二"],
+                 "rows": [["1", "2"]], "style": "Table Grid",
+                 "header_bold": True, "caption": "表格题注二",
+                 "caption_label": "表", "caption_bookmark": "tbl_book"},
+                {"type": "image", "path": str(png), "width_mm": 20,
+                 "alignment": "center", "bookmark": "img_book"},
+                {"type": "page_break", "bookmark": "pb_book"},
+                {"type": "toc", "instr": ' TOC \\o "1-3" \\h \\z \\u '},
+                {"type": "section_break", "start_type": "new_page",
+                 "page": {"width_mm": 210, "height_mm": 297,
+                          "orient": "portrait",
+                          "margins_mm": {"top": 25, "bottom": 25,
+                                         "left": 20, "right": 20}},
+                 "header": "第二章页眉", "header_align": "center",
+                 "header_font": "Arial", "header_size_pt": 9,
+                 "header_bold": False,
+                 "footer": "第二节页脚", "footer_align": "center",
+                 "footer_font": "Arial", "footer_size_pt": 9,
+                 "footer_bold": False,
+                 "footer_page_numbers": {"template": "page",
+                                         "fmt": "lowerRoman", "start": 1,
+                                         "align": "right"},
+                 "different_first_page": False, "cols": 1,
+                 "no_footer": False, "reuse_last_paragraph": True,
+                 "apply_to": "next"},
+            ],
+        }
+        proc, out = _create_raw(tmp_path, spec, name="all-keys.json")
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+        payload = json.loads(proc.stdout.decode("utf-8"))
+        assert payload["ok"] is True
+        assert payload["blocks"] == len(spec["blocks"]) == 13
+        assert payload["sections"] == 2
+        assert out.exists()

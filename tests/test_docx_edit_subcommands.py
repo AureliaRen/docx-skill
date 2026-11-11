@@ -21,7 +21,7 @@
 | `style` | `w:pStyle` 真写进目标段（`w:val` = styleId），相邻段**没有** pPr |
 | `normalize` | 合并后 `w:r` 数量下降且**文本逐字不变**；`w:rPr` 不同不合并；带 `w:br` 的 run 是隔离带；空白保留（`xml:space="preserve"`） |
 | `toc` | 段落里有 `TOC` 域，且 `fldChar begin → instrText → separate → 占位文本 → end` 顺序齐全 |
-| `page-numbers` | 页脚出现 `PAGE` 与 `NUMPAGES`，两个域各一套 begin/separate/end |
+| `page-numbers` | 页脚出现 `PAGE` 与 `NUMPAGES`，两个域各一套 begin/separate/end；**幂等**（已有域时 `changed:false`，页脚 XML 逐字节不变，就地重跑连文件 mtime/SHA256 都不动）；页脚原有 run 的文字与加粗一律保留（追加，不整段替换） |
 
 ## 边界用例（非零退出 + 源文件 SHA256 不变）
 
@@ -43,6 +43,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -151,6 +152,18 @@ def field_sequence(p_el) -> list:
 
 def instr_texts(p_el) -> list:
     return [t.text or "" for t in p_el.iter(w("instrText"))]
+
+
+def field_codes(p_el) -> list:
+    """段落里域代码的第一个 token（`PAGE` / `NUMPAGES` / `TOC` …），按出现顺序。"""
+    return [t.split()[0] for t in instr_texts(p_el) if t.split()]
+
+
+def footer_parts(path: Path) -> dict:
+    """``word/footer*.xml`` 的 {部件名: 原始字节}，用于「页脚 XML 变没变」的指纹比对。"""
+    with zipfile.ZipFile(Path(path)) as z:
+        return {n: z.read(n) for n in sorted(z.namelist())
+                if re.fullmatch(r"word/footer\d*\.xml", n)}
 
 
 def pstyle_val(para) -> str | None:
@@ -417,19 +430,27 @@ def test_insert_applies_the_requested_style(tmp_path: Path):
         ("a", "Normal"), ("HEAD", "Heading 1"), ("b", "Normal")]
 
 
-def test_insert_beyond_end_appends_at_tail(tmp_path: Path):
-    """`--index` 超出段落数 → 追加到文末（既有 fallback），JSON 回显的是入参。
+def test_insert_beyond_end_refuses_instead_of_clamping(tmp_path: Path):
+    """`--index` 超出段落数 → **退出 2 + 不写盘**，不再静默追加到文末。
 
-    注意 `inserted_at` 是**参数回显**（99），不是新段真实落点（3）；这条差异已在
-    `docs/reports/P5-A2-REPORT.md` 登记为行为意外，不在此处断言实现应该改。
+    旧实现（P6 前）在 `args.index >= len(paras)` 时落到 `doc.add_paragraph`，
+    于是 `--index 99` 在 3 段文档上把段落追加到**下标 3**，却在 JSON 里回显
+    `inserted_at: 99`——调用方拿到的是一个永远不存在的位置。`P5-A2-REPORT.md`
+    把它登记为「行为意外」，本条按审计 §2.5 的裁定把它改成硬错误。
+
+    断言四件事：退出码 2、stderr 说明合法范围、stdout 没有 JSON、源文件字节不变。
     """
     src = save(tmp_path, "ins3.docx", ["a", "b", "c"])
+    before = sha256(src)
     out = tmp_path / "ins3_out.docx"
-    res = payload(run_edit("insert", src, "--index", 99,
-                           "--text", "TAIL", "-o", out))
-    assert res["inserted_at"] == 99
-    got = Document(str(out))
-    assert [p_.text for p_ in got.paragraphs] == ["a", "b", "c", "TAIL"]
+
+    cp = run_edit("insert", src, "--index", 99, "--text", "TAIL", "-o", out)
+    assert cp.returncode == 2
+    assert "out of range" in cp.stderr
+    assert "[0, 2]" in cp.stderr and "current N=3" in cp.stderr
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
 
 
 def test_insert_with_unknown_style_exits_nonzero_and_keeps_bytes(tmp_path: Path):
@@ -775,23 +796,177 @@ def test_page_numbers_appends_to_an_existing_footer_paragraph(tmp_path: Path):
     assert got.sections[0].footer.paragraphs[0].text == "prevPage 1 of 1"
 
 
-def test_page_numbers_run_twice_duplicates_the_fields(tmp_path: Path):
-    """**非幂等**：跑两次页码会追加第二套域。
+def test_page_numbers_run_twice_is_idempotent(tmp_path: Path):
+    """**幂等**：第二次跑不再插第二套域，而是报 `changed: false` 原样收手。
 
-    这不是本子命令的回归，而是当前实现的既有行为（`cmd_page_numbers` 无去重判断）。
-    钉住它有两个用处：① 任何人加去重逻辑时会在这里红，逼他确认是不是有意的；
-    ② 报告里登记为「重复执行会叠加」的证据。
+    P6-C3 之前这里是反向断言（`"Page 1 of 1Page 1 of 1"`、四段 instrText），
+    钉的是当时的缺陷：`cmd_page_numbers` 没有去重判断，plan 里同一句
+    `page-numbers` 被 apply 两次就叠出两个页码。现在改成断幂等——**这条用例的
+    方向翻了，是有意的**，写在这里以免后来人以为漏了历史。
     """
     src = save(tmp_path, "pn_twice.docx", ["body text"])
     once = tmp_path / "pn_once.docx"
-    payload(run_edit("page-numbers", src, "-o", once))
+    res1 = payload(run_edit("page-numbers", src, "-o", once))
+    assert res1["changed"] is True
+
     twice = tmp_path / "pn_twice_out.docx"
-    payload(run_edit("page-numbers", once, "-o", twice))
+    res2 = payload(run_edit("page-numbers", once, "-o", twice))
+    assert res2["changed"] is False
+    assert res2["footer_fields"] == ["PAGE", "NUMPAGES"]
 
     got = Document(str(twice))
     fp = got.sections[0].footer.paragraphs[0]
-    assert fp.text == "Page 1 of 1Page 1 of 1"
-    assert instr_texts(fp._p) == [" PAGE ", " NUMPAGES ", " PAGE ", " NUMPAGES "]
+    assert fp.text == "Page 1 of 1"
+    assert instr_texts(fp._p) == [" PAGE ", " NUMPAGES "]
+    assert field_codes(fp._p) == ["PAGE", "NUMPAGES"]
+
+
+def test_page_numbers_second_run_keeps_the_footer_xml_byte_identical(tmp_path: Path):
+    """连跑两次，`word/footer*.xml` 逐字节相同（不是「看起来一样」，是字节级）。
+
+    只比 `paragraph.text` 会放过「域插了两套但占位文本恰好相同」这类问题；
+    这里直接比 footer 部件的原始字节，并另外数一遍域个数。
+    """
+    src = save(tmp_path, "pn_idem.docx", ["body text"])
+    once = tmp_path / "pn_idem_once.docx"
+    payload(run_edit("page-numbers", src, "-o", once))
+    before = footer_parts(once)
+    assert before, "第一次跑完必须真的存在 footer 部件"
+
+    twice = tmp_path / "pn_idem_twice.docx"
+    payload(run_edit("page-numbers", once, "-o", twice))
+    after = footer_parts(twice)
+
+    assert sorted(before) == sorted(after)
+    for name in before:
+        assert before[name] == after[name], f"{name} 在第二次跑之后被改写了"
+
+    fp = Document(str(twice)).sections[0].footer.paragraphs[0]
+    # 一个 PAGE + 一个 NUMPAGES，不多不少
+    assert instr_texts(fp._p).count(" PAGE ") == 1
+    assert instr_texts(fp._p).count(" NUMPAGES ") == 1
+    assert fp.text == "Page 1 of 1"
+
+
+def test_page_numbers_in_place_rerun_writes_nothing_at_all(tmp_path: Path):
+    """就地重跑（不带 `-o`）时连文件都不写：SHA256 与 mtime 一字不差。
+
+    这是「幂等」对操作者最实在的含义——同一份 plan 跑两遍，第二遍不该在
+    mtime 上留痕，也不该重打一遍 zip（python-docx 重写会把条目时间戳刷成
+    当前时刻，那样 SHA256 必然变）。
+    """
+    src = save(tmp_path, "pn_inplace.docx", ["body text"])
+    payload(run_edit("page-numbers", src))
+    first_sha, first_mtime = sha256(src), src.stat().st_mtime_ns
+
+    res = payload(run_edit("page-numbers", src))
+    assert res["changed"] is False
+    assert sha256(src) == first_sha
+    assert src.stat().st_mtime_ns == first_mtime
+
+    fp = Document(str(src)).sections[0].footer.paragraphs[0]
+    assert fp.text == "Page 1 of 1"
+
+
+def test_page_numbers_keeps_the_existing_footer_text_and_its_formatting(tmp_path: Path):
+    """页脚原有 run 的文字与加粗必须原样保留，页码**追加**在段尾（不整段替换）。
+
+    断言钉在 run 级，而不是只看 `paragraph.text` 里含「公司机密」——整段替换成
+    `"公司机密Page 1 of 1"` 的单 run 也能让 `text` 断言通过，却已经把格式、
+    书签、域一起丢了。
+    """
+    d = Document()
+    d.add_paragraph("body text")
+    fp = d.sections[0].footer.paragraphs[0]
+    r = fp.add_run("公司机密")
+    r.bold = True
+    src = tmp_path / "pn_keep.docx"
+    d.save(str(src))
+    freeze_docx(src)
+
+    out = tmp_path / "pn_keep_out.docx"
+    payload(run_edit("page-numbers", src, "-o", out))
+
+    footer = Document(str(out)).sections[0].footer
+    assert len(footer.paragraphs) == 1
+    fp = footer.paragraphs[0]
+    assert fp.text == "公司机密Page 1 of 1"
+    # 原 run 还在原位，且加粗没丢
+    assert fp.runs[0].text == "公司机密"
+    assert fp.runs[0].bold is True
+    # 新 run 追加在它后面，不是插在前面
+    assert fp.runs[1].text == "Page "
+    # XML 里第一个 w:r 的文本仍是原文
+    first_run_text = next(
+        t.text for t in fp._p.iter(w("t")) if t.text
+    )
+    assert first_run_text == "公司机密"
+
+
+@pytest.mark.parametrize("form", ["complex", "simple"])
+def test_page_numbers_does_not_stack_on_an_existing_page_field(tmp_path: Path, form):
+    """页脚里**已经有页码域**（Word 存的复杂域 / `w:fldSimple` 简单域）时不再插。
+
+    这两种写法都要认：python-docx 只产复杂域，而 Word 与 LibreOffice 都会产
+    `w:fldSimple`。只认一种，另一类文档就会变成 `第 1 页 Page 1 of 1`。
+    """
+    d = Document()
+    d.add_paragraph("body text")
+    fp = d.sections[0].footer.paragraphs[0]
+    fp.add_run("第 ")
+    if form == "complex":
+        p = fp._p
+        for ftype, extra in (("begin", None), (None, " PAGE "),
+                             ("separate", None), (None, "1"), ("end", None)):
+            r = p.makeelement(w("r"), {})
+            p.append(r)
+            if ftype is not None:
+                fld = r.makeelement(w("fldChar"), {w("fldCharType"): ftype})
+                r.append(fld)
+            elif extra == " PAGE ":
+                it = r.makeelement(w("instrText"), {})
+                it.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                it.text = extra
+                r.append(it)
+            else:
+                t = r.makeelement(w("t"), {})
+                t.text = extra
+                r.append(t)
+    else:
+        fs = fp._p.makeelement(w("fldSimple"), {w("instr"): " PAGE "})
+        r = fs.makeelement(w("r"), {})
+        t = r.makeelement(w("t"), {})
+        t.text = "1"
+        r.append(t)
+        fs.append(r)
+        fp._p.append(fs)
+    fp.add_run(" 页")
+    src = tmp_path / f"pn_has_{form}.docx"
+    d.save(str(src))
+    freeze_docx(src)
+
+    before = footer_parts(src)
+    out = tmp_path / f"pn_has_{form}_out.docx"
+    res = payload(run_edit("page-numbers", src, "-o", out))
+    assert res["changed"] is False
+    assert res["already_present"] == ["PAGE"]
+
+    footer = Document(str(out)).sections[0].footer
+    para = footer.paragraphs[0]
+    assert "Page " not in para.text
+    if form == "complex":
+        # 复杂域的占位结果也是 `<w:r><w:t>`，因此进 `paragraph.text`
+        assert para.text == "第 1 页"
+        assert instr_texts(para._p) == [" PAGE "]
+    else:
+        # `w:fldSimple` 的结果 run 不是 paragraph 的直接子元素，
+        # python-docx 的 `.text` 看不到它（只剩 "第  页"）——所以按 XML 断。
+        assert para.text == "第  页"
+        simple = list(para._p.iter(w("fldSimple")))
+        assert len(simple) == 1
+        assert simple[0].get(w("instr")) == " PAGE "
+    # 页脚部件逐字节未变
+    assert footer_parts(out)["word/footer1.xml"] == before["word/footer1.xml"]
 
 
 # ===========================================================================
@@ -800,16 +975,19 @@ def test_page_numbers_run_twice_duplicates_the_fields(tmp_path: Path):
 @pytest.mark.parametrize("cmd,extra,expected", [
     ("delete", ["--index", -1], ["a", "b"]),
     ("style", ["--index", -1, "--style", "Heading 1"], ["a", "b", "c"]),
-    ("insert", ["--index", -1, "--text", "NEG"], ["a", "b", "NEG", "c"]),
 ])
 def test_negative_index_uses_python_semantics(tmp_path: Path, cmd, extra, expected):
     """负数 `--index` 不报错，按 Python 负索引解释（-1 = 最后一段）。
 
     `docx_edit.py` 的按 index 取段的子命令都是直接 `doc.paragraphs[args.index]`
     与 `args.index < len(paras)` 判断，CLI 层没有任何 `>= 0` 校验。于是：
-    `delete --index -1` 删**最后一段**、`style --index -1` 给**最后一段**套样式、
-    `insert --index -1` 落在最后一段**之前**。这是既有行为，不是本轮的期望值；
-    钉住它是为了让「哪天有人加了负索引校验」时这里有红点，逼他确认是不是有意的。
+    `delete --index -1` 删**最后一段**、`style --index -1` 给**最后一段**套样式。
+    这是既有行为，不是本轮的期望值；钉住它是为了让「哪天有人加了负索引校验」时
+    这里有红点，逼他确认是不是有意的。
+
+    **`insert` 已于 P6 从本参数化里摘出**：负数下标插在「最后一段之前」却回显
+    `-1`，与「回显 = 真实落点」的契约冲突，现改为退出 2（见文件末尾
+    `test_insert_negative_index_exits_two_...`）。
     """
     src = save(tmp_path, f"neg_{cmd}.docx", ["a", "b", "c"])
     out = tmp_path / f"neg_{cmd}_out.docx"
@@ -929,3 +1107,172 @@ def test_every_subcommand_reports_json_with_ok_true(tmp_path: Path):
         assert out.is_file(), name
         # 产物必须还能被 python-docx 打开（写盘没写坏 zip）
         Document(str(out))
+
+
+# ===========================================================================
+# insert --index：越界硬报错 + inserted_at = 真实落点（P6 / 审计 §2.5）
+# ===========================================================================
+# 背景（2026-11-11 实测，见 docs/reports/P6-FIX-C2B.md）：旧实现对 `--index`
+# 既不做下界也不做上界校验，两种越界都 exit 0 并回显入参：
+#   --index 99  → 落到 add_paragraph 分支，真实下标 4，JSON 报 99
+#   --index -1  → 走 Python 负索引，插在最后一段之前（下标 3），JSON 报 -1
+# 现在：越界一律 stderr + exit 2，且**一个字节都不写**；`inserted_at` 改为插入后
+# 按元素身份反查出来的真实下标。
+def test_insert_index_equal_to_n_exits_two(tmp_path: Path):
+    """`--index == N`（差一位越界，最容易漏的那个）→ 退出 2，不落盘。
+
+    旧实现里 `args.index < len(paras)` 为假时静默转 append，于是 N 与 99 表现
+    完全相同——这条专门钉住「刚好差一位」也要报错。
+    """
+    src = save(tmp_path, "ins_n.docx", ["a", "b", "c"])
+    before = sha256(src)
+    out = tmp_path / "ins_n_out.docx"
+
+    cp = run_edit("insert", src, "--index", 3, "--text", "X", "-o", out)
+    assert cp.returncode == 2
+    assert "out of range" in cp.stderr
+    assert "[0, 2]" in cp.stderr and "current N=3" in cp.stderr
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("bad", [-1, -2, -99])
+def test_insert_negative_index_exits_two(tmp_path: Path, bad):
+    """负数 `--index` → 退出 2（不再借用 Python 负索引语义）。
+
+    `delete` / `style` 的负索引仍按 Python 语义走（有专门用例钉着）；`insert`
+    特殊在它要**回报落点**：回显 `-1` 而真实插在下标 N-1，是最典型的谎报。
+    """
+    src = save(tmp_path, f"ins_neg{bad}.docx", ["a", "b", "c"])
+    before = sha256(src)
+    out = tmp_path / f"ins_neg{bad}_out.docx"
+
+    cp = run_edit("insert", src, f"--index={bad}", "--text", "X", "-o", out)
+    assert cp.returncode == 2
+    assert "out of range" in cp.stderr
+    assert "[0, 2]" in cp.stderr and "current N=3" in cp.stderr
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
+
+
+def test_insert_boundary_zero_and_last_index_are_ok(tmp_path: Path):
+    """合法边界 `0` 与 `N-1` 行为不变：exit 0、落点等于入参、其余 JSON 键不动。
+
+    这条是「不要修过头」的反向保险：加校验后 0 和 N-1 必须照旧可用，且
+    `ok` / `output` / `text` 三个键一个不少。
+    """
+    src = save(tmp_path, "ins_edge.docx", ["a", "b", "c"])
+
+    out0 = tmp_path / "ins_edge0.docx"
+    res0 = payload(run_edit("insert", src, "--index", 0, "--text", "HEAD",
+                            "-o", out0))
+    assert res0["inserted_at"] == 0
+    assert [p_.text for p_ in Document(str(out0)).paragraphs] == [
+        "HEAD", "a", "b", "c"]
+
+    out_last = tmp_path / "ins_edge_last.docx"
+    res_last = payload(run_edit("insert", src, "--index", 2, "--text", "MID",
+                                "-o", out_last))
+    assert res_last["inserted_at"] == 2
+    assert [p_.text for p_ in Document(str(out_last)).paragraphs] == [
+        "a", "b", "MID", "c"]
+
+    for res, out in ((res0, out0), (res_last, out_last)):
+        assert res["ok"] is True
+        assert res["output"] == str(out)
+
+
+def test_insert_inserted_at_is_the_measured_landing_position(tmp_path: Path):
+    """`inserted_at` 必须是**插入后按元素身份反查**出来的下标，不是入参回显。
+
+    怎么做成真断言（两条独立证据）：
+
+    1. **对象身份**：进程内调 `cmd_insert`，先按住原第 2 段的元素引用，插完断言
+       它被**推到下标 3**、下标 2 换成了别的元素——即新段落确实占住 2。同时
+       `inserted_at == 2`，而这是实现反查出来的值。
+    2. **逐字重复文本**：三段都写同一个词 `dup`，插入的也是 `dup`。此时「按文本
+       搜索第一个 dup」这种假定位完全失效，只能靠位置/身份判断——落点仍然是 2。
+
+    反向自证（把 `cmd_insert` 换回旧的 clamp+回显实现）：本用例在第 1 步就红，
+    因为旧实现下 `--index 99` 之外没有越界可言，但 `inserted_at` 恒等于入参，
+    一旦入参与落点出现分叉（下面的 `--index 99` 分支）它就报不出真实位置。
+    """
+    from types import SimpleNamespace
+
+    import docx_edit as de  # scripts/ 已在模块顶部进 sys.path
+
+    src = save(tmp_path, "ins_measure.docx", ["dup", "b", "dup"])
+    doc = Document(str(src))
+    anchor = body_paragraph_elements(doc)[2]
+
+    res = de.cmd_insert(doc, SimpleNamespace(index=2, text="dup", style=None))
+    after = body_paragraph_elements(doc)
+
+    assert len(after) == 4
+    assert after[3] is anchor, "原第 2 段必须被推到下标 3（对象身份不变）"
+    assert after[2] is not anchor, "下标 2 必须换成新插入的那个元素"
+    assert res["inserted_at"] == 2, "inserted_at 必须是反查出的真实下标"
+    assert [p_.text for p_ in doc.paragraphs] == ["dup", "b", "dup", "dup"]
+
+    # 证据 2：重复文本下 CLI 也必须报真实落点（文本搜索无法区分，只能靠位置）
+    src2 = save(tmp_path, "ins_measure2.docx", ["dup", "b", "dup"])
+    out = tmp_path / "ins_measure2_out.docx"
+    res2 = payload(run_edit("insert", src2, "--index", 1, "--text", "dup",
+                            "-o", out))
+    assert res2["inserted_at"] == 1
+    assert [p_.text for p_ in Document(str(out)).paragraphs] == [
+        "dup", "dup", "b", "dup"]
+
+
+def test_inserted_at_comes_from_the_lookup_not_the_argument(tmp_path: Path,
+                                                            monkeypatch):
+    """`inserted_at` 的**来源**必须是落点反查，不是 `args.index`——用哨兵值证明。
+
+    为什么需要这条（而不是只靠上一条黑盒断言）：在**合法区间内**，回显入参和
+    反查落点在数值上恒等（`insert_paragraph_before` 让新段正好占住该下标），
+    所以「`inserted_at == 2` 且新段在下标 2」这种黑盒断言对「实现改回回显入参」
+    完全免疫——它照样绿。要分开这两种实现，只能钉**数据来源**：把
+    `_body_index_of` 换成一个与入参不相等的哨兵，`inserted_at` 必须跟着哨兵走。
+
+    反向自证：把 `cmd_insert` 的返回改成 `{"inserted_at": args.index, ...}`
+    （校验保留，只退回回显）→ 本条立刻红，报 `0 != 41`。
+    """
+    from types import SimpleNamespace
+
+    import docx_edit as de
+
+    src = save(tmp_path, "ins_src.docx", ["a", "b", "c"])
+    doc = Document(str(src))
+    monkeypatch.setattr(de, "_body_index_of", lambda _doc, _el: 41)
+
+    res = de.cmd_insert(doc, SimpleNamespace(index=0, text="X", style=None))
+    assert res["inserted_at"] == 41, "inserted_at 必须来自 _body_index_of 的返回值"
+
+
+def test_insert_empty_body_accepts_index_zero_only(tmp_path: Path):
+    """空 body（N=0）只剩一个插入点：`0` 合法（= 追加首段），其余退出 2。
+
+    `Document()` 的默认模板 body 里只有 `sectPr`，`doc.paragraphs` 是空列表。
+    合法范围 `[0, N-1]` 在这里退化成空集，若照搬会连「往空文档写第一段」都封死，
+    所以单列这条边界：0 放行、1 与 -1 报错。
+    """
+    src = tmp_path / "empty_body.docx"
+    Document().save(str(src))
+    freeze_docx(src)
+
+    out = tmp_path / "empty_body_out.docx"
+    res = payload(run_edit("insert", src, "--index", 0, "--text", "FIRST",
+                           "-o", out))
+    assert res["inserted_at"] == 0
+    assert [p_.text for p_ in Document(str(out)).paragraphs] == ["FIRST"]
+
+    before = sha256(src)
+    for bad in (1, -1):
+        cp = run_edit("insert", src, "--index", bad, "--text", "NOPE")
+        assert cp.returncode == 2, bad
+        assert "out of range" in cp.stderr
+        assert "current N=0" in cp.stderr
+        assert cp.stdout.strip() == ""
+    assert sha256(src) == before
