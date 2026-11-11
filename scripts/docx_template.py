@@ -7,11 +7,16 @@ Usage:
     python docx_template.py fill template.docx values.json output.docx [--strict]
     python docx_template.py template.docx values.json output.docx      # fill 简写
 
---fix-formulas     After writing, convert linear formulas into native Office Math
-                   OMML (runs docx_mathify on the result). Opt-in; remote lineage.
---no-fix-formulas  Skip the default _/^ marker pass (paired _xx_ / ^xx^ ->
-                   vertAlign runs). The two switches are independent and both
-                   can be used in the same apply.
+--fix-formulas     Opt-in second channel: after writing, convert LaTeX / linear
+                   formulas into native Office Math OMML (runs docx_mathify).
+                   Remote lineage; off by default.
+--no-fix-formulas  Turn off the *default* marker channel (paired _xx_ / ^xx^ ->
+                   vertAlign runs), which is on unless you say otherwise.
+
+                   These two flags drive two separate channels on two separate
+                   defaults (``fix_formulas`` / ``omml_formulas``), and they are
+                   mutually exclusive on the command line: passing both is an
+                   argparse error (exit 2) rather than a silent merge.
 
 ``fill`` 是 hermes 版 CLI 的位置参数形式：不写子命令、直接给三个路径时也走 fill
 （``_with_default_subcommand()`` 自动补上），所以旧脚本不用改。
@@ -37,7 +42,9 @@ Usage:
 2. **``--fix-formulas`` 原版 import 的是 ``scripts/office/fix_formulas.py``**，
    同样不入仓。本版内置一个最小实现：单个 ``w:t`` 内成对 ``_xx_`` → subscript、
    ``^xx^`` → superscript。只用**成对包裹制**——不碰孤立的下划线/尖号，避免把
-   LaTeX 式 ``x_i`` 的裸下划线误伤。
+   LaTeX 式 ``x_i`` 的裸下划线误伤。**注意名字漂移**：原版这个 flag 指的就是这条
+   marker 通道；合并后 ``--fix-formulas`` 已改指 OMML 通道（``dest=omml_formulas``，
+   opt-in 默认关），marker 通道改由默认值（开）+ ``--no-fix-formulas`` 控制。
 3. apply ``--to`` 合并样式时，同名样式只改 rPr/pPr 里 JSON 给到的键，不整段
    覆盖，保住目标文档已有的其余格式。
 4. ElementTree 没有父指针：要把一个 ``w:t`` 拆成多个 run 时不能就地改，
@@ -627,14 +634,25 @@ def main(argv=None):
     a = sp.add_parser("apply", help="apply a template JSON to a new or existing docx")
     a.add_argument("template"); a.add_argument("-o","--output")
     a.add_argument("--to")
-    a.add_argument("--no-fix-formulas", action="store_false", dest="fix_formulas",
-                   default=True,
-                   help="Skip automatic _/^ marker conversion (enabled by default)")
-    a.add_argument("--fix-formulas", action="store_true", dest="omml_formulas",
-                   default=False,
-                   help="After writing, also convert linear formulas into native "
-                        "Office Math OMML (runs docx_mathify; independent of the "
-                        "default _/^ marker pass)")
+    # Two formula channels, two dests, two defaults:
+    #   marker channel -> dest=fix_formulas,   default ON,  ``--no-fix-formulas``
+    #   OMML channel   -> dest=omml_formulas,  default OFF, ``--fix-formulas``
+    # The two names read like a +/- pair but they write different dests, so both
+    # used to be accepted and took effect as an AND: the marker pass switched off
+    # and docx_mathify then received raw ``_xx_`` markers. On a document that
+    # carries markers that conversion fails, yet the CLI still exited 0
+    # (measured 2026-11-11, P6/FIX-C5D). Defaults stay as they were; the pair is
+    # now exclusive so "both" is a usage error instead of a silent merge.
+    fx = a.add_mutually_exclusive_group()
+    fx.add_argument("--no-fix-formulas", action="store_false", dest="fix_formulas",
+                    default=True,
+                    help="Turn off the default marker channel (paired _xx_ / ^xx^ "
+                         "-> vertAlign runs); on unless you pass this")
+    fx.add_argument("--fix-formulas", action="store_true", dest="omml_formulas",
+                    default=False,
+                    help="Opt-in second channel: LaTeX / linear formulas -> native "
+                         "Office Math OMML (docx_mathify), independent of the "
+                         "marker channel")
     f = sp.add_parser("fill", help="fill {{token}} placeholders from a JSON mapping")
     f.add_argument("template", help="input .docx containing {{tokens}}")
     f.add_argument("values", help="JSON file mapping token -> value")
@@ -711,7 +729,7 @@ def main(argv=None):
             out_path = Path(out).resolve()
             try:
                 _run_node(spath, str(out_path))
-                # If --fix-formulas, convert _/^ markers in the freshly created docx
+                # The default marker channel (on unless --no-fix-formulas):
                 if args.fix_formulas:
                     regw()
                     names, blobs = _read_blobs(out_path)

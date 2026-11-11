@@ -20,6 +20,18 @@ Design notes
   left-hand side, so the entry would land outside the extraction root. Drive
   prefixes are detected with `ntpath.splitdrive`, which is a no-op on POSIX (it
   returns an empty drive, so Linux behaves exactly as before).
+* **Windows name rules are part of the contract.** Two more entry shapes are
+  refused because the NTFS/Win32 layer rewrites the name behind our back, and a
+  name that does not survive the round trip breaks `unpack`→`pack` on documents
+  that are supposed to be byte-faithful:
+  * **Reserved device names** — `CON`, `NUL`, `AUX`, `PRN`, `COM0`-`COM9`,
+    `LPT0`-`LPT9`, `CONIN$`, `CONOUT$`, tested case-insensitively on the last
+    component with any extension ignored (`nul`, `CON.txt`). `NUL` accepts the
+    write and discards it, so `unpack()` used to report success for a part that
+    never reached the disk.
+  * **Trailing dot or space** in the last component — `evil.txt ` and `evil3. .`
+    are created as `evil.txt` and `evil3`, so two distinct entries can collide on
+    one file and the directory tree stops matching the archive.
 * **No dependency on `docx_utils`.** Kept standalone so it can be used by any
   script without dragging in the XML helper surface.
 
@@ -46,6 +58,15 @@ class UnsafeArchiveError(ValueError):
     """Raised when an archive entry would escape the extraction root."""
 
 
+#: Names the Win32 layer resolves to a character device no matter which
+#: directory they appear in. `COM0`/`LPT0` are reserved on current Windows too.
+_RESERVED_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(10)]
+    + [f"LPT{i}" for i in range(10)]
+)
+
+
 def _safe_member(name: str) -> str:
     """Normalize a zip entry name, rejecting anything outside the root."""
     if not name:
@@ -60,6 +81,16 @@ def _safe_member(name: str) -> str:
         raise UnsafeArchiveError(
             f"archive entry is absolute (drive prefix): {name!r}"
         )
+    # Not dead code, but conditionally live -- keep it, see the note below.
+    # `zipfile.ZipInfo.__init__` runs every name through `_sanitize_filename`,
+    # which on Windows (``os.sep == "\\"``) rewrites "\\" to "/" *before*
+    # `infolist()` ever returns it. So on Windows this branch cannot fire: a
+    # crafted "a\\..\\..\\evil.txt" reaches us as "a/../../evil.txt" and is
+    # caught by the normpath check instead. On POSIX ``os.sep`` is "/", nothing
+    # is rewritten, and this is the only thing that keeps a foreign archive
+    # (`7-Zip`, `.NET`, or a zip written on Windows) from materialising a
+    # file name containing backslashes. Deleting it would be a silent
+    # behaviour change on Linux/macOS, so it stays.
     if "\\" in name:
         raise UnsafeArchiveError(f"archive entry is not a POSIX path: {name!r}")
     if name.startswith("/"):
@@ -67,6 +98,17 @@ def _safe_member(name: str) -> str:
     norm = posixpath.normpath(name)
     if norm.startswith("..") or norm == "..":
         raise UnsafeArchiveError(f"archive entry escapes the root: {name!r}")
+    last = norm.rsplit("/", 1)[-1]
+    # Win32 resolves "NUL", "nul", "CON.txt" and "word/CON" to devices. "NUL"
+    # swallows the write and reports success, so a part would silently vanish.
+    if last.split(".", 1)[0].strip().upper() in _RESERVED_DEVICE_NAMES:
+        raise UnsafeArchiveError(f"archive entry is a device name: {name!r}")
+    # Win32 strips a trailing dot or space, so "evil.txt " lands as "evil.txt":
+    # two entries collide on one file and the tree stops matching the archive.
+    if last != last.rstrip(" ."):
+        raise UnsafeArchiveError(
+            f"archive entry has a trailing dot or space: {name!r}"
+        )
     return norm
 
 
@@ -86,7 +128,11 @@ def unpack(docx_path: str | Path, out_dir: str | Path) -> Path:
         for info in zf.infolist():
             name = _safe_member(info.filename)
             target = dst / name
-            if info.is_dir() or name.endswith("/"):
+            # `name` is normpath'd, so a trailing "/" cannot survive it; the old
+            # `or name.endswith("/")` half of this test was unreachable. A
+            # directory entry is only detectable through `info.is_dir()`, which
+            # reads the *unnormalized* name.
+            if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +149,13 @@ def pack(src_dir: str | Path, out_path: str | Path,
     reused, and any part present in the original but missing from ``src_dir`` is
     carried over untouched. This keeps round-trips lossless even if a caller only
     edited one part.
+
+    ``original`` is validated, not sniffed: a path that does not resolve to a
+    readable zip archive raises (``ValueError`` for an empty path,
+    ``FileNotFoundError`` for a missing/not-a-file path, ``BadZipFile`` for a
+    file that is not a zip). Silently packing without it produced a .docx that
+    looked fine but had lost every part the caller did not touch. Pass ``None``
+    (the default) to opt out of carry-over entirely.
     """
     src = Path(src_dir)
     out = Path(out_path)
@@ -120,9 +173,22 @@ def pack(src_dir: str | Path, out_path: str | Path,
 
     source = None
     if original is not None:
+        # An empty string is the usual CLI-argument default and must not be read
+        # as "no original": that is exactly the silent downgrade being closed.
+        if str(original).strip() == "":
+            raise ValueError(
+                "original is an empty path; pass None to pack without carry-over"
+            )
         orig = Path(original)
-        if orig.is_file():
+        if not orig.is_file():
+            raise FileNotFoundError(f"original archive not found: {orig}")
+        try:
             source = zipfile.ZipFile(orig)
+        except zipfile.BadZipFile as exc:
+            raise zipfile.BadZipFile(
+                f"original is not a valid zip archive: {orig}"
+            ) from exc
+        try:
             for info in source.infolist():
                 if info.is_dir():
                     continue
@@ -130,6 +196,12 @@ def pack(src_dir: str | Path, out_path: str | Path,
                 order.append(name)
                 if info.compress_type == zipfile.ZIP_STORED:
                     stored.add(name)
+        except BaseException:
+            # An unsafe entry aborts the pack before the writing block below, so
+            # this is the only place that can close the handle. Without it the
+            # original stays open (and locked) on Windows.
+            source.close()
+            raise
 
     # Anything new the caller added goes at the end, in a stable order.
     for name in sorted(present - set(order)):
@@ -165,11 +237,15 @@ Import it instead of running it:
 
     unpack(docx_path, out_dir) -> Path
         Extract every part of a .docx into out_dir. Rejects entries that would
-        escape out_dir (../, absolute paths, Windows drive letters).
+        escape out_dir (../, absolute paths, Windows drive and UNC prefixes) and
+        entries Windows would silently rewrite (device names such as NUL/CON,
+        trailing dots or spaces).
 
     pack(src_dir, out_path, original=None) -> Path
         Zip src_dir into out_path. Pass original= to reuse its entry order and
         compression method, so editing one part keeps the file byte-faithful.
+        A missing, empty or non-zip original raises instead of quietly packing
+        a document without carry-over.
 
     from docx_pack import UnsafeArchiveError
         Raised by both functions for entries that are not safe members.

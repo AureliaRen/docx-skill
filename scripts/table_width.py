@@ -38,6 +38,23 @@ Notes:
     ``auto`` splits it evenly across columns.
   * All w:w values here are dxa (twentieths of a point); 1 cm = 566.93 dxa.
   * Row heights are left alone; this script only touches horizontal geometry.
+
+Exit codes:
+  * ``0``  done.  ``report`` on a document that genuinely has no tables is
+    still ``0`` — reading an empty result is a real answer.
+  * ``1``  usage error, or nothing was written (e.g. a mutating action on a
+    document with no tables reports ``no tables found; nothing written``), or
+    ``word/document.xml`` does not exist at all.
+  * ``2``  the document could not be used: ``word/document.xml`` exists but is
+    not an unpacked Word body part, or is not well-formed XML;
+    also an explicit ``--widths`` list that carries *more* values than the
+    table has columns — dropping the extras would be silent data loss.
+    Nothing is written in either case.
+
+``--widths`` may carry fewer values than the table has columns: the last value
+is repeated to fill the rest (a deliberate convenience, see ``references/
+table-geometry.md``).  That padding is announced on stderr as
+``padded N column(s)`` so it never happens behind the caller's back.
 """
 import _bootstrap  # noqa: F401
 import argparse
@@ -279,13 +296,41 @@ def main():
         return 1
 
     register_all()
-    tree = parse(doc_xml)
+    try:
+        tree = parse(doc_xml)
+    except ET.ParseError as exc:
+        # Truncated unzip, half-downloaded .docx, an HTML error page saved as
+        # .docx: all land here.  Report it -- a traceback scrolls past and the
+        # caller is left believing the document is simply table-free.
+        print(f"error: {doc_xml} is not well-formed XML: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: cannot read {doc_xml}: {exc}", file=sys.stderr)
+        return 2
     root = tree.getroot()
+
+    # Word's body part always has the shape <w:document> ... <w:body>.  A part
+    # that parses but does not match it (the wrong file out of an unpack, a
+    # stray styles.xml, an XML document from some other schema) contains no
+    # <w:tbl> either -- which is exactly what "no tables found" must not mean.
+    if root.tag != wtag("document") or root.find(wtag("body")) is None:
+        got = root.tag.rsplit("}", 1)[-1]
+        print(f"error: {doc_xml} is not a Word document part"
+              f" (root <{got}>, expected <w:document> containing <w:body>)",
+              file=sys.stderr)
+        return 2
 
     tables = _tables(root)
     if not tables:
-        print("no tables found")
-        return 0
+        if args.action == "report":
+            # An empty reading is a real answer for a read-only command.
+            print("no tables found")
+            return 0
+        # For a mutating action the same empty result is *not* success: not a
+        # single width was written, so exit 0 would let a caller believe the
+        # geometry had been pinned.
+        print("no tables found; nothing written", file=sys.stderr)
+        return 1
 
     if args.action == "report":
         for i, t in enumerate(tables, 1):
@@ -312,11 +357,32 @@ def main():
 
     for ti, tbl in enumerate(targets, 1):
         n = _col_count(tbl)
+        # An explicit --widths list is per-column, and the two mismatches are
+        # not the same kind of thing:
+        #   * too many values -> the extras would be dropped silently = data
+        #     loss, so refuse (nothing has been written yet);
+        #   * too few        -> the last value is repeated (documented
+        #     convenience), but say so on stderr: an unannounced pad invents
+        #     widths the caller never asked for.
+        padded = 0
+        if explicit and args.action in ("set", "auto"):
+            if len(explicit) > n:
+                print(f"error: table {ti}: --widths has {len(explicit)} values"
+                      f" but the table has {n} columns; refusing to drop the"
+                      f" extra {len(explicit) - n}",
+                      file=sys.stderr)
+                return 2
+            padded = n - len(explicit)
+            if padded:
+                print(f"warning: table {ti}: --widths has {len(explicit)} values"
+                      f" but the table has {n} columns; padded {padded} column(s)"
+                      f" with {explicit[-1] / 1440 * 2.54:.2f} cm",
+                      file=sys.stderr)
         if args.action == "set":
             if not explicit:
                 print("error: 'set' requires --widths", file=sys.stderr)
                 return 1
-            widths = explicit[:n] + [explicit[-1]] * max(0, n - len(explicit))
+            widths = list(explicit) + [explicit[-1]] * padded
         elif args.action == "sync":
             # prefer the widths the author set on cells; fall back to the grid
             widths = _read_tcw(tbl) or _read_grid(tbl)
@@ -327,7 +393,7 @@ def main():
             widths = widths[:n] + [widths[-1]] * max(0, n - len(widths))
         else:  # auto
             if explicit:
-                widths = explicit[:n] + [explicit[-1]] * max(0, n - len(explicit))
+                widths = list(explicit) + [explicit[-1]] * padded
             else:
                 each = cm_to_dxa(args.content_width / n)
                 widths = [each] * n

@@ -17,6 +17,7 @@ No Office engine is involved anywhere: everything is asserted on the XML.
 """
 from __future__ import annotations
 
+import json
 import sys
 import zipfile
 from pathlib import Path
@@ -570,3 +571,111 @@ def test_rebuild_works_on_a_reopened_file(tmp_path):
     report = toc.build_static_toc(again, title="目录")
     assert report["entries"] == 3
     assert len(again.paragraphs) == first
+
+
+# ---- CLI: --pages must carry exactly one value per entry ---------------------
+#
+# ``--pages`` is mapped by position: the n-th value lands on the n-th entry.  A
+# count mismatch is therefore not a matter of taste — surplus values are dropped
+# and missing ones come out as blank slots, both silently, and a TOC with a blank
+# page number in the middle of a delivered file reads exactly like one that was
+# never paginated.  The library stays tolerant (a caller may pass a partial list
+# on purpose); the *CLI* rejects the mismatch, because there it is a typo.
+#
+# These pin the exit code (2 = usage error), the fact that nothing is written,
+# and — most importantly — that the message names both numbers, so the user can
+# see whether to add or drop values without counting entries by hand.
+
+
+def cli_source(tmp_path, name="pages_src.docx"):
+    """``toc_doc()`` on disk: three headings (levels 1, 2, 3)."""
+    path = tmp_path / name
+    toc_doc().save(path)
+    return path
+
+
+def test_cli_rejects_fewer_pages_than_entries(tmp_path, capsys):
+    src = cli_source(tmp_path)
+    out = tmp_path / "few.docx"
+    code = toc.main([str(src), "-o", str(out), "--pages", "1"])
+    assert code == 2, "a short --pages list must be a usage error, not silence"
+    assert not out.exists(), "a rejected run must not write the output file"
+    err = capsys.readouterr().err
+    assert "1 value" in err and "3 entries" in err, err
+
+
+def test_cli_rejects_more_pages_than_entries(tmp_path, capsys):
+    src = cli_source(tmp_path)
+    out = tmp_path / "many.docx"
+    code = toc.main([str(src), "-o", str(out), "--pages", "1,3,7,9"])
+    assert code == 2, "surplus page numbers used to be dropped silently"
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert "4 value" in err and "3 entries" in err, err
+
+
+def test_cli_accepts_matching_pages_and_writes_the_same_toc(tmp_path, capsys):
+    """The happy path is unchanged: exit 0, JSON report, identical lines."""
+    src = cli_source(tmp_path)
+    out = tmp_path / "match.docx"
+    code = toc.main([str(src), "-o", str(out), "--pages", "1,3,7"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    report = json.loads(captured.out)
+    assert report["entries"] == 3
+    assert report["output"] == str(out)
+
+    written = entries_of(Document(str(out)))
+    assert [all_text(p) for p in written] == [
+        "第一章　静电场1", "1.1　库仑定律3", "1.1.1　点电荷模型7"]
+    # ...and the API, given the same numbers, produces the same lines
+    reference = toc_doc()
+    toc.build_static_toc(reference, pages=["1", "3", "7"])
+    assert [all_text(p) for p in entries_of(reference)] == [
+        all_text(p) for p in written]
+
+
+def test_cli_page_count_follows_the_levels_filter(tmp_path, capsys):
+    """The check counts the entries *this* run would write, not all headings.
+
+    Counting headings would reject a correct ``--levels 1 --pages 1`` on a
+    three-heading document — the exact bug this test exists to catch.
+    """
+    src = cli_source(tmp_path)
+    out = tmp_path / "filtered.docx"
+    code = toc.main([str(src), "-o", str(out), "--levels", "1,2",
+                     "--pages", "1,3"])
+    assert code == 0, capsys.readouterr().err
+    assert [all_text(p) for p in entries_of(Document(str(out)))] == [
+        "第一章　静电场1", "1.1　库仑定律3"]
+
+    out2 = tmp_path / "filtered_bad.docx"
+    code = toc.main([str(src), "-o", str(out2), "--levels", "1,2",
+                     "--pages", "1,3,7"])
+    assert code == 2
+    assert not out2.exists()
+    assert "3 value" in capsys.readouterr().err
+
+
+def test_cli_single_entry_message_is_singular(tmp_path, capsys):
+    doc = Document()
+    doc.add_heading("唯一的标题", level=1)
+    src = tmp_path / "one.docx"
+    doc.save(src)
+    code = toc.main([str(src), "-o", str(tmp_path / "one_out.docx"),
+                     "--pages", "1"])
+    assert code == 0
+    code = toc.main([str(src), "-o", str(tmp_path / "one_bad.docx"),
+                     "--pages", "1,2"])
+    assert code == 2
+    assert "1 entry;" in capsys.readouterr().err
+
+
+def test_cli_omitting_pages_still_writes_empty_slots(tmp_path):
+    """No ``--pages`` at all is the documented "paginate later" mode."""
+    src = cli_source(tmp_path)
+    out = tmp_path / "nopages.docx"
+    assert toc.main([str(src), "-o", str(out)]) == 0
+    assert [all_text(p) for p in entries_of(Document(str(out)))] == [
+        "第一章　静电场", "1.1　库仑定律", "1.1.1　点电荷模型"]

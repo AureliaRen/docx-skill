@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Safety regressions for ``scripts/docx_pack.py``.
 
-Two defects are pinned here:
+Five defect families are pinned here:
 
 * **P0-C — drive-letter traversal.** ``_safe_member`` used to reject only
   ``../`` and names starting with ``/``. ``D:/x.txt`` is not POSIX-absolute, but
@@ -14,9 +14,19 @@ Two defects are pinned here:
   exited 0, doing nothing. ``--help`` must now exit 0 with real output (CI's
   ``--help`` gate requires non-empty output), and any other argument must exit 2
   on stderr.
+* **P6-FIX-C5C — device names.** ``NUL`` (and ``nul``, ``CON.txt``, ``word/CON``)
+  is resolved by Win32 to a character device, so the write was swallowed and
+  ``unpack()`` still reported success; ``CON`` materialised a 1-byte file. Both
+  are now refused.
+* **P6-FIX-C5C — trailing dot or space.** Win32 strips it, so ``"evil.txt "``
+  landed as ``"evil.txt"`` and two entries could collide on one file.
+* **P6-FIX-C5C — silent ``original=`` downgrade.** ``pack(original=<missing>)``,
+  ``original=""`` and ``original=<directory>`` used to be skipped without a
+  word, producing a .docx that had lost every part the caller did not touch.
 
-The normal-unpack test at the end is the reverse guard: it fails if the member
-check is tightened so far that ordinary archives stop extracting.
+The normal-unpack test at the end of the P0 section is the reverse guard: it
+fails if the member check is tightened so far that ordinary archives stop
+extracting.
 """
 from __future__ import annotations
 
@@ -240,3 +250,164 @@ def test_module_introduces_no_argparse():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "argparse" not in text
     assert 'if __name__ == "__main__":' in text
+
+
+# ---------------------------------------------------------------------------
+# 7. P6-FIX-C5C — names Windows rewrites behind our back
+# ---------------------------------------------------------------------------
+# Everything below needs an entry name that Python's own ``zipfile`` cannot
+# produce on Windows: ``ZipInfo.__init__`` runs every name through
+# ``_sanitize_filename``, which rewrites "\\" to "/" when ``os.sep == "\\"``.
+# ``writestr("..\\evil.txt")`` therefore stores "../evil.txt", and the backslash
+# and device-name shapes below would silently degrade into the cases that were
+# already covered. So these fixtures are hand-written ZIPs: local header, stored
+# payload, central directory, EOCD — the name goes in as raw UTF-8 bytes.
+def _raw_zip(path: Path, name: str, data: bytes = b"pwned") -> Path:
+    """Write a one-entry archive whose entry name is stored verbatim."""
+    import struct
+    import zlib
+
+    nb = name.encode("utf-8")
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    time_, date_ = 0, ((2020 - 1980) << 9) | (1 << 5) | 1
+    local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, time_, date_,
+                        crc, len(data), len(data), len(nb), 0) + nb
+    central = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 0,
+                          time_, date_, crc, len(data), len(data), len(nb),
+                          0, 0, 0, 0, 0x20, 0) + nb
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1,
+                       len(central), len(local) + len(data), 0)
+    path.write_bytes(local + data + central + eocd)
+    return path
+
+
+def _landed(root: Path) -> "list[str]":
+    """Real directory entries under ``root``.
+
+    ``Path.exists()`` lies about device names -- stat on ``out/NUL`` succeeds
+    because the device exists, not because unpack() wrote anything -- so landing
+    evidence has to come from a directory walk.
+    """
+    if not root.exists():
+        return []
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+@pytest.mark.parametrize("entry", [
+    "CON", "NUL", "AUX", "PRN", "COM1", "LPT1", "CONIN$", "CONOUT$",
+    "word/CON", "CON.txt", "nul",
+])
+def test_device_name_entries_are_rejected(tmp_path: Path, entry: str):
+    """A device name is not a part: NUL swallowed the write and unpack() still
+    reported success, so the part vanished from an "unpacked" document."""
+    archives = tmp_path / "in"
+    archives.mkdir()
+    evil = _raw_zip(archives / "evil.docx", entry, b"x")
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsafeArchiveError):
+        unpack(evil, out)
+
+    assert _landed(out) == [], f"{entry!r} left {_landed(out)} behind"
+
+
+@pytest.mark.parametrize("entry", ["evil.txt ", "evil2.txt.", "evil3. ."])
+def test_trailing_dot_or_space_is_rejected(tmp_path: Path, entry: str):
+    """Win32 strips a trailing dot/space, so "evil.txt " lands as "evil.txt" and
+    two distinct entries collide on one file."""
+    archives = tmp_path / "in"
+    archives.mkdir()
+    evil = _raw_zip(archives / "evil.docx", entry)
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsafeArchiveError):
+        unpack(evil, out)
+
+    assert _landed(out) == []
+
+
+@pytest.mark.parametrize("entry", [
+    "..\\evil.txt",
+    "a\\..\\..\\evil.txt",
+    "\\\\server\\share\\evil.txt",
+])
+def test_backslash_entries_never_land_outside_root(tmp_path: Path, entry: str):
+    """The backslash branch is a POSIX-only guard, but the promise holds on both
+    platforms: on Windows ``_sanitize_filename`` turns the name into the
+    forward-slash form and the normpath/drive check picks it up instead.
+    Whichever branch fires, nothing may be written."""
+    archives = tmp_path / "in"
+    archives.mkdir()
+    evil = _raw_zip(archives / "evil.docx", entry)
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsafeArchiveError):
+        unpack(evil, out)
+
+    assert _landed(out) == []
+    strays = [p for p in tmp_path.rglob("evil.txt") if archives not in p.parents]
+    assert strays == [], f"unpack() wrote {entry!r} outside the extraction root: {strays}"
+
+
+# ---------------------------------------------------------------------------
+# 8. P6-FIX-C5C — pack(original=...) must not degrade silently
+# ---------------------------------------------------------------------------
+def test_pack_original_missing_raises(tmp_path: Path):
+    """A missing original used to be skipped: the .docx came out looking fine
+    with every part the caller did not touch already gone."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a", encoding="utf-8")
+    out = tmp_path / "out.docx"
+
+    with pytest.raises(FileNotFoundError):
+        pack(src_dir, out, original=tmp_path / "missing.docx")
+    assert not out.exists(), "pack() wrote an archive even though original= was bogus"
+
+
+def test_pack_original_empty_string_raises(tmp_path: Path):
+    """``""`` is the classic argparse default; it must not read as "no original"."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a", encoding="utf-8")
+    out = tmp_path / "out.docx"
+
+    with pytest.raises(ValueError):
+        pack(src_dir, out, original="")
+    assert not out.exists()
+
+
+def test_pack_original_directory_raises(tmp_path: Path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a", encoding="utf-8")
+    adir = tmp_path / "adir"
+    adir.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        pack(src_dir, tmp_path / "out.docx", original=adir)
+
+
+def test_pack_original_not_a_zip_raises_with_path(tmp_path: Path):
+    """Pre-existing behaviour (BadZipFile) is kept, but the message now says
+    which file was rejected."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a", encoding="utf-8")
+    notzip = tmp_path / "notzip.docx"
+    notzip.write_text("i am not a zip", encoding="utf-8")
+
+    with pytest.raises(zipfile.BadZipFile) as excinfo:
+        pack(src_dir, tmp_path / "out.docx", original=notzip)
+    assert "notzip.docx" in str(excinfo.value)
+
+
+def test_pack_without_original_still_packs(tmp_path: Path):
+    """Reverse guard: opting out has to stay a supported, silent-free path."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a", encoding="utf-8")
+    out = tmp_path / "out.docx"
+
+    pack(src_dir, out)
+    assert zipfile.ZipFile(out).namelist() == ["a.txt"]

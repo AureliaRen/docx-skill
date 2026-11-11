@@ -21,7 +21,9 @@ What is asserted here is the measured post-fix behaviour, not a wish list:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import sys
 import zipfile
@@ -36,6 +38,7 @@ from docx import Document                       # noqa: E402
 from docx.shared import Pt, Twips                # noqa: E402
 
 from docx_template import _extract, main as template_main  # noqa: E402
+from _omml import needs_omml                  # noqa: E402  (single-source OMML gate)
 
 # Deliberately different from the python-docx default (Letter, 1in margins) so
 # "did the template land?" is decidable from the output alone.
@@ -223,3 +226,132 @@ def test_existing_output_file_is_overwritten(fixtures):
     assert out.stat().st_size > len(b"stale bytes, not a docx")
     assert TPL_FONT.encode() in part_bytes(out, "word/styles.xml")
     assert sha256(target) == before
+
+
+# ---------------------------------------------------------------------------
+# 8-12. --fix-formulas / --no-fix-formulas: two channels, two defaults, and
+#       "both" must be a usage error instead of a silent merge (P6/FIX-C5D).
+#
+# The audit's complaint was that the two flags read like a +/- pair while
+# actually writing two different dests:
+#     --no-fix-formulas -> dest=fix_formulas  (marker channel, default ON)
+#     --fix-formulas    -> dest=omml_formulas (OMML channel,   default OFF)
+# Measured on the pre-fix code (2026-11-11): passing both exited 0, turned the
+# marker channel off, and handed raw ``_xx_`` markers to docx_mathify -- which
+# then failed on any document carrying markers, still with exit 0. What is
+# asserted below is the post-fix contract: defaults unchanged, each single flag
+# unchanged, both together exit 2 with nothing written.
+# ---------------------------------------------------------------------------
+MARKER_PARA = "water H_2_O marker"          # paired _x_ -> vertAlign subscript
+LATEX_PARA = "结论：\\[ \\frac{a}{b} = c \\]"   # structural LaTeX -> OMML
+
+
+@pytest.fixture()
+def formula_docs(fixtures):
+    """A target whose two paragraphs exercise the two channels separately.
+
+    They are kept in *different* paragraphs on purpose: docx_mathify rewrites a
+    paragraph it converts, so a marker and a formula in the same paragraph would
+    make "did the marker channel run?" unobservable.
+    """
+    target = fixtures["tmp"] / "formulas.docx"
+    doc = Document()
+    doc.add_paragraph(MARKER_PARA)
+    doc.add_paragraph(LATEX_PARA)
+    doc.save(target)
+    return {**fixtures, "target": target,
+            "out": fixtures["tmp"] / "formulas_out.docx"}
+
+
+def counts(docx: Path) -> tuple[int, int]:
+    """(vertAlign occurrences, <m:oMath> occurrences) in document.xml."""
+    xml = part_bytes(docx, "word/document.xml").decode("utf-8")
+    return xml.count("vertAlign"), xml.count("<m:oMath")
+
+
+def test_no_formula_flag_keeps_documented_defaults(formula_docs):
+    """No flag: marker channel ON, OMML channel OFF -- exactly the old default."""
+    out = formula_docs["out"]
+
+    rc = run_cli(["apply", str(formula_docs["tpl"]),
+                  "--to", str(formula_docs["target"]), "-o", str(out)])
+
+    assert rc == 0
+    vertalign, omath = counts(out)
+    assert vertalign >= 1, "default marker channel stopped running"
+    assert omath == 0, "the OMML channel is opt-in; it must not run on its own"
+
+
+def test_no_fix_formulas_alone_only_disables_the_marker_channel(formula_docs):
+    out = formula_docs["out"]
+
+    rc = run_cli(["apply", str(formula_docs["tpl"]), "--to",
+                  str(formula_docs["target"]), "-o", str(out), "--no-fix-formulas"])
+
+    assert rc == 0
+    vertalign, omath = counts(out)
+    assert vertalign == 0, "--no-fix-formulas failed to disable the marker channel"
+    assert omath == 0, "the marker flag must not switch the OMML channel on"
+
+
+@needs_omml          # oMath 断言需要 Office；见 docs/reports/P6-FIX-C5D.md
+def test_fix_formulas_alone_adds_omml_and_leaves_marker_channel_on(formula_docs):
+    """The two channels coexist: opting into OMML does not disable the markers.
+
+    ⚠️ 这条断言的是**两条通道同时可见**（`oMath>=1` 且 `vertAlign>=1`），所以
+    必须挂 ``@needs_omml``：CI 四腿没有 Office、`MML2OMML.XSL` 不存在，
+    ``docx_mathify`` 会降级/报错，`oMath` 恒为 0 —— 不挂标记就是必红。
+    断言本身不降级：不能改成 `oMath>=0`，那等于什么都没测。
+    """
+    out = formula_docs["out"]
+
+    rc = run_cli(["apply", str(formula_docs["tpl"]), "--to",
+                  str(formula_docs["target"]), "-o", str(out), "--fix-formulas"])
+
+    assert rc == 0
+    vertalign, omath = counts(out)
+    assert omath >= 1, "--fix-formulas did not convert the LaTeX paragraph to OMML"
+    assert vertalign >= 1, \
+        "--fix-formulas must not turn off the default marker channel"
+
+
+@pytest.mark.parametrize("flags", [
+    ["--fix-formulas", "--no-fix-formulas"],
+    ["--no-fix-formulas", "--fix-formulas"],
+])
+def test_both_formula_flags_are_rejected_with_exit_2(formula_docs, capsys, flags):
+    """Both at once: argparse usage error, exit 2, nothing written."""
+    out = formula_docs["out"]
+
+    rc = run_cli(["apply", str(formula_docs["tpl"]),
+                  "--to", str(formula_docs["target"]), "-o", str(out), *flags])
+    captured = capsys.readouterr()
+
+    assert rc == 2, f"expected argparse's usage exit 2, got {rc}"
+    assert "not allowed with argument" in captured.err, \
+        f"the error must name the conflict, got: {captured.err!r}"
+    assert not out.exists(), "a rejected invocation must not write a document"
+
+
+def test_apply_help_states_the_two_channels_and_their_exclusivity():
+    """--help is the one place a user can see both channels and the XOR."""
+    saved = sys.argv
+    buf = io.StringIO()
+    try:
+        sys.argv = ["docx_template.py", "apply", "--help"]
+        try:
+            with contextlib.redirect_stdout(buf):
+                template_main()
+        except SystemExit as exc:
+            assert exc.code == 0
+    finally:
+        sys.argv = saved
+    # argparse wraps help text at the terminal width, so compare on a flattened
+    # copy: the claim being asserted is the wording, not where the line breaks.
+    flat = " ".join(buf.getvalue().split())
+
+    assert "[--no-fix-formulas | --fix-formulas]" in flat, \
+        "usage line must show the flags as mutually exclusive"
+    assert "Opt-in" in flat, "--fix-formulas must be labelled opt-in"
+    assert "independent of the marker channel" in flat, \
+        "--fix-formulas must be described as a separate channel"

@@ -15,6 +15,9 @@ Everything is XML-level and ``tmp_path`` based, so it runs without Word.
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,9 +31,9 @@ from docx.oxml import OxmlElement                           # noqa: E402
 from docx.oxml.ns import qn                                 # noqa: E402
 
 from docx_crossref import (                                 # noqa: E402
-    CACHED_KIND, MERGE_FORMAT, REF_FORMATS, RPR_ORDER, VERT_ALIGN, all_bookmarks,
-    bookmark_span_text, bookmarked_text, cached_result, cmd_bookmark,
-    cmd_caption, cmd_list, cmd_ref, cmd_renumber, field_elements,
+    CACHED_KIND, MERGE_FORMAT, REF_FORMATS, RPR_ORDER, VERT_ALIGN, UsageError,
+    all_bookmarks, bookmark_span_text, bookmarked_text, cached_result,
+    cmd_bookmark, cmd_caption, cmd_list, cmd_ref, cmd_renumber, field_elements,
     hyperlink_wrap, list_number_for, paragraph_text, with_vert_align,
 )
 from docx_numbering import cmd_define, set_numpr              # noqa: E402
@@ -573,3 +576,174 @@ def test_renumber_skips_above_below_that_carries_mergeformat(doc):
     fixed = cmd_renumber(doc, Args())
     assert fixed["ref_updated"] == 0 and fixed["ref_skipped"] == 1
     assert wrapped_texts(P(doc, 3)) == ["above"]
+
+
+# ---------------------------------------------------------------------------
+# 8. a bad --index is a usage error, not a traceback (audit §5.2)
+#
+# ``doc.paragraphs`` is a plain list, so ``doc.paragraphs[999]`` answered with
+# a fourteen-line ``IndexError`` traceback and exit 1.  The negative half of
+# the same bug was worse: Python reads ``-1`` as "the last paragraph", so
+# ``caption --index -1`` captioned a paragraph the caller never named and
+# printed ``ok: true``.  Both now exit 2 with one line on stderr that names the
+# legal range, and the documented exit-1 failures (unknown bookmark) keep
+# exit 1 so a script can still tell "you typed it wrong" from "the document
+# does not have what you asked for".
+# ---------------------------------------------------------------------------
+CLI = SCRIPTS / "docx_crossref.py"
+
+
+def run_cli(*args):
+    """Run the real CLI in a subprocess: ``(returncode, stdout, stderr)``."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    p = subprocess.run([sys.executable, str(CLI)] + [str(a) for a in args],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env)
+    return p.returncode, p.stdout, p.stderr
+
+
+@pytest.fixture()
+def cli_doc(tmp_path):
+    """A three-paragraph .docx on disk plus a bookmark called ``ref_1``."""
+    path = tmp_path / "doc.docx"
+    d = Document()
+    for i in range(3):
+        d.add_paragraph(f"正文 {i}")
+    d.save(str(path))
+    code, _, err = run_cli("bookmark", path, "--index", "1", "--name", "ref_1")
+    assert code == 0, err
+    return path
+
+
+def one_line(err: str) -> str:
+    lines = [ln for ln in err.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {err}"
+    return lines[0]
+
+
+def test_caption_index_out_of_range_is_a_usage_error(cli_doc):
+    code, out, err = run_cli("caption", cli_doc, "--index", "999",
+                             "--label", "图", "--text", "x")
+    assert code == 2, err
+    assert "Traceback" not in err
+    assert "out of range" in one_line(err) and "0..2" in err
+    assert out == ""
+
+
+def test_caption_negative_index_is_a_usage_error(cli_doc):
+    """``-1`` used to caption the *last* paragraph and still return ok."""
+    code, out, err = run_cli("caption", cli_doc, "--index", "-1",
+                             "--label", "图", "--text", "x")
+    assert code == 2, err
+    assert "Traceback" not in err
+    assert "negative" in one_line(err) and "0..2" in err
+    assert out == ""
+    # the last paragraph was not touched: the file on disk is unchanged
+    saved = Document(str(cli_doc))
+    assert "图" not in paragraph_text(saved.paragraphs[-1]._p)
+
+
+def test_bookmark_index_out_of_range_is_a_usage_error(cli_doc):
+    code, out, err = run_cli("bookmark", cli_doc, "--index", "999",
+                             "--name", "bm_x")
+    assert code == 2, err
+    assert "Traceback" not in err
+    assert "out of range" in one_line(err)
+
+
+def test_bookmark_negative_index_is_a_usage_error(cli_doc):
+    code, _, err = run_cli("bookmark", cli_doc, "--index", "-3", "--name", "bm_y")
+    assert code == 2, err
+    assert "negative" in one_line(err)
+
+
+def test_ref_index_out_of_range_is_a_usage_error(cli_doc):
+    code, out, err = run_cli("ref", cli_doc, "--index", "999", "--target", "ref_1")
+    assert code == 2, err
+    assert "Traceback" not in err
+    assert "out of range" in one_line(err)
+    assert out == ""
+
+
+def test_index_on_a_document_without_paragraphs_is_a_usage_error(tmp_path):
+    path = tmp_path / "empty.docx"
+    Document().save(str(path))
+    code, _, err = run_cli("caption", path, "--index", "0", "--label", "图")
+    assert code == 2, err
+    assert "no paragraphs" in one_line(err)
+
+
+def test_unknown_bookmark_still_exits_1(cli_doc):
+    """The one documented exit-1 failure must not be swallowed into exit 2."""
+    code, out, err = run_cli("ref", cli_doc, "--index", "1", "--target", "nope")
+    assert code == 1, err
+    assert "Traceback" not in err
+    assert "no such bookmark" in one_line(err)
+    assert out == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "not-a-docx"])
+def test_unreadable_input_is_a_usage_error(tmp_path, kind):
+    target = {"missing": tmp_path / "nope.docx",
+              "directory": tmp_path,
+              "not-a-docx": tmp_path / "plain.txt"}[kind]
+    if kind == "not-a-docx":
+        target.write_text("not a package", encoding="utf-8")
+    code, out, err = run_cli("caption", target, "--index", "0", "--label", "图")
+    assert code == 2, err
+    assert "Traceback" not in err
+    line = one_line(err)
+    assert {"missing": "no such file",
+            "directory": "is a directory",
+            "not-a-docx": "not a .docx package"}[kind] in line
+    assert out == ""
+
+
+def test_legal_index_still_writes_the_caption(cli_doc):
+    """The fix must not touch the working path: same JSON, same document."""
+    code, out, err = run_cli("caption", cli_doc, "--index", "2",
+                             "--label", "图", "--text", "架构")
+    assert code == 0, err
+    assert err.strip() == ""
+    payload = json.loads(out)
+    assert payload["ok"] is True and payload["bookmark"] == "图_1"
+    saved = Document(str(cli_doc))
+    assert "图 1" in paragraph_text(saved.paragraphs[2]._p)
+
+
+def test_paragraph_at_reports_the_legal_range_for_api_callers():
+    d = Document()
+    d.add_paragraph("only one")
+    with pytest.raises(UsageError) as e:
+        cmd_caption(d, Args(index=5, label="图", text="", bookmark=None))
+    assert "out of range" in str(e.value) and "0..0" in str(e.value)
+    with pytest.raises(UsageError):
+        cmd_bookmark(d, Args(index=-1, name="bm"))
+    with pytest.raises(UsageError):
+        cmd_ref(d, Args(index=9, target="ghost", prefix="", suffix="",
+                        format="default", cached=None, allow_missing=True))
+
+
+def test_non_integer_index_from_the_api_is_a_usage_error():
+    d = Document()
+    d.add_paragraph("only one")
+    with pytest.raises(UsageError) as e:
+        cmd_ref(d, Args(index="0", target="ghost", prefix="", suffix="",
+                        format="default", cached=None, allow_missing=True))
+    assert "must be an integer" in str(e.value)
+
+
+def test_unknown_bookmark_span_is_a_usage_error(doc):
+    with pytest.raises(UsageError):
+        caption(doc, 1, text="架构", bookmark_span="nonsense")
+
+
+def test_unknown_vert_align_is_a_usage_error(doc):
+    r = caption(doc, 1, text="架构")
+    with pytest.raises(UsageError):
+        ref(doc, 2, r["bookmark"], vert_align="sideways")
+
+
+def test_usage_error_keeps_the_system_exit_contract():
+    """Why the older ``pytest.raises(SystemExit)`` tests still pass."""
+    assert issubclass(UsageError, SystemExit)

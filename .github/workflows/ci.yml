@@ -195,15 +195,63 @@ jobs:
         # the stylesheet is absent; everything else must pass.
         #
         # Exit code alone is not enough: pytest exits 0 when a whole block of
-        # tests has been turned into skips. The counts are asserted below.
+        # tests has been turned into skips. The gate below judges a *property*
+        # of the run instead of a pair of snapshot numbers (P5-AUDIT-QUALITY
+        # section 4, "the gate verifies a count, not a surface").
         #
-        # The numbers are the hosted-runner reality, not this workstation:
-        #   passed  >= 1356, skipped <= 372
+        # THE GATE -- four checks, no snapshot arithmetic:
+        #
+        #   1. FAILURES ARE NEVER ALLOWED.  failed == 0 and errors == 0.
+        #
+        #   2. IDENTITY: every collected test must be accounted for.
+        #        passed + skipped + failed + errors + xfailed + xpassed == collected
+        #      `collected` comes from a separate `--collect-only` process, i.e.
+        #      from pytest's own collector rather than from the run being judged.
+        #      A test that is collected but never reported -- dropped by a
+        #      conftest change, lost to a bad selector, silently not imported --
+        #      breaks the identity. With nothing failing and no xfail in the
+        #      suite this reduces to the plain `passed + skipped == collected`.
+        #
+        #   3. FLOOR: passed >= MIN_PASSED (1441, measured on a simulated
+        #      runner after the P6 batch; see the arithmetic below). Monotone: it only ever moves
+        #      up, so tests that really execute can never quietly stop
+        #      executing. This is also what catches a single pass -> skip flip,
+        #      which the identity cannot see (moving one test between two
+        #      buckets preserves the total).
+        #
+        #   4. SKIP RATIO CEILING: skipped <= collected / 4 (25%).
+        #      A ratio, not a count: adding a new test that skips on CI (no
+        #      Office on the runner) can no longer force a false red, while a
+        #      whole category of tests degrading into skips still trips it.
+        #      Today 374/1815 = 20.6%, i.e. about 80 slots of slack.
+        #
+        # What replaced what, and why (P5-AUDIT-QUALITY 4.1-4.3 and 10 item 8):
+        #   MIN_PASSED was 1356 when this gate was written (P5). It was never the
+        #     problem: it is a monotone floor and its zero headroom is the point
+        #     of it. The P6 batch added 88 tests that really run on the runner,
+        #     so following this file's own rule the floor moved to 1441.
+        #   MAX_SKIPPED = 372 (371 measured + 1 headroom) is deleted. A
+        #     one-test headroom is a snapshot: every new skip-on-CI test turned
+        #     all four legs red and demanded a magic-number edit in the same
+        #     commit -- the audit's "false red" finding. The ratio ceiling
+        #     replaces it. The single pass -> skip flip the old ceiling caught
+        #     immediately is now caught by the floor (check 3), because `passed`
+        #     sits on that floor: the floor is a measurement, not slack.
+        #
+        # The numbers are the hosted-runner reality, not this workstation.
+        # P6 measurement (2026-11-11, after the P6 fix batch; this is the
+        # current truth): 1441 passed / 374 skipped / collected 1815.
+        # P5 measurement (historical, do not use as the floor):
+        #   passed 1356 / skipped 371 / collected 1727.
         # Re-measured on a simulated runner after the P5 round landed
         # (no Office -> no MML2OMML.XSL, no _smoke/ in the parent dir, no
         # work/r7_final/): 1356 passed / 371 skipped / collect 1727.
+        # A developer machine with Office reports 1576 passed / 239 skipped on
+        # the same collect 1815 (P6 numbers; before P6 it was 1488 / 239 on
+        # collect 1727) -- the ~135 extra passes are the OMML-dependent tests
+        # flipping back to pass. Do NOT use that number here.
         #
-        # How that number is built, so the next person can audit it instead of
+        # How the floor is built, so the next person can audit it instead of
         # just bumping it:
         #   A1 baseline (before RT-001/002/007/008/009)      1293 / 359
         #   + RT-009 test_fonts.py   9 -> 13 tests           +4  /   0   (they run
@@ -219,45 +267,55 @@ jobs:
         #   + P5 P0  test_docx_pack_safety.py 14 tests      +14 /   0
         #   + P5 P0  test_docx_template_output.py 7 tests    +7 /   0   (neither
         #                                            file touches the OMML chain)
-        #   =                                                1356 / 371
-        # A developer machine with Office reports ~1488 passed / 239 skipped
-        # because 125 OMML tests and 1 _smoke test really execute there -- do
-        # NOT use that number here.
+        #   =                                                1356 / 371   (P5)
+        #   + P6 batch (9 test files touched, +88 tests total)  +85 /  +3
+        #        measured aggregate only -- the per-file split was not
+        #        verified one by one, so it is deliberately not written here.
+        #        The +3 skips are tests that need the XSL at run time.
+        #   =                                                1441 / 374  (P6)
         #
-        # The floor only ever moves up: every new block that runs on the runner
-        # is added to it, so losing those tests trips the floor instead of
-        # passing silently. The ceiling keeps the documented "measured + 1"
-        # headroom.
-        #
-        # skipped is bounded above, not pinned: the count moves whenever a spec
-        # file is added or _smoke starts shipping. A *rise* past the bound means
-        # a block of tests stopped running and needs a human look; a *drop* is
-        # fine. The headroom is deliberately small (1) -- if a new test file
-        # adds skip-on-CI cases, this bound must be raised in the same commit.
+        # Adding tests from now on (details in docs/reports/P6-FIX-C4.md):
+        #   new test that RUNS on the runner  -> raise MIN_PASSED to the freshly
+        #                                        measured `passed`. Nothing else.
+        #   new test that SKIPS on the runner -> change nothing at all: the
+        #                                        identity follows `collected` and
+        #                                        the ratio ceiling has slack.
+        #   either way, do not reintroduce a skipped-count constant.
         shell: bash
         run: |
           set -uo pipefail
-          log=$(mktemp)   # not ./pytest.log: keep the checkout clean for later steps
+          log=$(mktemp)          # not ./pytest.log: keep the checkout clean
+          collect_log=$(mktemp)
           python -m pytest tests/ --tb=short -q > "$log" 2>&1
           status=$?
           tail -n 30 "$log"
           if [ "$status" -ne 0 ]; then
-            rm -f "$log"
+            rm -f "$log" "$collect_log"
             echo "::error::pytest exited $status"
             exit 1
           fi
-          python - "$log" <<'PY'
+          # The identity needs an independent denominator, so ask pytest's own
+          # collector -- in a separate process -- how many tests exist at all.
+          python -m pytest tests/ --collect-only -q > "$collect_log" 2>&1
+          cstatus=$?
+          if [ "$cstatus" -ne 0 ]; then
+            rm -f "$log" "$collect_log"
+            echo "::error::--collect-only exited $cstatus; cannot establish the identity denominator"
+            exit 1
+          fi
+          python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1356   # simulated-runner measurement, not a local number
-          MAX_SKIPPED = 372   # 371 measured + 1 headroom; breakdown in the step comment
+          MIN_PASSED = 1441                        # monotone floor, simulation below
+          SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
-          log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          collect_log = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
 
           # The summary is the last line carrying a duration, e.g.
-          #   "1293 passed, 359 skipped in 29.63s"
+          #   "1441 passed, 374 skipped, 5 warnings in 61.23s"
           summary = None
-          for line in log.splitlines():
+          for line in run_log.splitlines():
               if re.search(r"\bin\s+\d+(?:\.\d+)?s", line) and re.search(r"\d+ (?:passed|failed|error)", line):
                   summary = line
           if summary is None:
@@ -269,22 +327,60 @@ jobs:
               m = re.search(r"(\d+) " + word, summary)
               return int(m.group(1)) if m else 0
 
-          passed, skipped, failed, errors = count("passed"), count("skipped"), count("failed"), count("errors?")
+          passed, skipped = count("passed"), count("skipped")
+          failed, errors = count("failed"), count("errors?")
+          xfailed, xpassed = count("xfailed"), count("xpassed")
+
+          collected = None
+          for line in collect_log.splitlines():
+              m = re.match(r"(\d+) tests? collected", line.strip())
+              if m:
+                  collected = int(m.group(1))
+          if collected is None:
+              print("::error::no 'N tests collected' line in the --collect-only output; "
+                    "cannot verify the identity")
+              sys.exit(1)
+          print(f"collected={collected} (from --collect-only)")
+
+          accounted = passed + skipped + failed + errors + xfailed + xpassed
+          ceiling = collected * SKIP_RATIO_NUM // SKIP_RATIO_DEN
           bad = 0
+
           if failed or errors:
               print(f"::error::{failed} failed / {errors} error -- failures are never allowed")
               bad = 1
+          if accounted != collected:
+              print(
+                  f"::error::identity broken: passed({passed}) + skipped({skipped}) + failed({failed})"
+                  f" + errors({errors}) + xfailed({xfailed}) + xpassed({xpassed}) = {accounted},"
+                  f" but --collect-only collected {collected}."
+                  f" {collected - accounted} test(s) were collected and never reported;"
+                  f" a test that cannot run is not a test that passed"
+              )
+              bad = 1
           if passed < MIN_PASSED:
-              print(f"::error::passed={passed} is below the floor {MIN_PASSED}; tests were lost, not fixed")
+              print(
+                  f"::error::passed={passed} is below the floor {MIN_PASSED}; tests stopped"
+                  f" executing (deleted, or flipped from pass to skip). The floor only moves up"
+              )
               bad = 1
-          if skipped > MAX_SKIPPED:
-              print(f"::error::skipped={skipped} exceeds the ceiling {MAX_SKIPPED}; a block of tests stopped running")
+          if skipped * SKIP_RATIO_DEN > collected * SKIP_RATIO_NUM:
+              print(
+                  f"::error::skipped={skipped} is over {ceiling} (collected={collected} /"
+                  f" {SKIP_RATIO_DEN}); a whole category of tests stopped running"
+              )
               bad = 1
-          print(f"passed={passed} (>= {MIN_PASSED}), skipped={skipped} (<= {MAX_SKIPPED}), failed={failed}")
+
+          ratio = (100.0 * skipped / collected) if collected else 0.0
+          print(
+              f"passed={passed} (>= {MIN_PASSED}) | skipped={skipped} (<= {ceiling} ="
+              f" {ratio:.1f}% of {collected}) | failed={failed} errors={errors}"
+              f" | accounted={accounted} vs collected={collected}"
+          )
           sys.exit(1 if bad else 0)
           PY
           # Re-exit with the parser's status: a trailing `rm` would otherwise
           # become the step's exit code and mask a real failure.
           rc=$?
-          rm -f "$log"
+          rm -f "$log" "$collect_log"
           exit $rc

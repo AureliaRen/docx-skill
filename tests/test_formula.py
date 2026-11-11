@@ -24,6 +24,7 @@ Run:  python -m pytest tests/ -v
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -271,9 +272,20 @@ W_NS = math_omml.W_NS
 
 
 # --------------------------------------------------------------- helpers
-def run_cli(script: str, *args) -> subprocess.CompletedProcess:
-    """以子进程跑 argparse CLI；环境对齐 hermes e2e 的口径。"""
+def run_cli(script: str, *args, env_extra: dict | None = None) -> subprocess.CompletedProcess:
+    """以子进程跑 argparse CLI；环境对齐 hermes e2e 的口径。
+
+    ``env_extra`` 用于单条用例改写环境（如把 ``MML2OMML_XSL`` 指到不存在的
+    路径来复现「缺 XSL」）；传 ``None`` 表示删掉该变量，避免宿主机上的残留
+    值影响判定。不改写时行为与旧签名完全一致。
+    """
     env = dict(os.environ, LC_ALL="C", PYTHONIOENCODING="utf-8")
+    env.pop("MML2OMML_XSL", None)
+    for k, v in (env_extra or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     return subprocess.run(
         [sys.executable, str(SCRIPTS / script), *map(str, args)],
         capture_output=True, env=env, check=False,
@@ -524,3 +536,134 @@ def test_smoke_baseline_out_tnr():
     assert proc.returncode == 0, proc.stdout.decode("utf-8", "replace")
 
     assert "word/document.xml" in names
+
+
+# ===========================================================================
+# 5. CLI 契约（P6-FIX-C5F）：落点标志互斥 + 退出码 3 真的可达
+#
+# 这一组锁的是**命令行行为**，不是公式内容。审计口径（CLI-AUDIT P2）：
+# `docx_mathify.py in.docx --inplace -o out.docx` 曾静默忽略 `-o` —— out.docx
+# 不生成、输入文件反被覆盖，退出码还是 0。所以三条断言缺一不可：退出码、
+# 「两边文件都没被改」、以及备份文件没被创建（证明连备份分支都没进）。
+#
+# 三条落点用例刻意用**可降级片段**（`$P = I^{2}R$` 落成文字角标 run），
+# 全程不碰 MML2OMML.XSL —— 这样它们在无 Office 的 CI 上也照跑，不 skip。
+# 退出码 3 的用例反过来：用真分式 + 把 XSL 指到不存在的路径，任何机器上都
+# 必然失败，同样不依赖宿主机装没装 Office。
+# ===========================================================================
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _degradable_docx(tmp_path: Path, name: str = "in.docx") -> Path:
+    """纯上下标片段：落成文字 run + vertAlign，不需要 XSL 也不产 OMML。"""
+    from docx import Document
+
+    src = tmp_path / name
+    doc = Document()
+    doc.add_paragraph(r"功率 $P = I^{2}R$ 结束")
+    doc.save(str(src))
+    return src
+
+
+def _structural_docx(tmp_path: Path, name: str = "in.docx") -> Path:
+    r"""含真分式：必走 OMML 分支（``\frac`` 在 ``_STRUCTURAL_CMDS`` 里）。"""
+    from docx import Document
+
+    src = tmp_path / name
+    doc = Document()
+    doc.add_paragraph(r"分压 $U=\frac{U_0}{R_1}$ 结束")
+    doc.save(str(src))
+    return src
+
+
+def test_mathify_rejects_inplace_with_out(tmp_path: Path):
+    """``--inplace`` + ``-o`` 是用法错误：退 2，且**两个文件都不许被碰**。
+
+    反向自证（做完已还原）：把互斥检查换成旧的分流写法，本用例会在
+    ``returncode == 2`` 那一行红 —— 旧版退 0、输入文件被覆盖。
+    """
+    src = _degradable_docx(tmp_path)
+    out = tmp_path / "out.docx"
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--inplace", "-o", out)
+
+    assert proc.returncode == 2, (
+        f"退出码应为 2（用法错误），实际 {proc.returncode}；"
+        f"stdout={proc.stdout.decode('utf-8', 'replace')!r}")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "--inplace" in stderr and "-o" in stderr, (
+        f"报错没说清是哪两个标志冲突：{stderr!r}")
+    assert "error:" in stderr, f"用法错误必须走 stderr 且以 error: 开头：{stderr!r}"
+
+    # a) 源文件字节不变（关键：旧版会就地覆盖它）
+    assert _sha256(src) == before, "报错路径上源文件被改了 —— 判定必须发生在任何读写之前"
+    # b) 没有凭空写出 -o 指定的文件
+    assert not out.exists(), "-o 指定的文件被创建了，说明并没有真的报错退出"
+    # c) 备份分支也没进（进了就说明它还是照着 --inplace 跑了一段）
+    assert not (tmp_path / "in.bak.docx").exists(), "备份文件被创建，说明 --inplace 已开始执行"
+
+
+def test_mathify_out_only_still_writes_out(tmp_path: Path):
+    """单用 ``-o``：退 0，写出 out.docx，源文件一个字节都不动。"""
+    src = _degradable_docx(tmp_path)
+    out = tmp_path / "out.docx"
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "-o", out)
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    assert out.is_file(), "单用 -o 必须写出输出文件"
+    assert _sha256(src) == before, "单用 -o 不该改源文件"
+    assert not (tmp_path / "in.bak.docx").exists(), "单用 -o 不该产生备份"
+
+
+def test_mathify_inplace_only_still_rewrites(tmp_path: Path):
+    """单用 ``--inplace``：退 0，先备份再就地改写，备份 == 原始字节。"""
+    src = _degradable_docx(tmp_path)
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--inplace")
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    bak = tmp_path / "in.bak.docx"
+    assert bak.is_file(), "--inplace 必须先备份"
+    assert _sha256(bak) == before, "备份内容与原文件不一致"
+    assert _sha256(src) != before, "--inplace 没有真的改写源文件（转换没生效？）"
+    # 角标真的落成了 run 级 vertAlign，而不是被整段跳过
+    assert "vertAlign" in doc_xml(src), "纯上下标片段没落成文字角标"
+
+
+def test_mathify_exit_3_when_xsl_missing(tmp_path: Path):
+    """缺 XSL → 文档仍写出，但退出码 3（部分成功），报告里失败数 > 0。
+
+    这条用例是「退出码 3 不是死分支」的**可执行证据**：它把 ``MML2OMML_XSL``
+    指到一个不存在的路径，构造出「环境不可用」这个真实触发条件。宿主机装没装
+    Office 都一样 —— env 覆盖优先生效，挂了也走同一条失败路径。
+
+    反向自证（做完已还原）：把 ``return 3`` 改成 ``return 0``，本用例在
+    ``returncode == 3`` 处红。
+    """
+    src = _structural_docx(tmp_path)
+    out = tmp_path / "out.docx"
+    rep = tmp_path / "report.md"
+    missing = tmp_path / "no_such_dir" / "MML2OMML.XSL"
+
+    proc = run_cli("docx_mathify.py", src, "-o", out, "--report", rep,
+                   env_extra={"MML2OMML_XSL": str(missing)})
+
+    assert proc.returncode == 3, (
+        f"缺 XSL 时退出码应为 3（部分成功），实际 {proc.returncode}；"
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "failed to convert" in stderr, f"stderr 没报出失败数：{stderr!r}"
+
+    # 文档照样写出去了（半成品保留原文，人工可补救）—— 这正是「部分成功」的含义
+    assert out.is_file(), "退 3 时输出文件应当仍然存在"
+    assert "\\frac" in plain_text(out), "失败片段应按原文留住，而不是被吃掉"
+
+    # 报告独立佐证：失败数不是 0
+    assert rep.is_file()
+    text = rep.read_text(encoding="utf-8")
+    assert "失败：0" not in text, "报告里失败数为 0，与退出码 3 自相矛盾"

@@ -538,6 +538,36 @@ def _place(doc, elements, reference) -> None:
             body.append(element)
 
 
+def _wanted_levels(levels):
+    """``(1, 2)`` -> ``{1, 2}``; ``None`` -> ``None``, meaning "no filter".
+
+    One place decides what a ``levels`` argument means, because two callers now
+    need the same answer: :func:`build_static_toc`, and the CLI's
+    ``--pages`` count check — which must count exactly the entries the build
+    would write, or it would reject a correct invocation.
+    """
+    if levels is None:
+        return None
+    try:
+        return {int(level) for level in levels}
+    except (TypeError, ValueError):
+        raise ValueError("levels must be an iterable of ints, got %r"
+                         % (levels,))
+
+
+def select_outline(doc, levels=DEFAULT_LEVELS) -> list:
+    """The outline entries :func:`build_static_toc` would write, in order.
+
+    Same filter, same order: ``collect_outline`` minus the levels nobody asked
+    for.  Exposed (not private) because counting entries before a build is a
+    legitimate caller need — the CLI uses it to check ``--pages`` before it
+    touches the document.
+    """
+    wanted = _wanted_levels(levels)
+    return [entry for entry in collect_outline(doc)
+            if wanted is None or entry["level"] in wanted]
+
+
 def build_static_toc(doc, *, levels=DEFAULT_LEVELS, pages=None, title=None,
                      insert_at=None, indent_chars=DEFAULT_INDENT_CHARS,
                      tab_pos_mm=None, section_index=None,
@@ -546,7 +576,10 @@ def build_static_toc(doc, *, levels=DEFAULT_LEVELS, pages=None, title=None,
 
     * ``levels`` — outline levels to include, e.g. ``(1, 2)``.
     * ``pages`` — ``None`` writes an empty page slot for a later paginator;
-      a sequence is written verbatim, in outline order.
+      a sequence is written verbatim, in outline order.  The API tolerates a
+      short or long sequence (missing values become blank slots, surplus values
+      are unused); the CLI does not — ``--pages`` there must carry exactly one
+      value per entry, because a count mismatch is a typo, not an intent.
     * ``title`` — ``None`` writes no heading line; a string (or
       ``{"text": …}``) writes one, in ``TOC Heading`` when available.
     * ``insert_at`` — index into ``doc.paragraphs`` (after the old TOC has been
@@ -571,13 +604,7 @@ def build_static_toc(doc, *, levels=DEFAULT_LEVELS, pages=None, title=None,
     "dropped_entries", "dropped_titles", "adopted", "section_index",
     "inserted_at"}``.
     """
-    wanted = None
-    if levels is not None:
-        try:
-            wanted = {int(level) for level in levels}
-        except (TypeError, ValueError):
-            raise ValueError("levels must be an iterable of ints, got %r"
-                             % (levels,))
+    wanted = _wanted_levels(levels)
 
     fallback = drop_existing_toc(doc, adopt_unmarked=adopt_unmarked)
     anchor = fallback["anchor"]
@@ -667,6 +694,7 @@ def _pages_arg(text):
 def main(argv=None) -> int:
     import argparse
     import json
+    import sys
     from docx import Document
 
     ap = argparse.ArgumentParser(
@@ -679,8 +707,9 @@ def main(argv=None) -> int:
                          "(default 1,2,3)")
     ap.add_argument("--pages",
                     help="page numbers for the entries, in order, comma "
-                         "separated, e.g. 1,3,7 or i,ii,1. Omit to leave the "
-                         "slots empty for a later pass")
+                         "separated, e.g. 1,3,7 or i,ii,1 — exactly one per "
+                         "entry (a different count is a usage error, exit 2). "
+                         "Omit to leave the slots empty for a later pass")
     ap.add_argument("--title", help="heading text for the TOC itself, "
                                     "e.g. 目录")
     ap.add_argument("--insert-at", type=int, default=None,
@@ -698,11 +727,33 @@ def main(argv=None) -> int:
                     help="report what would be written, save nothing")
     args = ap.parse_args(argv)
 
+    levels = _levels_arg(args.levels)
+    pages = _pages_arg(args.pages) if args.pages else None
+
     doc = Document(args.docx)
+
+    # ``--pages`` is positional-by-ordinal: the *n*-th value lands on the
+    # *n*-th entry.  A count mismatch therefore is not a style question — the
+    # surplus values are dropped and the missing ones come out as blank slots,
+    # both silently, and a TOC with a blank page number in the middle of a
+    # delivered file is indistinguishable from one that was never paginated.
+    # Counting here (before anything is written) turns that into a usage error;
+    # the API stays tolerant, because a caller passing a partial list on purpose
+    # is a different thing from a shell user mistyping a comma.
+    if pages is not None:
+        entries = select_outline(doc, levels)
+        if len(pages) != len(entries):
+            print("error: --pages has %d value(s) but the TOC has %d entr%s; "
+                  "give exactly one page number per entry, or omit --pages to "
+                  "leave the slots empty"
+                  % (len(pages), len(entries), "y" if len(entries) == 1 else "ies"),
+                  file=sys.stderr)
+            return 2
+
     report = build_static_toc(
         doc,
-        levels=_levels_arg(args.levels),
-        pages=_pages_arg(args.pages) if args.pages else None,
+        levels=levels,
+        pages=pages,
         title=args.title,
         insert_at=args.insert_at,
         indent_chars=_levels_arg(args.indent_chars),

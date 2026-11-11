@@ -27,6 +27,23 @@ Usage
    （pandoc issue #11674 的官方修法）。
 3. ``\quad \, \; \: \!`` 与普通空格都会被 XSLT 丢弃 → 默认改写成 ``\ ``（NBSP）。
 
+退出码契约（P6-FIX-C2 起明确，此前是隐含行为）
+---------------------------------------------
+* **0** —— 成功（写入分支或 ``--dump`` 打印）。
+* **2** —— **用法错误**：``--dump`` 与 ``--after``/``--before`` 同时给、
+  ``--after``/``--before`` 给了空串、``--after`` 与 ``--before`` 同时给、
+  LaTeX 转换环境缺失。全部**在任何读写之前**判定，文档一个字节都不动。
+* **1** —— **文档/运行期错误**：``word/document.xml`` 不存在、``<w:body>`` 缺失、
+  marker 在文档里找不到。
+
+不静默说谎的两条硬约束（P6-FIX-C2，依据 P5-AUDIT-QUALITY §5.7）
+--------------------------------------------------------------
+1. **不许静默丢弃参数**：``--dump`` 只打印不写文件，锚点对它毫无意义 ——
+   同时给就明确报错退 2，**不允许**像旧版那样先 ``return 0`` 把 ``--after`` 吞掉。
+2. **不许静默降级落点**：带锚点时公式的落点只报**实测坐标**（``at body[i]`` /
+   ``at tc[i]``，由插入后在树上反查该元素的下标得到），不报入参；
+   marker 找不到时报错里给**实际可搜范围**（正文段落 0-based ``[0, N-1]`` + 单元格数）。
+
 History (2026-10-23)
 --------------------
 重写。旧版手写 OMML 构造器产出 schema 非法结构（``<m:oMath>`` 被嵌进
@@ -102,6 +119,31 @@ def build_para(latex: str, display: bool, raw_spacing: bool = False) -> ET.Eleme
     return para
 
 
+def _locate(body: ET.Element, para: ET.Element) -> tuple[str, int]:
+    """回显**实际**落点：插入后到树上反查该段落的下标，不猜、不回显入参。
+
+    ``insert_near()`` 的容器列表是 ``[body] + list(body.iter(w:tc))``，落点可能是
+    ``<w:body>`` 的直接子元素，也可能在某个 ``<w:tc>`` 里。这里按**对象身份**
+    （``is``）在同样的容器序列里找一遍：找到的下标就是真位置，找不到返回 ``("?", -1)``
+    （宁可报"不知道"，也不编一个数字）。
+
+    下标口径 = **容器自身直接子元素的下标**（含 ``w:sectPr``、``w:tbl``），
+    即 ``body[i]`` 可与 ``<w:body>`` 的子元素序列直接对齐核对。
+    """
+    containers = [("body", body)] + [("tc", c) for c in body.iter(wtag("tc"))]
+    for name, container in containers:
+        for i, child in enumerate(list(container)):
+            if child is para:
+                return name, i
+    return "?", -1
+
+
+def _usage_error(msg: str) -> int:
+    """用法错误统一退 2（与 argparse 自身的参数错误同码）。"""
+    print(f"error: {msg}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Insert native Office Math (OMML) into an unpacked .docx "
@@ -111,12 +153,33 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("formula")
     p.add_argument("--display", action="store_true",
                    help="行间公式（产出 m:oMathPara，居中）")
-    p.add_argument("--after", metavar="MARKER", help="插在该文字段落之后")
-    p.add_argument("--before", metavar="MARKER", help="插在该文字段落之前")
+    p.add_argument("--after", metavar="MARKER",
+                   help="插在该文字段落之后（与 --dump 互斥）")
+    p.add_argument("--before", metavar="MARKER",
+                   help="插在该文字段落之前（与 --after / --dump 互斥）")
     p.add_argument("--raw-spacing", action="store_true",
                    help=r"不改写 \quad \, \; \: \!（注意：这些间距会被 XSLT 丢掉）")
-    p.add_argument("--dump", action="store_true", help="只打印生成的 OMML，不写文件")
+    p.add_argument("--dump", action="store_true",
+                   help="只打印生成的 OMML，不写文件（与 --after/--before 互斥）")
     args = p.parse_args(argv)
+
+    # ---- 用法级校验：全部先于 register_all/build_para/任何读写 ----
+    # 旧版把 --after 的互斥检查放在 --dump 的 return 0 **之后**，于是
+    # `--after X --dump` 会静默把 --after 吞掉（P5-AUDIT-QUALITY §5.7）。
+    # 现在这类矛盾参数一律明确报错退 2，且文档一个字节都不动。
+    if args.dump and (args.after is not None or args.before is not None):
+        return _usage_error(
+            "--dump cannot be combined with --after/--before: --dump only prints "
+            "the OMML and never writes the document, so the anchor would be "
+            "silently ignored. Drop --dump to insert, or drop the anchor to dump.")
+    if args.after is not None and args.before is not None:
+        return _usage_error("--after and --before are mutually exclusive")
+    for _flag, _value in (("--after", args.after), ("--before", args.before)):
+        if _value is not None and not _value.strip():
+            return _usage_error(
+                f"{_flag} was given an empty marker; it would silently append the "
+                "formula at the end of the document instead of anchoring it. "
+                "Omit the flag to append at the end, or pass a non-empty marker.")
 
     register_all()
     regm()
@@ -149,18 +212,22 @@ def main(argv: list[str] | None = None) -> int:
         print("error: <w:body> not found", file=sys.stderr)
         return 1
 
-    if args.after and args.before:
-        print("error: --after and --before are mutually exclusive", file=sys.stderr)
-        return 1
-
-    marker = args.after or args.before
-    position = "after" if args.after else "before"
+    marker = args.after if args.after is not None else args.before
+    position = "after" if args.after is not None else "before"
+    # 可搜范围必须在 insert_near **之前**数：insert_near 的 fallback 会先把公式段
+    # 追加进 body 再返回 False，事后数出来的段数会多 1（自己就成了假报错）。
+    n_body = sum(1 for c in list(body) if c.tag == wtag("p"))
+    n_tc = len(list(body.iter(wtag("tc"))))
     anchored = insert_near(body, marker, position, para)
-    if marker and not anchored:
+    where = _locate(body, para)          # ← 插入**之后**反查，落点是真值
+    if marker is not None and not anchored:
         # Do not silently drop the formula at the end of the document: the
         # caller asked for a specific anchor, and a misplaced equation is harder
-        # to notice than a failed command.
-        print(f"error: marker not found: {marker!r}", file=sys.stderr)
+        # to notice than a failed command. 报错里给实际可搜范围，别让调用方猜。
+        rng = f"0-based [0, {n_body - 1}]" if n_body else "document has none"
+        print(f"error: marker not found: {marker!r} — searched {n_body} body "
+              f"paragraph(s) ({rng}) and {n_tc} table cell(s); no paragraph "
+              "text contains this marker", file=sys.stderr)
         return 1
 
     write(tree, doc_xml)
@@ -168,8 +235,12 @@ def main(argv: list[str] | None = None) -> int:
     # 「修正相量点 N 处」只在真修了才追加，没有相量点的公式（常态）输出与旧版
     # 完全一致，不给下游解析多一个字段。
     note = f"  修正相量点 {_LAST_PHASOR_FIXES} 处" if _LAST_PHASOR_FIXES else ""
+    # 落点回显（P6-FIX-C2）：只在**给了锚点**时追加，且报的是插入后反查到的实测
+    # 下标（`at body[3]` / `at tc[1]`），不是入参。无锚点的追加路径 stdout 与
+    # 旧版逐字节一致，不给既有下游解析加字段。
+    at_note = f"  at {where[0]}[{where[1]}]" if marker is not None else ""
     print(f"Inserted {'display' if args.display else 'inline'} formula: "
-          f"{args.formula}{note}")
+          f"{args.formula}{note}{at_note}")
     if _LAST_PHASOR_ERROR:
         print(f"warning: 相量点修复失败：{_LAST_PHASOR_ERROR}", file=sys.stderr)
     return 0

@@ -99,12 +99,23 @@ and a `toc` block inserts a Table of Contents field. Field results are
 computed by Word/LibreOffice when the file is opened, not by python-docx;
 every field is written with a cached result so the file reads correctly
 before anyone recalculates.
+
+Exit codes — ``0`` the document was written (JSON on stdout); ``1`` it was
+built but is not deliverable (a dangling cross-reference target, an invalid
+or duplicate bookmark name); ``2`` the *spec itself* was rejected **before
+anything was written**.  Code ``2`` prints one readable line to stderr and
+never a traceback: it names the offending key and the nearest legitimate
+spelling, because a misspelt key used to be dropped in silence — the spec
+then built a document with the content missing and still exited ``0``.
+A genuine run-time failure of the builder keeps its exit ``1`` and its
+traceback, so a bug can still be located.
 """
 from __future__ import annotations
 import _bootstrap  # noqa: F401
 
 import argparse
 import contextlib
+import difflib
 import json
 import sys
 from pathlib import Path
@@ -1060,6 +1071,344 @@ def add_block(doc, block: dict) -> list:
     return made
 
 
+# ---- spec validation --------------------------------------------------------
+#
+# Everything above reads a block with ``block.get(...)``, so the only possible
+# outcome of a misspelt key used to be silence: ``{"blockz": [...]}`` built a
+# valid, empty document, printed ``"blocks": 0`` and exited 0, and the author
+# had no way to see that the content never went in.  The vocabulary the builder
+# actually reads is therefore declared here and checked *before* a single
+# paragraph exists.
+#
+# Strict on purpose: an unknown key is an error, not a warning.  Making the
+# author fix a typo is far cheaper than shipping a document that is quietly
+# missing a chapter.  Values are not clamped either — an out-of-range value is
+# reported with the range it would have been clamped into.
+
+# ``SpecError`` is the one exception class that ``main`` turns into exit 2; any
+# other exception keeps exit 1 and its traceback, because that is a builder bug
+# rather than something the spec author can fix.
+class SpecError(Exception):
+    """A spec that asks for something the builder cannot honour."""
+
+
+TOP_LEVEL_KEYS = ("blocks", "footer", "footer_page_numbers", "header", "page",
+                  "styles")
+PAGE_KEYS = ("height_mm", "margins_mm", "orient", "width_mm")
+MARGIN_KEYS = ("bottom", "footer", "gutter", "header", "left", "right", "top")
+STYLE_KEYS = ("base", "bold", "color", "font", "font_east_asia", "italic",
+              "name", "outline_level", "size_pt")
+RUN_KEYS = ("bold", "italic", "subscript", "superscript", "text", "underline",
+            "vert_align")
+TAB_STOP_KEYS = ("align", "leader", "pos_cm", "pos_mm")
+BOTTOM_BORDER_KEYS = ("color", "sides", "size", "space", "style")
+# ``add_page_number_field``'s keyword arguments — a spec may set them at the top
+# level or inside a ``section_break``; an unknown one there is a ``TypeError``
+# at ``**kwargs`` expansion time, i.e. another bare traceback.
+PAGE_NUMBER_KEYS = ("align", "bold", "fmt", "font", "page_type", "prefix",
+                    "size_pt", "start", "suffix", "template", "total")
+# ``char_width_pt`` / ``first_line_indent_font_pt`` are inputs to the character
+# → twips conversion rather than paragraph *outputs*, so they are not in
+# ``PARA_FORMAT_KEYS``; a spec sets them on the same blocks all the same.
+CHAR_WIDTH_KEYS = ("char_width_pt", "first_line_indent_font_pt")
+
+
+def _with_para_format(*keys) -> set:
+    """A block's own keys plus the shared paragraph-format vocabulary."""
+    return set(keys) | set(PARA_FORMAT_KEYS) | set(CHAR_WIDTH_KEYS)
+
+
+BLOCK_KEYS = {
+    "heading": _with_para_format("text", "level"),
+    "paragraph": _with_para_format("text", "runs", "style"),
+    "bullet_list": _with_para_format("items", "style"),
+    "numbered_list": _with_para_format("items", "num_id", "num_text",
+                                       "num_fmt", "start", "indent_left",
+                                       "hanging", "bookmark_prefix", "ilvl",
+                                       "style"),
+    "caption": _with_para_format("label", "text", "style", "pstyle",
+                                 "bookmark_span", "ref_bookmark", "drop_text"),
+    "table_caption": _with_para_format("label", "text", "style", "pstyle",
+                                       "bookmark_span", "ref_bookmark",
+                                       "drop_text"),
+    "crossref": _with_para_format("target", "prefix", "suffix", "format",
+                                  "cached", "superscript", "vert_align",
+                                  "hyperlink", "own_paragraph"),
+    # ``table`` produces no paragraph of its own, and its ``style`` is the
+    # *table* style, so the paragraph vocabulary does not apply to it.
+    "table": {"header", "rows", "style", "header_bold", "caption",
+              "caption_label", "caption_bookmark"},
+    "image": _with_para_format("path", "width_mm"),
+    "page_break": _with_para_format(),
+    "toc": _with_para_format("instr"),
+    # ``section_break`` has its own ``header``/``footer`` keys, so a paragraph
+    # ``alignment`` here would be a silent no-op — exactly what this check
+    # exists to remove.
+    "section_break": {"start_type", "page", "header", "header_align",
+                      "header_font", "header_size_pt", "header_bold",
+                      "footer", "footer_align", "footer_font",
+                      "footer_size_pt", "footer_bold", "footer_page_numbers",
+                      "different_first_page", "cols", "no_footer",
+                      "reuse_last_paragraph", "apply_to"},
+}
+
+
+def _suggestions(key, allowed) -> list:
+    """Nearest legitimate spellings of *key*, best first (may be empty)."""
+    return difflib.get_close_matches(str(key), sorted(allowed), n=2,
+                                     cutoff=0.5)
+
+
+def _check_keys(where: str, obj, allowed, problems: list) -> bool:
+    """Flag every key of *obj* that is not in *allowed*; True for a dict.
+
+    One problem line per object rather than per key: a spec with two typos in
+    one block reads better as one sentence than as two.
+    """
+    if not isinstance(obj, dict):
+        problems.append("%s must be a JSON object, got %s"
+                        % (where, type(obj).__name__))
+        return False
+    unknown = [k for k in obj if k not in allowed]
+    if unknown:
+        named = []
+        for key in unknown:
+            near = _suggestions(key, allowed)
+            named.append('"%s"%s' % (key, ' (did you mean "%s"?)' % near[0]
+                                     if near else ""))
+        problems.append("%s: unknown key %s; valid keys here: %s"
+                        % (where, ", ".join(named), ", ".join(sorted(allowed))))
+    return True
+
+
+def _check_page(where: str, page, problems: list) -> None:
+    if page is None:
+        return
+    if _check_keys(where, page, PAGE_KEYS, problems):
+        margins = page.get("margins_mm")
+        if margins is not None:
+            _check_keys(where + ".margins_mm", margins, MARGIN_KEYS, problems)
+
+
+def _check_page_numbers(where: str, fpn, problems: list) -> None:
+    # ``true`` is the documented shorthand for "the default Page X of Y".
+    if fpn is None or isinstance(fpn, bool):
+        return
+    _check_keys(where, fpn, PAGE_NUMBER_KEYS, problems)
+
+
+def _check_runs(where: str, runs, problems: list) -> None:
+    if runs is None:
+        return
+    if not isinstance(runs, list):
+        problems.append('%s: "runs" must be a list of run objects' % where)
+        return
+    for k, run in enumerate(runs):
+        _check_keys("%s.runs[%d]" % (where, k), run, RUN_KEYS, problems)
+
+
+def _check_items(where: str, items, problems: list) -> None:
+    if items is None:
+        return
+    if not isinstance(items, list):
+        problems.append('%s: "items" must be a list' % where)
+        return
+    for k, item in enumerate(items):
+        if isinstance(item, dict):
+            _check_keys("%s.items[%d]" % (where, k), item, ("text",),
+                        problems)
+
+
+def _check_level(where: str, block: dict, problems: list) -> None:
+    """``heading``'s level: python-docx takes 0..9; report the range, no clamp."""
+    if "level" not in block:
+        return
+    level = block["level"]
+    whole = (isinstance(level, (int, float)) and not isinstance(level, bool)
+             and float(level).is_integer())
+    if not whole:
+        problems.append('%s: "level" must be a whole number 0..9, got %r'
+                        % (where, level))
+    elif not 0 <= level <= 9:
+        problems.append('%s: "level" out of range: %r (allowed 0..9: 0 writes '
+                        "Word's Title style, 1..9 write Heading 1..9); the "
+                        "value is not clamped" % (where, level))
+
+
+def _check_table(where: str, block: dict, problems: list) -> None:
+    """A row longer than the table is wide loses cells — silently, before."""
+    header = block.get("header") or []
+    rows = block.get("rows") or []
+    if header and not isinstance(header, list):
+        problems.append('%s: "header" must be a list of cell values' % where)
+        header = []
+    if not isinstance(rows, list):
+        problems.append('%s: "rows" must be a list of rows' % where)
+        return
+    if header:
+        ncols = len(header)
+    elif rows and isinstance(rows[0], list):
+        ncols = len(rows[0])
+    else:
+        ncols = 1
+    for k, row in enumerate(rows):
+        if not isinstance(row, list):
+            problems.append("%s: rows[%d] must be a list of cell values"
+                            % (where, k))
+        elif len(row) > ncols:
+            problems.append("%s: rows[%d] has %d cells but the table has %d "
+                            "column(s)%s; the extra cells would be dropped"
+                            % (where, k, len(row), ncols,
+                               ' (from "header")' if header else ""))
+
+
+def _check_block(index: int, block, problems: list) -> None:
+    where = "blocks[%d]" % index
+    if not isinstance(block, dict):
+        problems.append("%s must be a JSON object, got %s"
+                        % (where, type(block).__name__))
+        return
+    btype = block.get("type")
+    if btype is None:
+        problems.append('%s: needs "type"; choose one of: %s'
+                        % (where, ", ".join(sorted(BLOCK_KEYS))))
+        return
+    if not isinstance(btype, str) or btype not in BLOCK_KEYS:
+        near = _suggestions(btype, BLOCK_KEYS)
+        problems.append('%s: unknown block type %r%s; choose one of: %s'
+                        % (where, btype,
+                           ' (did you mean "%s"?)' % near[0] if near else "",
+                           ", ".join(sorted(BLOCK_KEYS))))
+        return
+
+    label = '%s (type "%s")' % (where, btype)
+    if not _check_keys(label, block, BLOCK_KEYS[btype] | {"type"}, problems):
+        return
+
+    if btype == "heading":
+        _check_level(where, block, problems)
+    elif btype == "table":
+        _check_table(where, block, problems)
+    elif btype == "image":
+        if not block.get("path"):
+            problems.append('%s: image blocks need "path"' % where)
+    elif btype == "crossref":
+        if not block.get("target"):
+            problems.append('%s: crossref blocks need "target" (a bookmark '
+                            "name)" % where)
+    elif btype == "section_break":
+        _check_page(where + ".page", block.get("page"), problems)
+        _check_page_numbers(where + ".footer_page_numbers",
+                            block.get("footer_page_numbers"), problems)
+
+    _check_runs(where, block.get("runs"), problems)
+    _check_items(where, block.get("items"), problems)
+
+    stops = block.get("tab_stops")
+    if isinstance(stops, list):
+        for k, stop in enumerate(stops):
+            if isinstance(stop, dict):
+                _check_keys("%s.tab_stops[%d]" % (where, k), stop,
+                            TAB_STOP_KEYS, problems)
+    border = block.get("bottom_border")
+    if isinstance(border, dict):
+        _check_keys(where + ".bottom_border", border, BOTTOM_BORDER_KEYS,
+                    problems)
+
+
+def validate_spec(spec: dict) -> None:
+    """Raise :class:`SpecError` listing everything wrong with *spec* at once.
+
+    Reporting all problems in one pass means a spec with three typos needs one
+    edit-and-rerun cycle, not three.
+    """
+    problems: list = []
+    if not _check_keys("spec", spec, TOP_LEVEL_KEYS, problems):
+        raise SpecError("; ".join(problems))
+
+    _check_page("spec.page", spec.get("page"), problems)
+    _check_page_numbers("spec.footer_page_numbers",
+                        spec.get("footer_page_numbers"), problems)
+
+    styles = spec.get("styles")
+    if styles is not None:
+        if not isinstance(styles, list):
+            problems.append('spec: "styles" must be a list of style objects')
+        else:
+            for i, style in enumerate(styles):
+                where = "styles[%d]" % i
+                if _check_keys(where, style, STYLE_KEYS, problems):
+                    if not style.get("name"):
+                        problems.append('%s: needs "name"' % where)
+
+    blocks = spec.get("blocks")
+    if blocks is not None:
+        if not isinstance(blocks, list):
+            problems.append('spec: "blocks" must be a list of block objects')
+        else:
+            for i, block in enumerate(blocks):
+                _check_block(i, block, problems)
+
+    if problems:
+        raise SpecError("; ".join(problems))
+
+
+def _describe(exc) -> str:
+    """One readable clause describing an exception raised while building."""
+    if isinstance(exc, SystemExit):
+        return str(exc.code)
+    if isinstance(exc, KeyError):
+        # ``KeyError`` arrives from two places with different shapes: a dict
+        # lookup of a key the spec forgot (``'path'``) and python-docx's own
+        # "no style with name 'x'" prose.  Only the first is worth rewording.
+        text = exc.args[0] if exc.args else ""
+        text = text if isinstance(text, str) else repr(text)
+        return text if " " in text else "missing required key %r" % (text,)
+    text = str(exc)
+    return text or type(exc).__name__
+
+
+# Exceptions the builder raises *because the spec asked for something
+# impossible* — an unknown alignment, an unknown page-number format, a row
+# wider than the table, a missing "path".  They are the author's to fix, so
+# they are reported like any other spec problem instead of as a traceback.
+# Anything outside this tuple keeps exit 1 and its traceback: that is a bug in
+# the builder, and the traceback is what makes it locatable.
+_BUILD_ERRORS = (KeyError, IndexError, TypeError, ValueError, SystemExit)
+
+
+def _input_error(message: str) -> int:
+    """Reject the spec: JSON on stdout, one readable line on stderr, exit 2.
+
+    Exit 2 promises that *nothing was written*, so a caller can retry after
+    fixing the spec without wondering whether half a document exists.
+    """
+    print(json.dumps({"ok": False, "output": None, "error": message},
+                     ensure_ascii=False))
+    print("docx_create: %s" % message, file=sys.stderr)
+    return 2
+
+
+def _load_spec(path: str) -> dict:
+    """Read the spec file; every "this file cannot be used" becomes SpecError."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise SpecError("cannot read spec %s: %s" % (path, exc.strerror or exc))
+    except UnicodeDecodeError as exc:
+        raise SpecError("spec %s is not UTF-8 text: %s" % (path, exc))
+    try:
+        spec = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SpecError("spec %s is not valid JSON: %s (line %d, column %d)"
+                        % (path, exc.msg, exc.lineno, exc.colno))
+    if not isinstance(spec, dict):
+        raise SpecError("spec %s must be a JSON object, got %s"
+                        % (path, type(spec).__name__))
+    return spec
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Create a .docx from a JSON spec.",
@@ -1068,29 +1417,40 @@ def main() -> int:
     ap.add_argument("output", help="path of .docx to write")
     args = ap.parse_args()
 
-    with open(args.spec, encoding="utf-8") as f:
-        spec = json.load(f)
+    # ---- everything up to the save is guarded: a spec problem exits 2 with
+    # one line, and only a genuine builder bug keeps its traceback (exit 1).
+    try:
+        spec = _load_spec(args.spec)
+        validate_spec(spec)
+    except SpecError as exc:
+        return _input_error(str(exc))
 
     doc = Document()
-    if spec.get("page"):
-        apply_page(doc, spec["page"])
-    # Before any spec style: the built-in caption style is bold blue (a Word
-    # template default), and a caption is what "Insert Table of Figures"
-    # formats, so it would turn every caption in a printed paper blue.
-    caption_neutralised = _neutralise_caption_style(doc)
-    if spec.get("styles"):
-        add_styles(doc, spec["styles"])
-    if spec.get("header"):
-        set_hdrftr_text(doc.sections[0], spec["header"], kind="header")
-    if spec.get("footer"):
-        set_hdrftr_text(doc.sections[0], spec["footer"], kind="footer")
-    for block in spec.get("blocks", []):
-        add_block(doc, block)
-    if spec.get("footer_page_numbers"):
-        fpn = spec["footer_page_numbers"]
-        add_page_number_field(doc.sections[0],
-                              **(dict(fpn) if isinstance(fpn, dict) else {}))
-    dangling = check_crossref_anchors(doc)
+    try:
+        if spec.get("page"):
+            apply_page(doc, spec["page"])
+        # Before any spec style: the built-in caption style is bold blue (a Word
+        # template default), and a caption is what "Insert Table of Figures"
+        # formats, so it would turn every caption in a printed paper blue.
+        caption_neutralised = _neutralise_caption_style(doc)
+        if spec.get("styles"):
+            add_styles(doc, spec["styles"])
+        if spec.get("header"):
+            set_hdrftr_text(doc.sections[0], spec["header"], kind="header")
+        if spec.get("footer"):
+            set_hdrftr_text(doc.sections[0], spec["footer"], kind="footer")
+        for block in spec.get("blocks", []):
+            add_block(doc, block)
+        if spec.get("footer_page_numbers"):
+            fpn = spec["footer_page_numbers"]
+            add_page_number_field(
+                doc.sections[0],
+                **(dict(fpn) if isinstance(fpn, dict) else {}))
+        dangling = check_crossref_anchors(doc)
+    except SpecError as exc:
+        return _input_error(str(exc))
+    except _BUILD_ERRORS as exc:
+        return _input_error("%s: %s" % (type(exc).__name__, _describe(exc)))
     if dangling["missing"]:
         # Writing a REF at a non-existent bookmark produces a field whose
         # cached text is all the reader ever sees and whose click goes
@@ -1117,7 +1477,12 @@ def main() -> int:
                           "duplicate_names": dangling["duplicate_names"]},
                          ensure_ascii=False))
         return 1
-    doc.save(args.output)
+    try:
+        doc.save(args.output)
+    except OSError as exc:
+        # A path the caller cannot write is an input problem, not a builder bug.
+        return _input_error("cannot write %s: %s"
+                            % (args.output, exc.strerror or exc))
     # R-11: python-docx writes <w:zoom> without the schema-required w:percent;
     # patch it right after save so pipeline output is valid without a manual
     # second pass (see fix_zoom.py). fix_docx prints CLI-style diagnostics to

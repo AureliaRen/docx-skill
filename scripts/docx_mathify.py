@@ -34,6 +34,22 @@ Usage
 
 打开输出后建议在真 Word 里验一遍：
     python verify_word.py out.docx --out verify        # latex-fix 工作区的校验脚本
+
+退出码契约（P6-FIX-C5F 起成文，此前 3 只隐含在代码里）
+-----------------------------------------------------
+* **0** —— 成功。文档已写出（或 ``--dry-run`` 按预期没写），零转换失败。
+* **1** —— 预期内的失败：输入文件不存在。输入**不是**合法 docx 时抛
+  ``PackageNotFoundError`` 走 traceback（同属 1 的退出码，但消息不是本文写的）。
+* **2** —— 用法错误，且**一律在任何读写之前**判定：
+  ``--inplace`` 与 ``-o/--out`` 同时给（互斥，不许静默择一）；
+  三个落点标志（``-o`` / ``--inplace`` / ``--dry-run``）一个都没给。
+* **3** —— **部分成功**：文档写出去了，但至少一条公式没转成（``stats["failed"]``
+  非空），该片段按原文留着。这是唯一一个「有产物 + 非零码」的出口，调用方必须查。
+
+``3`` 的触发条件（实测见 ``docs/reports/P6-FIX-C5F.md``）：缺 ``MML2OMML.XSL``、
+XSL 文件不可解析、``latex2mathml`` 转换失败、XSLT 应用失败、``assert_legal``
+判结构非法。注意「缺 XSL」**不必然**退 3 —— 只有文档里存在必走 OMML 的片段
+（分式/根号/…）才会，全部可降级成文字 run 时仍退 0。
 """
 from __future__ import annotations
 
@@ -1225,6 +1241,19 @@ def main(argv: list[str] | None = None) -> int:
                    help="align/gather 里没有 \\tag 的行按顺序自动编号（默认只认 \\tag{...}）")
     args = p.parse_args(argv)
 
+    # ---- 落点标志互斥（P6-FIX-C5F）---------------------------------------
+    # `--inplace` 就地覆盖输入、`-o/--out` 写另一份文件 —— 同时给时不知道写哪
+    # 一份。旧版的分流写成 `if args.inplace and not args.dry_run:` 在前、
+    # `elif args.out:` 在后，于是 `--inplace` **静默吃掉** `-o`：out.docx 不
+    # 生成、输入文件反被覆盖，全部痕量只有 stdout 那行「输出: <输入文件>」。
+    # 与 insert_formula.py（P6-FIX-C2）同一条纪律：不许静默丢弃参数，明确
+    # 报错退 2，且**在任何读写之前**判定 —— 文档一个字节都不动。
+    if args.inplace and args.out:
+        print("error: --inplace 与 -o/--out 互斥：--inplace 就地覆盖输入文件，"
+              "-o/--out 写另一份输出文件，同时给无法判定落点；请只保留一个。",
+              file=sys.stderr)
+        return 2
+
     src = Path(args.input)
     if not src.is_file():
         print(f"error: {src} 不存在", file=sys.stderr)
@@ -1265,9 +1294,16 @@ def main(argv: list[str] | None = None) -> int:
     for f in perr[:10]:
         print("  PHASOR-WARN", f["latex"], "->", f["error"], file=sys.stderr)
     if stats["failed"]:
-        # Some formulas could not be converted. The document is still written
-        # (partial conversion is useful), but the caller must be able to tell:
-        # a silent 0 would hide broken equations in a delivered file.
+        # 部分成功（退出码 3，契约见模块 docstring / SKILL.md 的 Exit codes 表）：
+        # 文档**已经写出去了**（半成品对人工补救有用，所以不撤回），但至少一条
+        # 公式没转成、按原文留着。调用方必须能分辨这件事 —— 静默 0 会把带破损
+        # 公式的文件当成完成品交出去。
+        #
+        # 触发源（P6-FIX-C5F 实测，矩阵见 docs/reports/P6-FIX-C5F.md）：
+        #   缺 MML2OMML.XSL / XSL 路径不可用 / XSL 文件不是可解析 XML /
+        #   latex2mathml 抛错 / XSLT 应用失败 / assert_legal 判 OMML 结构非法。
+        # 「缺 XSL」不必然退 3：文档里全是可降级片段（文字 run / 文字角标）时
+        # 压根不碰 XSL，仍是 0。
         print(f"error: {len(stats['failed'])} formula(s) failed to convert",
               file=sys.stderr)
         return 3

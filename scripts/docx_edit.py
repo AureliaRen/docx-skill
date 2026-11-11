@@ -10,7 +10,10 @@ Subcommands:
   style     apply a paragraph style to a body paragraph by index
   normalize merge adjacent runs with identical formatting
   toc       insert a Table of Contents field at a body paragraph index
-  page-numbers  add "Page X of Y" (PAGE/NUMPAGES fields) to the footer
+  page-numbers  add "Page X of Y" (PAGE/NUMPAGES fields) to the footer;
+                idempotent - a footer that already carries a PAGE/NUMPAGES
+                field is left byte-for-byte alone, and an in-place re-run
+                writes nothing at all
 
 Examples:
   docx_edit.py replace in.docx --find old --replace new -o out.docx
@@ -31,6 +34,7 @@ import _bootstrap  # noqa: F401
 
 import argparse
 import json
+import os
 import sys
 
 from docx import Document
@@ -57,14 +61,81 @@ def cmd_set_cell(doc, args) -> dict:
     return {"table": args.table, "row": args.row, "col": args.col}
 
 
+class InsertIndexError(ValueError):
+    """`insert --index` cannot be honoured honestly.
+
+    Raised *before* the document is touched, so `main` can refuse with exit 2
+    and nothing is written — the file is exactly as it was.
+    """
+
+
+def _body_index_of(doc, p_el) -> int | None:
+    """Position of the paragraph element ``p_el`` in ``doc.paragraphs``.
+
+    Identity (`is`), not text equality: two paragraphs may legitimately hold
+    the same text, and the point of this lookup is to report the position of
+    *the object we just inserted*, not of the first paragraph that looks like
+    it. Returns None when the element is not a body paragraph at all.
+    """
+    for i, para in enumerate(doc.paragraphs):
+        if para._p is p_el:
+            return i
+    return None
+
+
+def _check_insert_index(index: int, n: int) -> None:
+    """Refuse an ``--index`` that does not name a real insertion point.
+
+    ``index`` is a 0-based position in ``doc.paragraphs`` (body only — table
+    cell paragraphs are not counted), and must name a paragraph that exists:
+    the new paragraph is inserted *before* it, so it lands at exactly that
+    index. Anything else is a caller bug, and clamping it silently is worse
+    than failing, because the caller is told a position it will never get:
+
+    * ``--index 99`` on a 4-paragraph body used to fall through to
+      ``add_paragraph`` and land at index 4 while reporting ``inserted_at: 99``;
+    * ``--index -1`` used to hit Python's negative indexing, insert before the
+      *last* paragraph (landing at N-1) and echo ``-1`` back.
+
+    An empty body (N=0) is the one degenerate case with a single valid
+    insertion point: 0, which appends the document's first paragraph.
+    """
+    if n == 0:
+        if index != 0:
+            raise InsertIndexError(
+                f"insert --index {index} is out of range: the body has no "
+                f"paragraphs, so the only valid index is [0, 0] (current N=0)")
+        return
+    if not 0 <= index <= n - 1:
+        raise InsertIndexError(
+            f"insert --index {index} is out of range: legal range is "
+            f"[0, {n - 1}], current N={n}")
+
+
 def cmd_insert(doc, args) -> dict:
+    """Insert a paragraph at body index ``index`` and report where it landed.
+
+    ``inserted_at`` in the returned JSON is the paragraph's **measured**
+    position after the insert (looked up by element identity), never an echo
+    of the argument: an echoed argument is precisely how the old code
+    reported ``99`` for a paragraph that had been appended at index 4.
+    """
     paras = doc.paragraphs
-    if args.index < len(paras):
-        anchor = paras[args.index]
-        new_para = anchor.insert_paragraph_before(args.text, style=args.style)
-    else:
+    n = len(paras)
+    _check_insert_index(args.index, n)
+
+    if n == 0:
         new_para = doc.add_paragraph(args.text, style=args.style)
-    return {"inserted_at": args.index, "text": new_para.text}
+    else:
+        new_para = paras[args.index].insert_paragraph_before(
+            args.text, style=args.style)
+
+    landed = _body_index_of(doc, new_para._p)
+    if landed is None:
+        raise InsertIndexError(
+            "the paragraph was inserted but is not reachable as a body "
+            "paragraph, so its position cannot be reported")
+    return {"inserted_at": landed, "text": new_para.text}
 
 
 def cmd_delete(doc, args) -> dict:
@@ -152,15 +223,56 @@ def cmd_toc(doc, args) -> dict:
     return {"toc_inserted_at": args.index}
 
 
+PAGE_FIELD_CODES = ("PAGE", "NUMPAGES")
+
+
+def _field_codes(p_el) -> set:
+    """Field codes a footer paragraph already carries (`PAGE`, `NUMPAGES`).
+
+    Both spellings count. python-docx only ever writes the *complex* form
+    (``fldChar begin -> instrText -> separate -> result -> end``), but Word
+    and LibreOffice both also emit the *simple* form
+    (``<w:fldSimple w:instr=" PAGE "/>``), so a footer built by either tool
+    has to be recognised too — otherwise a second page number gets stapled
+    onto one that was already there.
+
+    Field codes may also be split across several ``w:instrText`` runs, so the
+    texts are joined before tokenising rather than tested one run at a time.
+    """
+    code = "".join(it.text or "" for it in p_el.iter(_q("instrText")))
+    code += " " + " ".join(fs.get(_q("instr"), "") or ""
+                           for fs in p_el.iter(_q("fldSimple")))
+    return {tok for tok in code.upper().split() if tok in PAGE_FIELD_CODES}
+
+
 def cmd_page_numbers(doc, args) -> dict:
+    """Append `Page X of Y` to the footer — once, and without losing anything.
+
+    Two behaviours are load-bearing here:
+
+    * **Idempotent.** If the footer already carries a ``PAGE``/``NUMPAGES``
+      field the document is reported ``changed: False`` and (for an in-place
+      run) `main` skips `save()` entirely, so plan→apply→apply leaves the
+      file untouched instead of stacking a second "Page 1 of 1".
+    * **Append, never replace.** The existing runs of the footer paragraph are
+      left in place; the new runs go after them. A footer reading
+      ``CONFIDENTIAL`` becomes ``CONFIDENTIALPage 1 of 1``, not
+      ``Page 1 of 1``.
+    """
     footer = doc.sections[0].footer
+    present = set()
+    for para in footer.paragraphs:
+        present |= _field_codes(para._p)
+    if present:
+        return {"footer_fields": list(PAGE_FIELD_CODES), "changed": False,
+                "already_present": sorted(present)}
     para = footer.paragraphs[0] if footer.paragraphs \
         else footer.add_paragraph()
     para.add_run("Page ")
     _add_field(para, " PAGE ", "1")
     para.add_run(" of ")
     _add_field(para, " NUMPAGES ", "1")
-    return {"footer_fields": ["PAGE", "NUMPAGES"]}
+    return {"footer_fields": list(PAGE_FIELD_CODES), "changed": True}
 
 
 def main() -> int:
@@ -228,7 +340,14 @@ def main() -> int:
     elif args.cmd == "set-cell":
         result = cmd_set_cell(doc, args)
     elif args.cmd == "insert":
-        result = cmd_insert(doc, args)
+        try:
+            result = cmd_insert(doc, args)
+        except InsertIndexError as exc:
+            # Same exit code argparse uses for a bad argument value: the
+            # caller passed an --index that cannot be honoured. Nothing has
+            # been saved at this point, so the input file is untouched.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     elif args.cmd == "delete":
         result = cmd_delete(doc, args)
     elif args.cmd == "normalize":
@@ -241,7 +360,14 @@ def main() -> int:
         result = cmd_style(doc, args)
 
     out = args.output or args.path
-    doc.save(out)
+    # A no-op (-page-numbers on a footer that already carries the fields) must
+    # not rewrite the package: an in-place re-run then leaves mtime and SHA256
+    # untouched, which is what "idempotent" has to mean for an operator who
+    # runs the same plan twice. A distinct -o still gets a file, or the CLI
+    # contract ("there is always an output path") would break.
+    if result.get("changed", True) \
+            or os.path.abspath(out) != os.path.abspath(args.path):
+        doc.save(out)
     result.update({"ok": True, "output": out})
     print(json.dumps(result, ensure_ascii=False))
     return 0
