@@ -212,8 +212,8 @@ jobs:
         #      breaks the identity. With nothing failing and no xfail in the
         #      suite this reduces to the plain `passed + skipped == collected`.
         #
-        #   3. FLOOR: passed >= MIN_PASSED (1441, measured on a simulated
-        #      runner after the P6 batch; see the arithmetic below). Monotone: it only ever moves
+        #   3. FLOOR: passed >= MIN_PASSED (1440, measured on a clean clone with no
+        #      Office; see the arithmetic below). Monotone: it only ever moves
         #      up, so tests that really execute can never quietly stop
         #      executing. This is also what catches a single pass -> skip flip,
         #      which the identity cannot see (moving one test between two
@@ -223,13 +223,17 @@ jobs:
         #      A ratio, not a count: adding a new test that skips on CI (no
         #      Office on the runner) can no longer force a false red, while a
         #      whole category of tests degrading into skips still trips it.
-        #      Today 374/1815 = 20.6%, i.e. about 80 slots of slack.
+        #      Today 375/1815 = 20.7%, i.e. about 78 slots of slack.
         #
         # What replaced what, and why (P5-AUDIT-QUALITY 4.1-4.3 and 10 item 8):
         #   MIN_PASSED was 1356 when this gate was written (P5). It was never the
         #     problem: it is a monotone floor and its zero headroom is the point
         #     of it. The P6 batch added 88 tests that really run on the runner,
-        #     so following this file's own rule the floor moved to 1441.
+        #     so following this file's own rule the floor moved to 1440.
+        #     The first attempt at that moved it to 1441 and went red on all four
+        #     legs: the simulation had been run inside the development tree,
+        #     whose parent directory contains `_smoke/`, so one test passed
+        #     there and skips on a runner. Simulate on a clean clone.
         #   MAX_SKIPPED = 372 (371 measured + 1 headroom) is deleted. A
         #     one-test headroom is a snapshot: every new skip-on-CI test turned
         #     all four legs red and demanded a magic-number edit in the same
@@ -240,7 +244,9 @@ jobs:
         #
         # The numbers are the hosted-runner reality, not this workstation.
         # P6 measurement (2026-11-11, after the P6 fix batch; this is the
-        # current truth): 1441 passed / 374 skipped / collected 1815.
+        # current truth, four legs agree): 1440 passed / 375 skipped / collected 1815.
+        # Measure it on a clone of this repository, not inside the development
+        # tree -- see the `_smoke/` note above.
         # P5 measurement (historical, do not use as the floor):
         #   passed 1356 / skipped 371 / collected 1727.
         # Re-measured on a simulated runner after the P5 round landed
@@ -272,7 +278,7 @@ jobs:
         #        measured aggregate only -- the per-file split was not
         #        verified one by one, so it is deliberately not written here.
         #        The +3 skips are tests that need the XSL at run time.
-        #   =                                                1441 / 374  (P6)
+        #   =                                                1440 / 375  (P6)
         #
         # Adding tests from now on (details in docs/reports/P6-FIX-C4.md):
         #   new test that RUNS on the runner  -> raise MIN_PASSED to the freshly
@@ -306,14 +312,14 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1441                        # monotone floor, simulation below
+          MIN_PASSED = 1440                        # monotone floor, measured on a clean clone
           SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
           run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
           collect_log = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
 
           # The summary is the last line carrying a duration, e.g.
-          #   "1441 passed, 374 skipped, 5 warnings in 61.23s"
+          #   "1440 passed, 375 skipped, 5 warnings in 61.23s"
           summary = None
           for line in run_log.splitlines():
               if re.search(r"\bin\s+\d+(?:\.\d+)?s", line) and re.search(r"\d+ (?:passed|failed|error)", line):
