@@ -121,7 +121,7 @@ top-level comments.
 
 修订：
 
-```bash
+```powershell
 python scripts/docx_revisions.py list in.docx          # JSON，每条带 w:id
 python scripts/docx_revisions.py accept-all in.docx
 python scripts/docx_revisions.py reject-all in.docx
@@ -131,7 +131,7 @@ python scripts/docx_revisions.py reject in.docx --id 7
 
 批注：
 
-```bash
+```powershell
 python scripts/docx_comments.py list in.docx
 python scripts/docx_comments.py add in.docx --target "the phrase to anchor to" --text "note"
 python scripts/docx_comments.py add in.docx --target "..." --text "..." --author "Reviewer" --initials RV
@@ -139,6 +139,14 @@ python scripts/docx_comments.py delete in.docx --id 1
 ```
 
 每个命令都接受 `-o/--output`；不给就**原地改**。原地改之前先备份，或者干脆每次都显式给 `-o`。
+命令都在**仓库根**执行（`scripts/` 前缀不能省）。退出码（2026-11-11 实测）：
+
+- `0` —— 成功；文档干净时 `list` 报空、`accept-all` / `reject-all` 报 `resolved: 0` 也算成功。
+- `1` —— **预期内的失败**，输出是 `{"ok": false, "error": …}` 的 JSON：未知批注 id
+  （`no comment with id 1`）、目标文本在文档里找不到（`target not found: …`）、
+  未知修订 id（`no revision with id 3`）。
+- `2` —— **用法错误**，stderr 一行、无 traceback：参数越界或不可读的 `.docx`（同仓
+  `docx_crossref.py` 的 `--index` 越界/负数也是这一类）。
 
 ## 判断文档是否干净
 

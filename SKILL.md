@@ -19,12 +19,14 @@ Output convention differs by script and is deliberate:
   `docx_comments`, `docx_revisions`, `docx_section`, `docx_numbering`,
   `docx_crossref`, `docx_toc`. Parse these.
 - **Human-readable text** — `docx_mathify`, `table_width`, `insert_formula`,
-  `docx_template` (except `fill`, which emits JSON on stdout), and
-  `docx_common --api` (a name-plus-signature listing). These report progress and
-  are meant to be read.
+  `docx_template` (except `fill`, which emits JSON on stdout), `fix_fonts`,
+  `fix_zoom`, `merge_docs`, `pdf_export`, `docx_pack` (a bare run prints how to
+  import it), and `docx_common --api` (a name-plus-signature listing). These
+  report progress and are meant to be read.
 
-Exit codes are reliable: `0` on success, non-zero on failure. See
-[Exit codes](#exit-codes) for the one historical exception.
+Exit codes are reliable: `0` on success, `1` on an expected failure, `2` on a
+usage error. See [Exit codes](#exit-codes) for the full table and for `3`, the
+one partial-success code.
 
 ## Setup
 
@@ -70,10 +72,30 @@ pack("unpacked/", "out.docx", original="in.docx")
 ```
 
 `pack` reuses the original's entry order and compression method, so a
-round-trip that changes nothing produces an equivalent archive. `unpack` treats
-the archive as untrusted input and refuses entries that would escape the target
-directory — `../`, absolute paths, backslashes, and Windows drive-letter forms
-such as `D:/x.txt` — raising `UnsafeArchiveError`.
+round-trip that changes nothing produces an equivalent archive. Pass
+`original=` and a missing, empty, or non-zip original raises rather than quietly
+packing a document that lost its carry-over.
+
+`unpack` treats the archive as untrusted input and refuses every entry that
+would land outside the target directory, raising `UnsafeArchiveError` before
+anything is written. The refused shapes, each one exercised by the test suite:
+
+- **`..` traversal** — `../escape.txt`, and the backslash spelling
+  `..\..\evil.txt` (the `zipfile` layer normalises it to `../../evil.txt` on
+  Windows, and the `normpath` check catches it there).
+- **POSIX absolute paths** — `/abs/evil.txt`.
+- **Windows drive letters** — `D:/x.txt` and `D:x.txt`. Neither is POSIX
+  absolute, yet `pathlib` on Windows treats both as rooted, so `dst / name`
+  would drop `dst` entirely.
+- **UNC shares** — `\\server\share\x.txt`, reported as a drive prefix.
+- **Reserved device names** — `CON`, `NUL`, `AUX`, `PRN`, `CONIN$`, `CONOUT$`,
+  `COM0`–`COM9`, `LPT0`–`LPT9`, matched case-insensitively on the last component
+  with any extension ignored, so `nul`, `CON.txt` and `word/AUX.xml` are all
+  rejected. Win32 resolves these to a device in any directory, and `NUL`
+  swallows the write while reporting success.
+- **A trailing dot or space** in the last component — `evil.txt ` and
+  `evil3. .`. Win32 strips it, so two archive entries would collide on one file
+  name and the extracted tree would stop matching the archive.
 
 ## Quick reference
 
@@ -86,6 +108,11 @@ such as `D:/x.txt` — raising `UnsafeArchiveError`.
 | Replace text | `python scripts/docx_edit.py replace in.docx --find A --replace B -o out.docx` |
 | Set a table cell | `python scripts/docx_edit.py set-cell in.docx --table 0 --row 1 --col 2 --text X -o out.docx` |
 | Insert a paragraph | `python scripts/docx_edit.py insert in.docx --index 3 --text "..." -o out.docx` |
+| Delete a paragraph | `python scripts/docx_edit.py delete in.docx --index 3 -o out.docx` |
+| Apply a paragraph style | `python scripts/docx_edit.py style in.docx --index 0 --style "Heading 1" -o out.docx` |
+| Merge adjacent identical runs | `python scripts/docx_edit.py normalize in.docx -o out.docx` |
+| Insert a TOC *field* | `python scripts/docx_edit.py toc in.docx --index 1 -o out.docx` |
+| Add "Page X of Y" to the footer | `python scripts/docx_edit.py page-numbers in.docx -o out.docx` |
 | Health-check a document | `python scripts/docx_validate.py in.docx` |
 | List comments | `python scripts/docx_comments.py list in.docx` |
 | Add a comment | `python scripts/docx_comments.py add in.docx --target "some text" --text "note"` |
@@ -96,6 +123,8 @@ such as `D:/x.txt` — raising `UnsafeArchiveError`.
 | Apply a formatting template | `python scripts/docx_template.py apply tpl.json --to in.docx -o out.docx` |
 | Diagnose table widths | `python scripts/table_width.py report unpacked/` |
 | Force table widths | `python scripts/table_width.py set unpacked/ --widths 2.4,4.2,4.2` |
+| Copy `tcW` into the grid | `python scripts/table_width.py sync unpacked/` |
+| Spread columns over the text width | `python scripts/table_width.py auto unpacked/ [--content-width 14.6]` |
 | Batch linear formulas → Office Math | `python scripts/docx_mathify.py in.docx -o out.docx --report conv.md` |
 | Insert one LaTeX formula | `python scripts/insert_formula.py unpacked/ "\frac{-b}{2a}" --display` |
 | Inspect numbering definitions | `python scripts/docx_numbering.py list in.docx` |
@@ -105,14 +134,78 @@ such as `D:/x.txt` — raising `UnsafeArchiveError`.
 | Strip numbering | `python scripts/docx_numbering.py detach in.docx --index 3:9` |
 | Make a numbered caption | `python scripts/docx_crossref.py caption in.docx --index 42 --label 图 --text "架构"` |
 | Insert a cross-reference | `python scripts/docx_crossref.py ref in.docx --index 70 --target 图_1 --prefix "如图" --suffix 所示` |
+| Put a bookmark on a paragraph | `python scripts/docx_crossref.py bookmark in.docx --index 12 --name 图_1 -o out.docx` |
 | Refresh all field results | `python scripts/docx_crossref.py renumber in.docx -o out.docx` |
 | List bookmarks / fields | `python scripts/docx_crossref.py list in.docx` |
-| Write a static table of contents | `python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7` |
+| Write a static table of contents | `python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7` (one `--pages` value per entry — the three values here mean the source has exactly three entries; a different count is exit 2) |
+| Inspect / edit sections | `python scripts/docx_section.py list\|break\|pagenum\|pagenums\|header\|footer\|cols in.docx` |
 | Measure the displayed page of paragraphs | `python tools/word_accept.py in.docx --page-probe 1,9,43 --json out.json` |
 | Unify fonts (CJK body / Latin Times New Roman) | `python scripts/fix_fonts.py in.docx [more.docx ...]` |
 | Merge two documents | `python scripts/merge_docs.py base.docx src.docx out.docx` |
 | Add the missing `w:percent` to `<w:zoom>` | `python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]` |
 | Export to PDF with the text layer intact | `pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]` |
+
+Common commands (each one checked against `--help` on this machine, exit `0`):
+
+```bash
+python scripts/docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
+python scripts/insert_formula.py unpacked/ "\frac{-b}{2a}" --display --after "marker"
+python scripts/table_width.py set unpacked/ --table 1 --widths 2.4,4.2,2.4,5.6
+python scripts/merge_docs.py base.docx src.docx merged.docx
+python scripts/fix_fonts.py a.docx b.docx --heading-threshold 14
+python scripts/docx_template.py fill tpl.docx values.json out.docx --strict
+```
+
+`docx_edit page-numbers` is **idempotent**: a footer that already carries a
+`PAGE` or `NUMPAGES` field — complex form or `<w:fldSimple>` — is left
+byte-for-byte alone, an in-place re-run writes nothing at all, and stdout grows
+two extra keys, `changed` and `already_present`, so a script can tell "added" from
+"was already there".
+
+**`--index` is always 0-based**, and what it counts depends on the script:
+
+| Script | What `--index` counts | Out of range |
+|---|---|---|
+| `docx_edit insert` | body paragraphs; `N` is legal and means "append" | exit `2`, message names the legal range |
+| `docx_edit delete` / `style` | body paragraphs | exit `1` (`IndexError`) |
+| `docx_crossref` | body paragraphs | exit `2`, message names the legal range |
+| `docx_numbering` | body **and table** paragraphs, in document order; `lo:hi` is half-open and `--index` is repeatable | exit `1`, "selection matched no paragraphs" |
+| `docx_toc --insert-at` | body paragraphs | clamped to the end of the body |
+
+`docx_toc`'s `inserted_at` in its report is a different thing: it is where the
+TOC was actually written, measured after insertion, not an input.
+
+**`docx_section.py` owns section-level page setup.** `list` prints every
+section's geometry as JSON; `break` appends a section; `pagenum` writes
+`<w:pgNumType>` (format and start value); `pagenums` writes the PAGE/NUMPAGES
+fields into a section's footer; `header` / `footer` write that section's own
+running text; `cols` sets the column count. Every subcommand except `list` takes
+`--section N` (default `-1`, the last section).
+
+```bash
+python scripts/docx_section.py break in.docx --start-type new_page -o out.docx
+python scripts/docx_section.py pagenum out.docx --section 1 --fmt lowerRoman --start 1 -o out.docx
+python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
+```
+
+The `lowerRoman start=1` in the middle line is exactly the case `docx_toc` warns
+about: that section prints `i` on whatever physical page it starts at, so the
+displayed page number and the physical page index are two different numbers.
+
+**`docx_template.py apply` carries two independent formula channels, on two
+separate defaults, and they are mutually exclusive on the command line:**
+
+| Flag | Channel | Default |
+|---|---|---|
+| `--no-fix-formulas` | marker channel — paired `_xx_` / `^xx^` → `vertAlign` runs | **on** |
+| `--fix-formulas` | OMML channel — LaTeX / linear formulas → native Office Math (runs `docx_mathify`) | off |
+
+They read like a `+`/`-` pair but write different destinations
+(`fix_formulas` / `omml_formulas`), so passing both used to switch the marker
+pass off *and* hand raw `_xx_` markers to the OMML converter — which then failed
+while the CLI still exited `0`. It is now an argparse conflict, exit `2`. Without
+`-o`, `apply --to` rewrites the target in place and writes a `<file>.bak` first;
+with `-o`, the `--to` file is left byte-for-byte alone.
 
 ## Creating a document
 
@@ -121,16 +214,34 @@ such as `D:/x.txt` — raising `UnsafeArchiveError`.
 
 | `type` | Fields |
 |---|---|
-| `heading` | `text`, `level` (1–9) |
+| `heading` | `text`, `level` (0–9) |
 | `paragraph` | `text`, or `runs`, plus optional `style` |
 | `bullet_list` | `items` |
 | `numbered_list` | `items`; optional `num_id` (reuse an existing counter), `num_text` (default `%1.`), `num_fmt`, `start`, `ilvl`, `indent_left`, `hanging` |
 | `caption` | `label` (default `图`), `text`, optional `bookmark` — inserts `图 N  题注` with a `SEQ` counter + bookmark |
+| `table_caption` | the same fields as `caption`, for a table |
 | `crossref` | `target` (a bookmark), optional `prefix`, `suffix`, `format` (`default`/`full`/`above-below`/`page`/`number`), `cached`, `own_paragraph` |
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold` |
 | `image` | `path`, optional `width_mm` |
 | `page_break` | — |
+| `section_break` | `start_type`, optional `page`, `header` / `footer` (+ their `_align` / `_font` / `_size_pt` / `_bold`), `footer_page_numbers`, `different_first_page`, `cols`, `no_footer`, `reuse_last_paragraph`, `apply_to` |
 | `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures. **A field**: Word must update it (F9) before any entry exists |
+
+**The spec is validated before a single paragraph is built, and an unknown key
+or an unknown block type is an error, not a no-op.** `{"blockz": [...]}` used to
+build a valid, empty document, print `"blocks": 0` and exit `0`, so the author
+had no way to see that the content never went in. It now exits `2` with one line
+naming the offending key and, when it is close enough, a "did you mean" hint:
+
+```
+spec: unknown key "blockz" (did you mean "blocks"?); valid keys here: blocks, footer, footer_page_numbers, header, page, styles
+blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one of: bullet_list, caption, crossref, heading, image, numbered_list, page_break, paragraph, section_break, table, table_caption, toc
+```
+
+Exit `2` promises that **nothing was written**, so you can fix the spec and
+retry without wondering whether half a document exists. Values are not clamped
+either: an out-of-range value is reported with the range it would have been
+clamped into.
 
 `styles[]` entries take `font`, `font_east_asia`, `size_pt`, `bold`, `italic`,
 `color`, `base`, and `outline_level` — the last one writes
@@ -148,6 +259,10 @@ looks: the navigation pane is empty and `TOC \o` collects nothing.
 `outline_level` is 1-based (`1` → `w:outlineLvl val="0"`). `0` means "explicitly
 body text" (`val="9"`), for a style that must never be collected.
 
+`heading.level` is `0`–`9`, not `1`–`9`: python-docx's `add_heading` treats `0`
+as Word's **Title** style and `1`–`9` as Heading 1–9. `10` is a spec error, not
+a clamp.
+
 ## A static table of contents
 
 `toc` above is a **field**: the entries do not exist until someone presses F9,
@@ -156,6 +271,8 @@ the file must be right on open — a deliverable, a PDF conversion, a diff — w
 the entries as real paragraphs with `scripts/docx_toc.py` instead.
 
 ```
+# one --pages value per TOC entry: this line assumes the document has exactly
+# three entries. A mismatched count is a usage error (exit 2), not a silent pad.
 python scripts/docx_toc.py in.docx -o out.docx --title 目录 --pages 1,3,7
 ```
 
@@ -171,6 +288,19 @@ Each entry is `title<TAB>page` in style `toc 1/2/3`, with a right tab stop at th
 text-block width and a dot leader. The width comes from
 `docx_create.content_width_mm(section)` — never hard-code it, because the six
 test volumes genuinely differ (170 mm vs 160 mm).
+
+The flags worth knowing:
+
+| Flag | Effect |
+|---|---|
+| `--levels` | outline levels to include, `1,2` or `1-3` (default `1,2,3`) |
+| `--pages` | one page number per entry; **a different count is a usage error (exit 2)** |
+| `--title` | the heading text of the TOC itself |
+| `--insert-at` | body paragraph index to insert before (default: where the previous TOC was, else the end) |
+| `--section-index` | which section's text width sets the right tab stop |
+| `--indent-chars` | per-level left indent in characters (default `0,2,4`) |
+| `--adopt-unmarked` | also replace an unmarked TOC this module did not write — off by default, because that may be the user's own |
+| `--dry-run` | report what would be written, save nothing |
 
 **Page numbers have to be measured, not guessed.** `pages=None` leaves the slot
 empty; fill it from `tools/word_accept.py --page-probe`, which reports
@@ -239,6 +369,11 @@ correct after F9. `renumber` recomputes `SEQ` counters and rewrites every
 cached `REF` value, which is what makes a generated document correct for
 readers that never update fields.
 
+`docx_crossref bookmark` is the piece the `crossref` block type needs first: it
+puts a named bookmark on one paragraph so a later `ref` — or a `crossref` block
+in a spec — has something to point at. The name has to be unique; a second run
+with the same name exits `1` with `bookmark already exists`.
+
 ## Formula conversion (LaTeX → native Office Math)
 
 Two entry points share one engine (`math_omml.py`):
@@ -248,14 +383,48 @@ Two entry points share one engine (`math_omml.py`):
   `1kΩ=10³Ω`, `∠53.1°`), converts each into native OMML, and leaves the Chinese
   prose, table structure, and font sizes untouched. `--dry-run` reports without
   writing; `--report md` records every before/after pair, plus a count and a
-  per-paragraph table for spans that took the no-layout tier.
+  per-paragraph table for spans that took the no-layout tier. `--inplace` writes
+  a `<name>.bak.docx` first; `--inplace` together with `-o` is a usage error
+  (exit `2`), because the write target would be ambiguous.
 - **`insert_formula.py` — single.** Takes LaTeX and drops one equation into an
   unpacked document at an anchor.
+
+`insert_formula.py` has three rules, and each one exists to stop a silent
+misfire rather than to be polite:
+
+- **An anchored insert reports where it landed.** After writing, the script
+  looks the new paragraph up in the tree and appends the measured coordinate to
+  stdout — `at body[3]` for a body-level anchor, `at tc[1]` for one that went
+  into a table cell. The index is the container's own child index (counted with
+  `w:sectPr` and `w:tbl` included), which is what makes it checkable against
+  `<w:body>` directly; it is not the argument you passed.
+- **`--dump` together with `--after` / `--before` is a usage error, exit `2`.**
+  `--dump` only prints the OMML and never writes the document, so the anchor
+  would be swallowed without a word. `--after` and `--before` are mutually
+  exclusive for the same reason.
+- **An empty marker is a usage error, exit `2`.** `--after ""` would append the
+  formula at the end of the document while looking anchored; omit the flag when
+  appending at the end is what you actually want.
+
+A marker that matches nothing exits `1` and names the range it searched — the
+0-based body paragraph range plus the table-cell count.
 
 `linear_to_latex.py` decides *what counts as a formula*. It deliberately stays
 conservative so ordinary prose survives: `[0, 1]`, `f(x, y)`, and CJK headings
 are left alone; `U=IR` and `ΣI=0` become equations. Recognising a span is not
 the same as needing an equation *object* — see the tiers below.
+
+The chain has three steps, and skipping one leaves half a formula:
+
+```
+linear text --(linear_to_latex)--> LaTeX --(latex2mathml)--> MathML --(MML2OMML.XSL via lxml)--> OMML
+```
+
+`latex_to_omml_lxml(latex, display=False, raw_spacing=False)` returns an element
+carrying `xmlns:m`, ready to append into a `w:p`. `assert_legal()` rejects the
+two structures that make Word say "the file may be corrupted": a nested
+`<m:oMath>` inside `m:num` / `m:den` / `m:e` / `m:sub` / `m:sup` / `m:deg` /
+`m:fName` / `m:lim`, and an `m:rad` missing its `m:e`.
 
 ### Three output tiers
 
@@ -312,6 +481,67 @@ Equation font defaults to **Times New Roman**. Override with the `MATH_FONT`
 environment variable (`MATH_FONT="Cambria Math"` restores Word's default look;
 `MATH_FONT=""` disables injection entirely).
 
+### The `$...$` marker layer
+
+The regex must not be the thing that decides what is a formula. Let the author
+mark it instead: wrap LaTeX in `$...$` in the source text, and the parser only
+splits — it never guesses semantics.
+
+```python
+def _add_mixed(p, text):
+    """Parse $...$ markers into OMML, everything else into runs.
+
+    The author knows where the formula is; do not make the regex guess.
+    """
+    pos = 0
+    for m in re.finditer(r"\$([^$]+)\$", text):
+        if m.start() > pos:
+            _run(p, text[pos:m.start()])
+        tex = m.group(1)
+        try:
+            el = latex_to_omml_lxml(tex)
+            fix_phasor_dots(el)      # must run, or the dots float large
+            p._p.append(el)
+        except Exception as exc:
+            FAILS.append((tex, str(exc)[:150]))   # log it, fall back to text
+            _run(p, tex)                          # never drop a formula silently
+        pos = m.end()
+    if pos < len(text):
+        _run(p, text[pos:])
+```
+
+`FAILS` has to be printed or written to a file. A formula that vanishes without
+a trace is the hardest failure to find.
+
+### Phasor dots need a correction pass
+
+`latex2mathml` turns `\dot{I}` into `m:limUpp`, which Word renders as "a large
+glyph with a floating dot". `fix_phasor_dot.fix_phasor_dots(omml) -> int`
+rewrites it in place as `m:acc` (the `\u0307` combining dot) and returns how many
+sites it changed.
+
+Three layers, so nothing is misread:
+
+1. **`latex_to_omml_lxml()` does not fix it.** It is a pure conversion function;
+   `\dot{I}` comes out as `limUpp=1 / acc=0`.
+2. **Both CLIs already fix it, so the normal path never shows the bad form.**
+   `docx_mathify.py`'s `_to_omml()` is the single exit for every conversion, and
+   `insert_formula.py` fixes inside `_omml_stdlib()`. Both count their work and
+   report `修正相量点 N 处` on the summary line.
+3. **Only hand-written callers** — code that imports `math_omml` and converts
+   directly — have to add the pass themselves. The upside of doing it yourself is
+   that you can then assert `limUpp == 0` as a self-check.
+
+Measured baselines:
+
+```
+İ=U/Z 成立                   → 修正相量点 1 / oMath=1 limUpp=0 acc=2 TNR=16
+电流 İ_{L}+İ_{C} = İ 成立     → 修正相量点 3 / oMath=1 limUpp=0 acc=6
+İ_{L}+İ_{C}（无运算符，不转） → oMath=0   ← 正常：find_math_spans 要求有运算符/等式
+```
+
+Self-check: `python scripts/fix_phasor_dot.py`.
+
 ## Table geometry
 
 Word resolves column widths in a way that surprises people:
@@ -322,9 +552,23 @@ Word resolves column widths in a way that surprises people:
   `<w:tblGrid><w:gridCol>` and **ignores `tcW`**. A default grid makes every
   column equal no matter what you set.
 
-`table_width.py` keeps `tblW`, `gridCol`, and `tcW` consistent. Use `report`
-first to see the current state, then `sync` to copy `tcW` values into the grid,
-or `set --widths` to pin them explicitly.
+`table.autofit = False` writes exactly that `fixed` layout, which is why setting
+only `cell.width` silently yields equal columns. All three places have to agree:
+`tblW` + `gridCol` + `tcW`, in dxa (1 cm = 566.93 dxa).
+
+`table_width.py` keeps the three consistent. Use `report` first to see the
+current state, then `sync` to copy `tcW` values into the grid, `set --widths` to
+pin them explicitly, or `auto` to spread the columns over the usable text width
+(`--content-width`, default 14.6 cm = A4 minus 3.17 cm margins).
+
+`sync` without reading `report` first is the trap: it faithfully copies whatever
+`tcW` currently holds into the grid, wrong values included. And `set --widths`
+with more values than the table has columns is a usage error, exit `2` — it
+refuses to drop the extras:
+
+```
+error: table 1: --widths has 5 values but the table has 3 columns; refusing to drop the extra 2
+```
 
 ## Fonts: two rules that Word enforces
 
@@ -361,7 +605,9 @@ inside `m:oMath` are the exception: only `ascii` / `hAnsi` / `cs` are touched,
 overwritten `eastAsia` visibly degrades the equation.
 
 Files are rewritten in place through a temporary file and `shutil.move`, so an
-interrupted run leaves the original intact.
+interrupted run leaves the original intact. **It keeps no extra copy**: unlike
+`docx_mathify --inplace` and `docx_template apply --to`, `fix_fonts` leaves no
+`.bak` behind, so copy the file yourself if the original matters.
 
 ## `<w:zoom>` and its required attribute
 
@@ -394,29 +640,11 @@ Three things the script gets right that a naive patch does not:
 - Rewriting the zip reuses the original `ZipInfo` entries, so part order and
   compression survive the round trip.
 - A package with no `word/settings.xml` is legal, not broken: the script reports
-  `nothing to do` and exits `0`.
-
-The pure entry point is `fix_settings_xml(xml, percent) -> tuple[str, int]`: XML
-in, `(patched_xml, sites_changed)` out. The tests import it directly rather than
-shelling out.
-
-```
-python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]
-```
-
-Three details make it safe to run anywhere:
-
-- A `<w:zoom>` that already carries `w:percent` is returned untouched. Adding a
-  second `percent` would be a duplicate attribute — malformed XML, worse than
-  the original defect.
-- The archive is rebuilt by reusing each original `ZipInfo`, so entry order and
-  timestamps survive and the byte diff stays limited to `settings.xml`.
-- A package with no `word/settings.xml` is legal. The script reports
   `nothing to do` and exits `0` rather than inventing the part.
 
 The pure entry point is `fix_settings_xml(xml, percent) -> tuple[str, int]`: XML
-in, `(xml, count)` out, no file I/O, which is what the tests import. Re-running
-is a no-op.
+in, `(patched_xml, sites_changed)` out, no file I/O, which is what the tests
+import directly instead of shelling out.
 
 ## Merging two documents
 
@@ -525,7 +753,7 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 scripts/     flat, imported by bare module name — 26 .py + 1 .ps1 (25 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 6 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite
+tests/       pytest suite — 47 .py (46 test_*.py + _omml.py helper)
 ```
 
 ## Exit codes
@@ -533,13 +761,15 @@ tests/       pytest suite
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | expected failure (missing file, marker not found, bad spec) |
-| `2` | usage error (argparse, or a required mode flag missing) |
-| `3` | partial success — `docx_mathify` wrote the document but some formulas failed to convert |
+| `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, a missing or unreadable input file, "the document does not contain what you asked for", a runtime exception |
+| `2` | usage error — argparse, an `--index` outside the legal range (or negative, where the script validates it), an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together |
+| `3` | **`docx_mathify` only**: the document was written, but at least one formula failed to convert |
 
 `docx_mathify` returning `3` is deliberate: the output file is valid and mostly
 converted, but at least one equation is still linear text. Check the exit code if
-you are delivering the result.
+you are delivering the result. "Missing XSL" does not always mean `3` — a
+document whose spans are all degradable (text runs, text scripts) never touches
+the XSL and still exits `0`.
 
 ## Conventions
 
@@ -552,3 +782,16 @@ you are delivering the result.
   on Windows (`_bootstrap.py`).
 - `requirements.txt` is pure ASCII on purpose — pip reads it with the system
   locale encoding, and a stray em dash breaks the install on a CJK Windows.
+
+## Hard rules
+
+- Formulas in reports and formal documents go through LaTeX→OMML. Only
+  `H₂O`-level sub/superscripts use a `vertAlign` run instead.
+- Every script runs under `python -X utf8`. On Windows `_bootstrap` already
+  switches stdio to UTF-8 — do not add a second `reconfigure()`.
+- Back up before an in-place rewrite. `docx_mathify --inplace` writes
+  `<name>.bak.docx` and `docx_template.py apply --to` without `-o` writes
+  `<file>.bak`; `fix_fonts.py`, `fix_zoom.py`, and `merge_docs.py` keep no copy,
+  so copy the file yourself when the original matters.
+- Only `docx_template.py apply -o` needs node (docx-js skeleton). When the chain
+  is broken, use `apply --to` instead.
