@@ -166,6 +166,13 @@ def footer_parts(path: Path) -> dict:
                 if re.fullmatch(r"word/footer\d*\.xml", n)}
 
 
+def one_error_line(stderr: str) -> str:
+    """stderr 必须**恰好一行**（`error: ...`），没有 traceback 前导。"""
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {stderr}"
+    return lines[0]
+
+
 def pstyle_val(para) -> str | None:
     pPr = para._p.find(w("pPr"))
     if pPr is None:
@@ -364,38 +371,92 @@ def test_set_cell_collapses_a_multi_paragraph_cell(tmp_path: Path):
     assert got.tables[0].cell(0, 1).text == "keep"
 
 
-def test_set_cell_bad_table_index_exits_nonzero_and_keeps_bytes(tmp_path: Path):
-    """表下标越界 → 非零退出，源文件 SHA256 不变（异常在 save 之前抛出）。"""
+def _cell_fixture(tmp_path: Path, name: str = "cellbad.docx") -> Path:
+    """2×2 表 + 1 段正文：三个维度（table/row/col）都有越界余量可测。"""
     d = Document()
-    t = d.add_table(rows=1, cols=1)
-    t.cell(0, 0).text = "r0c0"
-    src = tmp_path / "cellbad.docx"
+    d.add_paragraph("intro")
+    t = d.add_table(rows=2, cols=2)
+    for r in range(2):
+        for c in range(2):
+            t.cell(r, c).text = f"r{r}c{c}"
+    src = tmp_path / name
     d.save(str(src))
-    freeze_docx(src)
+    return freeze_docx(src)
+
+
+@pytest.mark.parametrize("dim,args,needle", [
+    ("table", ["--table", 9, "--row", 0, "--col", 0],
+     "set-cell --table 9 is out of range: legal range is [0, 0], current N=1"),
+    ("row", ["--table", 0, "--row", 9, "--col", 0],
+     "set-cell --row 9 is out of range: legal range is [0, 1], current N=2"),
+    ("col", ["--table", 0, "--row", 0, "--col", 9],
+     "set-cell --col 9 is out of range: legal range is [0, 1], current N=2"),
+])
+def test_set_cell_each_dimension_out_of_range_is_a_usage_error(
+        tmp_path: Path, dim, args, needle):
+    """table / row / col **三个维度各一条**越界 → 退出 2 + stderr 点名是哪个维度。
+
+    为什么要分维度断而不只断「非零退出」：`doc.tables[t].cell(r, c)` 里三个下标
+    各自裸索引，一句泛泛的 `is out of range` 无法告诉调用方到底该改哪一个参数。
+    每条的 stderr 必须**只**包含自己那一维的措辞，别的维度不得出现——否则
+    「把三者写进同一句话」也能骗过只查 `in stderr` 的断言。
+    """
+    src = _cell_fixture(tmp_path, f"cellbad_{dim}.docx")
     before = sha256(src)
+    out = tmp_path / f"cellbad_{dim}_out.docx"
 
-    cp = run_edit("set-cell", src, "--table", 3, "--row", 0,
-                  "--col", 0, "--text", "x")
-    assert cp.returncode != 0
-    assert "IndexError" in cp.stderr
+    cp = run_edit("set-cell", src, *args, "--text", "x", "-o", out)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    line = one_error_line(cp.stderr)
+    assert line == f"error: {needle}"
+    for other in {"table", "row", "col"} - {dim}:
+        assert f"--{other} " not in line, f"{dim} 越界却报了 {other}"
+    assert cp.stdout.strip() == ""
     assert sha256(src) == before
+    assert not out.exists()
 
 
-def test_set_cell_bad_row_exits_nonzero_and_keeps_bytes(tmp_path: Path):
-    """行下标越界同理。"""
-    d = Document()
-    t = d.add_table(rows=1, cols=1)
-    t.cell(0, 0).text = "r0c0"
-    src = tmp_path / "cellbad2.docx"
-    d.save(str(src))
-    freeze_docx(src)
+@pytest.mark.parametrize("dim,args", [
+    ("table", ["--table", -1, "--row", 0, "--col", 0]),
+    ("row", ["--table", 0, "--row", -1, "--col", 0]),
+    ("col", ["--table", 0, "--row", 0, "--col", -1]),
+])
+def test_set_cell_negative_index_is_a_usage_error(tmp_path: Path, dim, args):
+    """三个维度的负下标同样退出 2（`-1` 不再被读成「最后一个」）。"""
+    src = _cell_fixture(tmp_path, f"cellneg_{dim}.docx")
     before = sha256(src)
+    out = tmp_path / f"cellneg_{dim}_out.docx"
 
-    cp = run_edit("set-cell", src, "--table", 0, "--row", 9,
-                  "--col", 0, "--text", "x")
-    assert cp.returncode != 0
-    assert "IndexError" in cp.stderr
+    cp = run_edit("set-cell", src, *args, "--text", "x", "-o", out)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    assert f"set-cell --{dim} -1 is out of range" in one_error_line(cp.stderr)
+    assert cp.stdout.strip() == ""
     assert sha256(src) == before
+    assert not out.exists()
+
+
+def test_set_cell_edge_cells_are_still_accepted(tmp_path: Path):
+    """反向保险：合法边角 `(0,0)` 与 `(1,1)` 照旧成功，输出 JSON 三键不变。
+
+    「越界一律报错」的最省事实现是把范围收得过窄（比如写成 `0 < t < N`），
+    这条专门挡住那种改过头。
+    """
+    src = _cell_fixture(tmp_path, "cell_edge.docx")
+
+    out00 = tmp_path / "cell_edge_00.docx"
+    res00 = payload(run_edit("set-cell", src, "--table", 0, "--row", 0,
+                             "--col", 0, "--text", "TL", "-o", out00))
+    assert (res00["table"], res00["row"], res00["col"]) == (0, 0, 0)
+
+    out11 = tmp_path / "cell_edge_11.docx"
+    res11 = payload(run_edit("set-cell", src, "--table", 0, "--row", 1,
+                             "--col", 1, "--text", "BR", "-o", out11))
+    assert (res11["table"], res11["row"], res11["col"]) == (0, 1, 1)
+
+    assert _grid(Document(str(out00))) == [["TL", "r0c1"], ["r1c0", "r1c1"]]
+    assert _grid(Document(str(out11))) == [["r0c0", "r0c1"], ["r1c0", "BR"]]
 
 
 # ===========================================================================
@@ -499,15 +560,37 @@ def test_delete_last_paragraph_keeps_section_properties(tmp_path: Path):
     assert got.sections[0].page_width is not None
 
 
-def test_delete_out_of_range_exits_nonzero_and_keeps_bytes(tmp_path: Path):
-    """index 越界 → 非零退出（IndexError），源文件 SHA256 不变。"""
+def test_delete_out_of_range_is_a_usage_error(tmp_path: Path):
+    """`delete --index 99` → 退出 2 + stderr 单行带合法范围，原文件零改动。
+
+    旧实现直接 `doc.paragraphs[args.index]`，于是 999 换来十四行
+    `IndexError` traceback 和 exit 1——调用方拿到的是解释器内部错误，
+    而不是「你参数写错了」。P8 定案：用法错误一律 exit 2、stderr 单行。
+    """
     src = save(tmp_path, "delbad.docx", ["a", "b"])
     before = sha256(src)
+    out = tmp_path / "delbad_out.docx"
 
-    cp = run_edit("delete", src, "--index", 99)
-    assert cp.returncode != 0
-    assert "IndexError" in cp.stderr
+    cp = run_edit("delete", src, "--index", 99, "-o", out)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        "error: delete --index 99 is out of range: legal range is [0, 1], "
+        "current N=2")
+    assert cp.stdout.strip() == ""
     assert sha256(src) == before
+    assert not out.exists()
+
+
+def test_delete_every_legal_index_still_works(tmp_path: Path):
+    """反向保险：`0` 与 `N-1` 两个边界照样删得掉，JSON 三键不变。"""
+    for idx in (0, 2):
+        src = save(tmp_path, f"delok{idx}.docx", ["a", "b", "c"])
+        out = tmp_path / f"delok{idx}_out.docx"
+        res = payload(run_edit("delete", src, "--index", idx, "-o", out))
+        assert res["deleted_index"] == idx
+        left = [p_.text for p_ in Document(str(out)).paragraphs]
+        assert left == (["b", "c"] if idx == 0 else ["a", "b"])
 
 
 # ===========================================================================
@@ -548,14 +631,33 @@ def test_style_overwrites_an_existing_pstyle(tmp_path: Path):
     assert got.paragraphs[1].style.name == "Heading 3"
 
 
-def test_style_out_of_range_exits_nonzero_and_keeps_bytes(tmp_path: Path):
+def test_style_out_of_range_is_a_usage_error(tmp_path: Path):
+    """`style --index 99` → 退出 2 + stderr 单行带合法范围，原文件零改动。"""
     src = save(tmp_path, "stybad.docx", ["a", "b"])
     before = sha256(src)
+    out = tmp_path / "stybad_out.docx"
 
-    cp = run_edit("style", src, "--index", 99, "--style", "Heading 1")
-    assert cp.returncode != 0
-    assert "IndexError" in cp.stderr
+    cp = run_edit("style", src, "--index", 99, "--style", "Heading 1", "-o", out)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        "error: style --index 99 is out of range: legal range is [0, 1], "
+        "current N=2")
+    assert cp.stdout.strip() == ""
     assert sha256(src) == before
+    assert not out.exists()
+
+
+def test_style_both_legal_paragraph_endpoints_still_work(tmp_path: Path):
+    """反向保险：首段与末段都还能套样式。"""
+    src = save(tmp_path, "styok.docx", ["a", "b", "c"])
+    for idx in (0, 2):
+        out = tmp_path / f"styok{idx}_out.docx"
+        res = payload(run_edit("style", src, "--index", idx,
+                               "--style", "Heading 1", "-o", out))
+        assert res["index"] == idx
+        assert res["style"] == "Heading 1"
+        assert pstyle_val(Document(str(out)).paragraphs[idx]) == "Heading1"
 
 
 def test_style_unknown_name_exits_nonzero_and_keeps_bytes(tmp_path: Path):
@@ -741,18 +843,46 @@ def test_toc_defaults_to_index_zero(tmp_path: Path):
     assert got.paragraphs[2].text == "beta two"
 
 
-def test_toc_beyond_end_appends_at_tail(tmp_path: Path):
-    """`--index` 超出段落数 → 追加到文末（既有 fallback）。"""
-    src = save(tmp_path, "toc99.docx", ["alpha one", "beta two"])
-    out = tmp_path / "toc99_out.docx"
-    res = payload(run_edit("toc", src, "--index", 99, "-o", out))
-    assert res["toc_inserted_at"] == 99
+def test_toc_legal_endpoints_land_where_asked(tmp_path: Path):
+    """合法区间的两个端点 `0` 与 `N-1` 都必须 exit 0，且落点就是入参。
+
+    ``toc --index`` 的语义是「插在**第 i 段之前**」，所以合法区间与
+    `delete`/`style`/`insert` 同口径：`0 <= i <= N-1`。
+
+    ``toc_inserted_at`` 在这里等于入参，是因为两个端点都真插到了那个位置；
+    本用例同时按 XML 顺序反查落点，避免「回显入参但实际落在别处」。
+
+    历史：本条原为 `test_toc_beyond_end_appends_at_tail`，钉住的是
+    「`--index 99` 静默落进 `doc.add_paragraph` 追加到文末、`toc_inserted_at`
+    回显 99」——那是把**一个缺陷**当契约留档：真实落点是 N（文末），回显却是
+    99，调用方拿到的位置它永远得不到。P8 / D5 把它并入「越界即硬错误」，
+    本用例只留合法端点。
+    """
+    paragraphs = ["alpha one", "beta two", "gamma three"]
+    # 端点 0：TOC 段成为第一段
+    src = save(tmp_path, "toc_lo.docx", paragraphs)
+    out = tmp_path / "toc_lo_out.docx"
+    res = payload(run_edit("toc", src, "--index", 0, "-o", out))
+    assert res["toc_inserted_at"] == 0
 
     got = Document(str(out))
     paras = body_paragraph_elements(got)
-    assert len(paras) == 3
-    assert "TOC" in "".join(instr_texts(paras[-1]))
-    assert got.paragraphs[0].text == "alpha one"
+    assert len(paras) == 4
+    assert "TOC" in "".join(instr_texts(paras[0]))
+
+    # 端点 N-1：TOC 段插在最后一段之前（= 新的倒数第二段）
+    src = save(tmp_path, "toc_hi.docx", paragraphs)
+    out = tmp_path / "toc_hi_out.docx"
+    res = payload(run_edit("toc", src, "--index", 2, "-o", out))
+    assert res["toc_inserted_at"] == 2
+
+    got = Document(str(out))
+    paras = body_paragraph_elements(got)
+    assert len(paras) == 4
+    assert "TOC" in "".join(instr_texts(paras[2]))
+    # TOC 段自己带一句域结果占位文本（`_add_field` 的 cached 值），所以不是空串
+    assert [p_.text for p_ in got.paragraphs][:2] == ["alpha one", "beta two"]
+    assert got.paragraphs[3].text == "gamma three"
 
 
 # ===========================================================================
@@ -972,49 +1102,116 @@ def test_page_numbers_does_not_stack_on_an_existing_page_field(tmp_path: Path, f
 # ===========================================================================
 # 行为记录（当前实现如此，钉住是为了「谁改了必须显式知道」）
 # ===========================================================================
-@pytest.mark.parametrize("cmd,extra,expected", [
-    ("delete", ["--index", -1], ["a", "b"]),
-    ("style", ["--index", -1, "--style", "Heading 1"], ["a", "b", "c"]),
+@pytest.mark.parametrize("cmd,extra", [
+    ("delete", []),
+    ("style", ["--style", "Heading 1"]),
 ])
-def test_negative_index_uses_python_semantics(tmp_path: Path, cmd, extra, expected):
-    """负数 `--index` 不报错，按 Python 负索引解释（-1 = 最后一段）。
+def test_negative_index_is_a_usage_error(tmp_path: Path, cmd, extra):
+    """负数 `--index` → 退出 2，不再借用 Python 负索引语义（P8 / D2b）。
 
-    `docx_edit.py` 的按 index 取段的子命令都是直接 `doc.paragraphs[args.index]`
-    与 `args.index < len(paras)` 判断，CLI 层没有任何 `>= 0` 校验。于是：
-    `delete --index -1` 删**最后一段**、`style --index -1` 给**最后一段**套样式。
-    这是既有行为，不是本轮的期望值；钉住它是为了让「哪天有人加了负索引校验」时
-    这里有红点，逼他确认是不是有意的。
+    历史：本条原为 `test_negative_index_uses_python_semantics`，钉住的是
+    「`delete --index -1` 删末段、`style --index -1` 给末段套样式、两者 exit 0」。
+    那是把**一个缺陷**当契约留档——`-1` 这个入参在任何文档里都不等于「最后一段」：
+    段落增删一次，同一个 `--index -1` 指的就换了一段。P8 定案的全仓退出码口径
+    （`2` = 用法/输入错误）把它改成硬错误，与 `insert` 在 P6 的处置保持一致；
+    `toc` 的 `--index -1` 仍按 Python 语义走（有专门用例钉着），不在本单范围。
 
-    **`insert` 已于 P6 从本参数化里摘出**：负数下标插在「最后一段之前」却回显
-    `-1`，与「回显 = 真实落点」的契约冲突，现改为退出 2（见文件末尾
-    `test_insert_negative_index_exits_two_...`）。
+    断言四件事：退出码 2、stderr 单行且带真实合法范围、stdout 为空、原文件
+    SHA256 不变且输出文件未创建（证明没有任何 `doc.save()` 落在异常路径上）。
     """
     src = save(tmp_path, f"neg_{cmd}.docx", ["a", "b", "c"])
+    before = sha256(src)
     out = tmp_path / f"neg_{cmd}_out.docx"
-    res = payload(run_edit(cmd, src, *extra, "-o", out))
-    assert res["ok"] is True
 
-    got = Document(str(out))
-    assert [p_.text for p_ in got.paragraphs] == expected
-    if cmd == "style":
-        assert pstyle_val(got.paragraphs[-1]) == "Heading1"
-    if cmd == "delete":
-        # 删掉的是末段 c，不是首段 a
-        assert "c" not in expected
+    cp = run_edit(cmd, src, "--index", -1, *extra, "-o", out)
+    assert cp.returncode == 2
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        f"error: {cmd} --index -1 is out of range: legal range is [0, 2], "
+        f"current N=3")
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
 
 
-def test_toc_negative_index_inserts_before_last_paragraph(tmp_path: Path):
-    """`toc --index -1` 同样落进 Python 负索引语义：TOC 段插在**最后一段之前**。"""
+def test_toc_negative_index_is_a_usage_error(tmp_path: Path):
+    """`toc --index -1` 与 `delete`/`style`/`insert` 同口径：退出 2，不落盘。
+
+    历史：本条原为 `test_toc_negative_index_inserts_before_last_paragraph`，
+    钉住的是「`--index -1` 走 Python 负索引、TOC 段插在最后一段之前、exit 0」
+    ——把**一个缺陷**当契约留档。（上一条 `test_negative_index_is_a_usage_error`
+    的 docstring 里那句「`toc` 的 `--index -1` 仍按 Python 语义走（有专门用例
+    钉着），不在本单范围」已随 P8 / D5 作废。）`-1` 在段落增删后会指到另一段，
+    与 `toc_inserted_at` 回显的 `-1` 一起构成「报告一个永远得不到的位置」。
+
+    断言四件事：退出码 2、stderr 单行且带真实合法范围、stdout 为空、原文件
+    SHA256 不变且输出文件未创建。
+    """
     src = save(tmp_path, "neg_toc.docx", ["a", "b", "c"])
+    before = sha256(src)
     out = tmp_path / "neg_toc_out.docx"
-    payload(run_edit("toc", src, "--index", -1, "-o", out))
+
+    cp = run_edit("toc", src, "--index", -1, "-o", out)
+    assert cp.returncode == 2
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        "error: toc --index -1 is out of range: legal range is [0, 2], "
+        "current N=3")
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("bad", [3, 99])
+def test_toc_index_at_or_beyond_n_is_a_usage_error(tmp_path: Path, bad):
+    """`--index >= N` → 退出 2；`N`（刚好差一位）与 `99` 同等对待。
+
+    旧实现里 `args.index < len(paras)` 为假时静默转 `doc.add_paragraph`
+    追加到文末，`toc_inserted_at` 仍回显入参——N 与 99 表现完全相同。
+    """
+    src = save(tmp_path, f"toc_oob_{bad}.docx", ["a", "b", "c"])
+    before = sha256(src)
+    out = tmp_path / f"toc_oob_{bad}_out.docx"
+
+    cp = run_edit("toc", src, "--index", bad, "-o", out)
+    assert cp.returncode == 2, bad
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        f"error: toc --index {bad} is out of range: legal range is [0, 2], "
+        f"current N=3")
+    assert cp.stdout.strip() == ""
+    assert sha256(src) == before
+    assert not out.exists()
+
+
+def test_toc_empty_body_accepts_index_zero_only(tmp_path: Path):
+    """空 body（N=0）只剩一个插入点：`0` 合法（= 追加首段），`1` 退出 2。
+
+    与 `insert --index` 的退化边界同口径（见
+    `test_insert_empty_body_accepts_index_zero_only`）：合法范围 `[0, N-1]`
+    在 N=0 时退化成空集，照搬会连「往空文档写第一个 TOC 段」都封死。
+    """
+    src = tmp_path / "empty_toc.docx"
+    Document().save(str(src))
+    freeze_docx(src)
+
+    out = tmp_path / "empty_toc_out.docx"
+    res = payload(run_edit("toc", src, "--index", 0, "-o", out))
+    assert res["toc_inserted_at"] == 0
 
     got = Document(str(out))
     paras = body_paragraph_elements(got)
-    assert len(paras) == 4
-    assert "TOC" in "".join(instr_texts(paras[2]))
-    assert [p_.text for p_ in got.paragraphs][0] == "a"
-    assert got.paragraphs[-1].text == "c"
+    assert len(paras) == 1
+    assert "TOC" in "".join(instr_texts(paras[0]))
+
+    before = sha256(src)
+    for bad_index in (1, -1):
+        cp = run_edit("toc", src, "--index", bad_index)
+        assert cp.returncode == 2, bad_index
+        assert "out of range" in cp.stderr
+        assert "current N=0" in cp.stderr
+        assert cp.stdout.strip() == ""
+    assert sha256(src) == before
 
 
 def test_paragraph_index_ignores_table_cells(tmp_path: Path):
@@ -1046,11 +1243,14 @@ def test_paragraph_index_ignores_table_cells(tmp_path: Path):
     assert len(got.tables) == 1
     assert got.tables[0].cell(0, 0).text == "cell"
 
-    # index 2 越界：表格段落不在 doc.paragraphs 里
+    # index 2 越界：表格段落不进 doc.paragraphs（P8 起为 exit 2 + 单行 stderr）
     before = sha256(src)
     cp = run_edit("delete", src, "--index", 2)
-    assert cp.returncode != 0
-    assert "IndexError" in cp.stderr
+    assert cp.returncode == 2
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == (
+        "error: delete --index 2 is out of range: legal range is [0, 1], "
+        "current N=2")
     assert sha256(src) == before
     assert Document(str(src)).tables[0].cell(0, 0).text == "cell"
 
@@ -1276,3 +1476,181 @@ def test_insert_empty_body_accepts_index_zero_only(tmp_path: Path):
         assert "current N=0" in cp.stderr
         assert cp.stdout.strip() == ""
     assert sha256(src) == before
+
+
+# ===========================================================================
+# 入口级输入校验：坏输入文件 → exit 2 + 单行 stderr + 零写盘（P8 / D8）
+# ===========================================================================
+# 背景（2026-11-11 实测）：`main()` 在
+# `ap.parse_args()` 之后、任何子命令校验之前就 `Document(args.path)`，于是输入
+# 文件本身坏掉时**八个子命令一起**裸抛异常，exit 1 + 十几行 traceback：
+#
+#   missing    → PackageNotFoundError      （19 行）
+#   directory  → FileNotFoundError         （23 行）
+#   non-zip    → PackageNotFoundError      （19 行）
+#   bare-zip   → KeyError "no [Content_Types].xml"（31 行）
+#
+# `docx_read` 上一轮已经在**入口**做同样的事（`InputError` / `_check_input` /
+# `_open_document`），本文件这一组用例把 `docx_edit` 钉到同一份契约上：
+# 四档 × 多个子命令，一律 exit 2、stdout 空、stderr 恰好一行 `error: ...`、
+# 一个字节都不写。**故意跨子命令参数化**——一条用例只测 `replace` 的话，
+# 「把校验塞进 cmd_replace」也能让它变绿，那就不是入口级校验了。
+def _bad_input_fixtures(tmp_path: Path) -> dict[str, Path]:
+    """四档「这个路径不可能是 Word 包」，每档一个 fixture。
+
+    * `missing`   —— 路径根本不存在（打错字 / cwd 不对 / 引号丢了）
+    * `directory` —— 存在但是目录（shell 通配常见）
+    * `non-zip`   —— 是文件但不是 ZIP（.doc/.rtf/.txt 改了后缀）
+    * `bare-zip`  —— 是 ZIP 但没有 `[Content_Types].xml`（自制压缩包改名）
+    """
+    missing = tmp_path / "no_such_input.docx"
+    if missing.exists():
+        missing.unlink()
+
+    directory = tmp_path / "a_directory.docx"
+    directory.mkdir(exist_ok=True)
+
+    non_zip = tmp_path / "plain_text.docx"
+    non_zip.write_bytes(b"this is plain text, not a zip archive\n")
+
+    bare_zip = tmp_path / "bare_archive.docx"
+    with zipfile.ZipFile(bare_zip, "w") as z:
+        z.writestr("hello.txt", "no content types here")
+        z.writestr("word/document.xml", "<w:document/>")
+
+    return {"missing": missing, "directory": directory,
+            "non-zip": non_zip, "bare-zip": bare_zip}
+
+
+# 四档 × 三个子命令。三个子命令分别落在三条**不同代码路径**上：
+# `replace` 走 if 分支、`normalize` 走 else+try、`page-numbers` 走 else+try 且
+# 会碰 sectPr/footer 部件；三条都退 2 才能排除「某个子命令局部修补」。
+BAD_INPUT_COMMANDS = [
+    ("replace", lambda p: ("replace", p, "--find", "a", "--replace", "b")),
+    ("normalize", lambda p: ("normalize", p)),
+    ("page-numbers", lambda p: ("page-numbers", p)),
+]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "non-zip", "bare-zip"])
+@pytest.mark.parametrize("cmd", [c[0] for c in BAD_INPUT_COMMANDS])
+def test_bad_input_file_is_a_usage_error_before_any_subcommand(
+        tmp_path: Path, kind, cmd):
+    """坏输入 → exit 2、stdout 空、stderr 恰好一行 `error:`、不写盘。
+
+    参数化两维（档 × 子命令）就是为了证明校验收在**入口**：任何一条组合退回
+    「裸 traceback + exit 1」，这里立刻红，且 `one_error_line` 会把那十几行
+    traceback 原样打进失败消息里。
+    """
+    paths = _bad_input_fixtures(tmp_path)
+    target = paths[kind]
+    mk = dict(BAD_INPUT_COMMANDS)[cmd]
+
+    before = sha256(target) if target.is_file() else None
+    out = tmp_path / f"guard_{kind}_{cmd}.docx"
+
+    cp = run_edit(*mk(target), "-o", out)
+
+    assert cp.returncode == 2, (
+        f"{kind}/{cmd}: rc={cp.returncode}\n"
+        f"stdout={cp.stdout!r}\nstderr={cp.stderr}")
+    line = one_error_line(cp.stderr)
+    assert line.startswith("error: "), line
+    # stdout 必须是**空的**：成功路径的 stdout 是 JSON，把失败也写进 stdout
+    # 会让每个 `json.loads(stdout)` 的调用方把失败读成成功。
+    assert cp.stdout == "", f"{kind}/{cmd}: stdout must be empty, got {cp.stdout!r}"
+    # 零写盘：`-o` 指的产物不该存在，输入文件（若真是文件）SHA256 不变。
+    assert not out.exists(), f"{kind}/{cmd}: wrote {out}"
+    if before is not None:
+        assert sha256(target) == before, f"{kind}/{cmd}: input was rewritten"
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "non-zip", "bare-zip"])
+def test_bad_input_message_names_the_specific_failure(tmp_path: Path, kind):
+    """四档各说各的**原因**，不是一句笼统的 "bad file"。
+
+    依据：`SKILL.md` 的报错分类里，这四档对应四种不同的修法（改路径 / 换文件 /
+    重新导出 / 重新打包）。一句 "cannot open" 会把「你打错字了」和「这个 .docx
+    是别人发来的 .doc 改了后缀」压成同一条，调用方无从下手。
+    """
+    paths = _bad_input_fixtures(tmp_path)
+    target = paths[kind]
+
+    cp = run_edit("replace", target, "--find", "a", "--replace", "b")
+    assert cp.returncode == 2
+    line = one_error_line(cp.stderr)
+
+    expect = {
+        "missing": "no such file",
+        "directory": "not a file",
+        "non-zip": "not a ZIP package",
+        "bare-zip": "not a Word package",
+    }[kind]
+    assert expect in line, f"{kind}: expected {expect!r} in {line!r}"
+
+
+def test_input_check_runs_before_subcommand_argument_validation(tmp_path: Path):
+    """坏输入 + 越界 `--index` ⇒ 报的必须是**输入**的错，不是 index 的错。
+
+    这条专门钉「校验的位置」：只有当 `_check_input()` 排在 `Document()` 之前、
+    且 `Document()` 排在子命令分派之前时，同时给两个错才会先报输入。
+    顺序反了（先分派再开文档）时这里会拿到 `out of range`，本条立刻红。
+    """
+    paths = _bad_input_fixtures(tmp_path)
+    cp = run_edit("delete", paths["missing"], "--index", "99")
+    assert cp.returncode == 2
+    line = one_error_line(cp.stderr)
+    assert "no such file" in line, line
+    assert "out of range" not in line, line
+
+
+def test_every_subcommand_refuses_a_missing_input(tmp_path: Path):
+    """八个子命令**全部**在坏输入上退 2 —— 一条不落。
+
+    上一条按「四档 × 3 子命令」取样，这条把其余五个补上（`set-cell` / `insert`
+    / `delete` / `style` / `toc`），保证没有哪个子命令因为自己的参数解析成功
+    就绕过入口校验。
+    """
+    missing = _bad_input_fixtures(tmp_path)["missing"]
+    cases = {
+        "set-cell": ("set-cell", missing, "--table", "0", "--row", "0",
+                     "--col", "0", "--text", "x"),
+        "insert": ("insert", missing, "--index", "0", "--text", "x"),
+        "delete": ("delete", missing, "--index", "0"),
+        "style": ("style", missing, "--index", "0", "--style", "Normal"),
+        "toc": ("toc", missing, "--index", "0"),
+    }
+    for name, argv in cases.items():
+        cp = run_edit(*argv)
+        assert cp.returncode == 2, f"{name}: rc={cp.returncode} {cp.stderr}"
+        assert one_error_line(cp.stderr).startswith("error: "), name
+        assert cp.stdout == "", name
+
+
+def test_input_guard_is_shared_with_docx_read_not_a_copy(tmp_path: Path):
+    """校验逻辑是**从 `docx_read` 拿的同一份**，不是抄了一份。
+
+    为什么钉这个：抄一份的意思是两处判据会各自漂移（`docx_read` 上一轮刚为
+    `KeyError` 补过 bare-zip 一档）。这里断言三个名字**对象同一**——一旦有人
+    在 `docx_edit` 里另写一份 `_check_input`，即使行为当下相同，本条也红。
+    """
+    import docx_edit as de
+    import docx_read as dr
+
+    assert de._check_input is dr._check_input
+    assert de._open_document is dr._open_document
+    assert de.InputError is dr.InputError
+
+
+def test_valid_document_still_round_trips_after_the_guard(tmp_path: Path):
+    """反向保护：加了入口校验，好文件必须照旧 exit 0 + JSON。
+
+    没有这条，「把所有输入都拒掉」也能让上面那组全绿。
+    """
+    src = save(tmp_path, "guard_good.docx", ["alpha", "beta"])
+    out = tmp_path / "guard_good_out.docx"
+    res = payload(run_edit("replace", src, "--find", "alpha",
+                           "--replace", "ALPHA", "-o", out))
+    assert res["replacements"] == 1
+    assert res["ok"] is True
+    assert [p.text for p in Document(str(out)).paragraphs] == ["ALPHA", "beta"]

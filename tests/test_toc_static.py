@@ -17,6 +17,7 @@ No Office engine is involved anywhere: everything is asserted on the XML.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import zipfile
@@ -28,9 +29,11 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from docx import Document  # noqa: E402
+from docx.enum.section import WD_SECTION  # noqa: E402
 from docx.enum.style import WD_STYLE_TYPE  # noqa: E402
 from docx.oxml import OxmlElement  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
+from docx.shared import Mm  # noqa: E402
 
 import docx_create as dc  # noqa: E402
 import docx_toc as toc  # noqa: E402
@@ -508,12 +511,20 @@ def test_insert_at_zero_puts_the_toc_in_front():
     assert all_text(doc.paragraphs[0]) == "第一章"
 
 
-def test_insert_at_past_the_end_appends():
+def test_insert_at_past_the_end_is_refused():
+    """``--insert-at 99`` names a paragraph that does not exist.
+
+    It used to be clamped into an append (``inserted_at: null``, exit 0), which
+    told the caller a position the document never had.  ``docx_edit.py insert
+    --index`` answers the same question with a hard refusal, and this is the
+    same question; see the CLI tests at the bottom of this file.
+    """
     doc = Document()
     doc.add_heading("第一章", level=1)
-    report = toc.build_static_toc(doc, insert_at=99)
-    assert report["inserted_at"] == 1
-    assert toc.is_toc_paragraph(doc.paragraphs[1])
+    with pytest.raises(toc.InsertIndexError):
+        toc.build_static_toc(doc, insert_at=99)
+    assert [p.text for p in doc.paragraphs] == ["第一章"], \
+        "a refused build must not have touched the document"
 
 
 def test_insert_at_keeps_document_order_of_entries():
@@ -679,3 +690,485 @@ def test_cli_omitting_pages_still_writes_empty_slots(tmp_path):
     assert toc.main([str(src), "-o", str(out)]) == 0
     assert [all_text(p) for p in entries_of(Document(str(out)))] == [
         "第一章　静电场", "1.1　库仑定律", "1.1.1　点电荷模型"]
+
+
+# ---- CLI: --insert-at must name a paragraph that exists ----------------------
+#
+# ``--insert-at i`` means "put the TOC before paragraph i", so ``i`` has to be a
+# real body paragraph: ``0 <= i < N``.  Anything else used to be clamped into an
+# append — the run exited 0, wrote the file, and reported ``inserted_at: null``,
+# i.e. the caller was told a position the document never had.  ``docx_edit.py
+# insert --index`` was fixed to refuse the same question with exit 2, so this is
+# the same fix for the same semantics; the API-level counterpart is
+# ``test_insert_at_past_the_end_is_refused`` above.
+#
+# An empty body (N=0) has exactly one honest insertion point: 0, meaning
+# "append" — there is no paragraph to insert before.  That mirrors
+# ``docx_edit._check_insert_index`` exactly.
+
+
+def three_para_doc(tmp_path, name="three.docx"):
+    """A document whose body has exactly three paragraphs, one of them a heading."""
+    doc = Document()
+    doc.add_heading("第一章", level=1)
+    doc.add_paragraph("正文一。")
+    doc.add_paragraph("正文二。")
+    path = tmp_path / name
+    doc.save(path)
+    return path
+
+
+def sha256_of(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_cli_rejects_insert_at_past_the_end(tmp_path, capsys):
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "oor.docx"
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "999"])
+    assert code == 2, "an out-of-range --insert-at must be a usage error"
+    assert not out.exists(), "a rejected run must not write the output file"
+    err = capsys.readouterr().err
+    assert err.startswith("error: "), err
+    assert "--insert-at 999 is out of range" in err, err
+    assert "legal range is [0, 2]" in err, err
+    assert "current N=3" in err, err
+
+
+def test_cli_rejects_insert_at_one_past_the_last_paragraph(tmp_path, capsys):
+    """N is itself out of range: ``i == N-1`` is legal, ``i == N`` is not."""
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "oor_n.docx"
+    assert toc.main([str(src), "-o", str(out), "--insert-at", "3"]) == 2
+    assert not out.exists()
+    assert "legal range is [0, 2]" in capsys.readouterr().err
+
+
+def test_cli_rejects_negative_insert_at(tmp_path, capsys):
+    """A negative index used to be silently clamped to 0 (or to N-len)."""
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "neg.docx"
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "-1"])
+    assert code == 2
+    assert not out.exists(), "a rejected run must not write the output file"
+    err = capsys.readouterr().err
+    assert "--insert-at -1 is out of range" in err, err
+    assert "legal range is [0, 2]" in err, err
+
+
+def test_cli_rejected_insert_at_leaves_an_existing_output_untouched(tmp_path):
+    """The stronger zero-write claim: an *existing* file keeps its exact bytes.
+
+    ``-o`` pointing at a real file is the normal case when regenerating, so
+    "nothing is written" has to mean the bytes on disk did not move — a refused
+    run that truncated or re-saved the file would be a data loss, not a warning.
+    """
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "existing.docx"
+    toc.main([str(src), "-o", str(out)])           # a legitimate first write
+    before = sha256_of(out)
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "999"])
+    assert code == 2
+    assert sha256_of(out) == before, "the refused run rewrote the output file"
+
+
+def test_cli_rejected_insert_at_leaves_the_input_untouched(tmp_path):
+    """No ``-o`` means "overwrite the input"; a refusal must not do that either."""
+    src = three_para_doc(tmp_path)
+    before = sha256_of(src)
+    assert toc.main([str(src), "--insert-at", "-5"]) == 2
+    assert sha256_of(src) == before
+
+
+def test_cli_insert_at_zero_lands_at_the_front(tmp_path, capsys):
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "front.docx"
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "0"])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["inserted_at"] == 0
+    written = Document(str(out))
+    assert toc.is_toc_paragraph(written.paragraphs[0])
+    assert not toc.is_toc_paragraph(written.paragraphs[1])
+    assert written.paragraphs[1].text == "第一章"
+
+
+def test_cli_insert_at_last_paragraph_lands_before_it(tmp_path, capsys):
+    """``i == N-1`` is legal and means "before the last paragraph"."""
+    src = three_para_doc(tmp_path)
+    out = tmp_path / "before_last.docx"
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "2"])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["inserted_at"] == 2
+    written = Document(str(out))
+    assert [p.text for p in written.paragraphs][0] == "第一章"
+    assert toc.is_toc_paragraph(written.paragraphs[2])
+    assert written.paragraphs[3].text == "正文二。"
+
+
+def test_cli_empty_body_insert_at_zero_appends(tmp_path, capsys):
+    """N=0: the only valid index is 0, and it means "append"."""
+    empty = tmp_path / "empty.docx"
+    Document().save(empty)
+    out = tmp_path / "empty_out.docx"
+    code = toc.main([str(empty), "-o", str(out), "--insert-at", "0"])
+    assert code == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["entries"] == 0
+    assert out.exists()
+
+
+def test_cli_empty_body_insert_at_one_is_refused(tmp_path, capsys):
+    empty = tmp_path / "empty2.docx"
+    Document().save(empty)
+    out = tmp_path / "empty_bad.docx"
+    code = toc.main([str(empty), "-o", str(out), "--insert-at", "1"])
+    assert code == 2
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert "--insert-at 1 is out of range" in err, err
+    assert "current N=0" in err, err
+
+
+# ---- rebuilding: the index must still exist after the old TOC is removed ------
+#
+# ``--insert-at i`` is judged against the body the caller *named*.  Rebuilding a
+# TOC removes the previous one first, which shortens that body -- so an index
+# that was legal can point past the end a moment later.  Appending in that case
+# is silent misplacement, not a fallback: measured on a nine-paragraph document
+# whose TOC sat at the top, ``--insert-at 8`` was accepted, the old TOC (three
+# paragraphs) was removed leaving N=6, and the rebuilt TOC was appended at the
+# bottom with exit 0 -- the TOC jumped from the front to the end and nobody was
+# told.  These cases pin the refusal instead.
+
+
+def doc_with_a_toc(tmp_path, name="with_toc.docx"):
+    """A three-paragraph body that already carries this module's TOC at the top.
+
+    The body has one heading, so the TOC this module writes is a *single* entry
+    paragraph: the document goes from N=3 to N=4, and dropping that TOC takes it
+    back to N=3.
+    """
+    doc = Document()
+    doc.add_heading("第一章", level=1)
+    doc.add_paragraph("正文一。")
+    doc.add_paragraph("正文二。")
+    toc.build_static_toc(doc, insert_at=0)
+    path = tmp_path / name
+    doc.save(path)
+    return path
+
+
+def test_cli_insert_at_vanishing_after_toc_removal_is_refused(tmp_path, capsys):
+    """An index legal before removal but past the end after it is a usage error.
+
+    Regression: this used to exit 0 and move the TOC to the end of the document.
+    """
+    src = doc_with_a_toc(tmp_path)
+    out = tmp_path / "rebuilt.docx"
+    before = sha256_of(src)
+    # N is 4 here (3 body + 1 TOC entry); 3 is legal now but the removal of that
+    # entry leaves N=3, so index 3 no longer names a paragraph.
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "3"])
+    assert code == 2, "an index that the TOC removal pushed past the end must be refused"
+    assert not out.exists(), "a refused rebuild must not write"
+    assert sha256_of(src) == before, "the input must be untouched"
+    err = capsys.readouterr().err
+    assert "out of range after the previous TOC was removed" in err, err
+    assert "current N=3" in err, err
+    assert "Traceback" not in err
+
+
+def test_cli_insert_at_surviving_the_toc_removal_is_honoured(tmp_path, capsys):
+    """An index that is still inside the shortened body is used as-is."""
+    src = doc_with_a_toc(tmp_path)
+    out = tmp_path / "rebuilt_ok.docx"
+    code = toc.main([str(src), "-o", str(out), "--insert-at", "2"])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    # 3 body paragraphs survive the removal, so index 2 = before "正文二。"
+    assert report["inserted_at"] == 2
+    written = Document(str(out))
+    assert toc.is_toc_paragraph(written.paragraphs[2])
+    assert written.paragraphs[3].text == "正文二。"
+
+
+def test_cli_rebuild_without_insert_at_lands_where_the_old_toc_was(tmp_path, capsys):
+    """Omitting ``--insert-at`` keeps the "rebuild in place" path working."""
+    src = doc_with_a_toc(tmp_path)
+    out = tmp_path / "rebuilt_inplace.docx"
+    code = toc.main([str(src), "-o", str(out)])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["dropped_entries"] == 1, "the old TOC must have been removed"
+    assert report["inserted_at"] == 0, "the rebuild belongs where the old TOC was"
+    written = Document(str(out))
+    assert toc.is_toc_paragraph(written.paragraphs[0])
+
+# ---- sections: which geometry the tab stop follows ---------------------------
+#
+# A right tab stop has to sit on the right edge of the *text block the entries
+# land in*, and the text block is a property of a section.  Two ways of picking
+# the wrong section were measured on a three-section sample (text blocks
+# 155.89 / 175.9 / 195.9 mm), both of which wrote the file and exited 0:
+#
+# * ``--section-index 99`` silently fell back to section 0 (40 mm off);
+# * ``--insert-at`` mixed up which section owned the paragraph, because
+#   ``w:pPr/w:sectPr`` marks the **last** paragraph of a section -- the loop
+#   counted the break paragraph itself and then subtracted one, so any
+#   paragraph that was *not* a break borrowed the previous section's width.
+#
+# Both are silent misplacement: every dotted leader in the TOC lands somewhere
+# other than the right margin, and nothing on stderr says so.
+
+
+def _fold_break_into_previous_paragraph(doc):
+    """Move the section break ``add_section`` just added into the para above.
+
+    ``Document.add_section()`` closes the section with a *new empty* paragraph
+    that holds ``w:pPr/w:sectPr``.  Word puts the break in the last paragraph
+    that has content instead, and that difference is the whole subject of the
+    ``--insert-at`` cases below: their expectations depend on the break sitting
+    on a *content* paragraph, at index 2 and 5.
+    """
+    paragraphs = doc.paragraphs
+    carrier, previous = paragraphs[-1]._p, paragraphs[-2]._p
+    pPr = carrier.find(qn("w:pPr"))
+    sectPr = pPr.find(qn("w:sectPr"))
+    pPr.remove(sectPr)
+    previous_pPr = previous.find(qn("w:pPr"))
+    if previous_pPr is None:
+        previous_pPr = previous.get_or_add_pPr()
+    previous_pPr.append(sectPr)
+    carrier.getparent().remove(carrier)
+
+
+def three_section_doc(tmp_path, name="three_sections.docx"):
+    """Eight paragraphs in three sections; breaks on paragraphs 2 and 5.
+
+    Text blocks 155.89 / 175.9 / 195.9 mm (Letter page, 30/20/10 mm margins),
+    so the three sections can be told apart by the tab stop alone.  The
+    paragraphs that carry the break belong to the section they *close*:
+
+    ``0 1 2 | 3 4 5 | 6 7``
+       S0      S1      S2
+    """
+    doc = Document()
+    doc.sections[0].left_margin = Mm(30)
+    doc.sections[0].right_margin = Mm(30)
+    doc.add_heading("第一章　第一节", level=1)
+    doc.add_paragraph("第一节正文。")
+    doc.add_heading("第二章　第一节末", level=1)
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    _fold_break_into_previous_paragraph(doc)
+    doc.sections[1].left_margin = Mm(20)
+    doc.sections[1].right_margin = Mm(20)
+    doc.add_heading("第三章　第二节", level=1)
+    doc.add_paragraph("第二节正文。")
+    doc.add_heading("第四章　第二节末", level=1)
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    _fold_break_into_previous_paragraph(doc)
+    doc.sections[2].left_margin = Mm(10)
+    doc.sections[2].right_margin = Mm(10)
+    doc.add_heading("第五章　第三节", level=1)
+    doc.add_paragraph("第三节正文。")
+    path = tmp_path / name
+    doc.save(path)
+    return path
+
+
+def section_widths_mm(path):
+    """Text-block width of every section, read back from the file itself."""
+    return [dc.content_width_mm(section) for section in Document(str(path)).sections]
+
+
+def assert_three_distinct_sections(widths):
+    """Guard the sample: if the three widths were equal the cases prove nothing."""
+    assert len(widths) == 3, widths
+    assert len(set(widths)) == 3, "the sample must give each section its own width"
+    assert widths[0] < widths[1] < widths[2], widths
+
+
+def entry_tab_stop_mm(path):
+    """Tab stop written on the first TOC entry of a saved file (the artifact)."""
+    entries = entries_of(Document(str(path)))
+    assert entries, "the sample has headings, so the TOC cannot be empty"
+    return stops_of(entries[0])[0][0]
+
+
+# ---- CLI: --section-index must name a section that exists ---------------------
+#
+# ``--section-index`` is the caller saying "I know which section this TOC goes
+# into; take the width from there".  An index that names no section cannot be
+# answered honestly -- falling back to section 0 hands back a width nobody asked
+# for and misplaces every leader by the margin difference (40 mm on this
+# sample).  Refusing is the only answer that keeps the caller's model of the
+# document intact.
+
+
+def test_cli_section_index_past_the_end_is_refused(tmp_path, capsys):
+    """``--section-index 99`` on three sections used to write a wrong TOC, exit 0."""
+    src = three_section_doc(tmp_path)
+    out = tmp_path / "oor_section.docx"
+    before = sha256_of(src)
+    code = toc.main([str(src), "-o", str(out), "--section-index", "99"])
+    assert code == 2, "an out-of-range --section-index must be a usage error"
+    assert not out.exists(), "a refused build must not write"
+    assert sha256_of(src) == before, "the input must be untouched"
+    captured = capsys.readouterr()
+    assert captured.out == "", "stdout is reserved for the success report"
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 1, captured.err
+    assert lines[0].startswith("error:"), captured.err
+    assert "--section-index 99" in lines[0], captured.err
+    assert "[0, 2]" in lines[0], "the message must state the real legal range"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_section_index_negative_past_the_start_is_refused(tmp_path, capsys):
+    """A negative index is legal down to ``-N``; one past that is not."""
+    src = three_section_doc(tmp_path)
+    out = tmp_path / "neg_section.docx"
+    for value in ("-4", "-99"):
+        code = toc.main([str(src), "-o", str(out), "--section-index", value])
+        assert code == 2, "--section-index %s must be refused" % value
+        assert not out.exists()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert len(captured.err.strip().splitlines()) == 1, captured.err
+        assert captured.err.startswith("error:"), captured.err
+        assert "[0, 2]" in captured.err, captured.err
+
+
+@pytest.mark.parametrize("value,index", [("0", 0), ("1", 1), ("2", 2),
+                                         ("-1", 2), ("-2", 1), ("-3", 0)])
+def test_cli_section_index_legal_values_pick_that_sections_width(tmp_path, capsys,
+                                                                 value, index):
+    """The legal range keeps working, including the from-the-end spelling."""
+    src = three_section_doc(tmp_path)
+    widths = section_widths_mm(src)
+    assert_three_distinct_sections(widths)
+    out = tmp_path / ("ok_section_%s.docx" % value.replace("-", "m"))
+    code = toc.main([str(src), "-o", str(out), "--section-index", value])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["section_index"] == index
+    assert report["tab_pos_mm"] == pytest.approx(widths[index], abs=0.01)
+    assert entry_tab_stop_mm(out) == pytest.approx(widths[index], abs=0.01)
+
+
+# ---- CLI: --insert-at must follow the section that owns the paragraph ---------
+#
+# ``at`` names a paragraph, and the TOC is inserted *before* it, so the entries
+# land in the section that paragraph belongs to.  ``w:pPr/w:sectPr`` marks the
+# last paragraph of a section, therefore the owning index is "how many break
+# paragraphs come strictly before ``at``" -- a break paragraph is the last one of
+# its own section, never the first of the next.
+
+
+@pytest.mark.parametrize("insert_at,index", [
+    (0, 0), (1, 0), (2, 0),        # 2 carries S0's break, so it is still S0
+    (3, 1), (4, 1), (5, 1),        # 5 carries S1's break, so it is still S1
+    (6, 2), (7, 2),
+])
+def test_cli_insert_at_follows_the_owning_sections_width(tmp_path, capsys,
+                                                         insert_at, index):
+    src = three_section_doc(tmp_path)
+    widths = section_widths_mm(src)
+    assert_three_distinct_sections(widths)
+    out = tmp_path / ("ia_%d.docx" % insert_at)
+    code = toc.main([str(src), "-o", str(out), "--insert-at", str(insert_at)])
+    assert code == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["section_index"] == index, (
+        "--insert-at %d belongs to section %d" % (insert_at, index))
+    assert report["tab_pos_mm"] == pytest.approx(widths[index], abs=0.01)
+    assert entry_tab_stop_mm(out) == pytest.approx(widths[index], abs=0.01)
+
+
+def test_cli_insert_at_off_by_one_cases_borrowed_the_previous_section(tmp_path, capsys):
+    """The four indices that used to take the *previous* section's width.
+
+    Kept as a named case so the regression is recognisable: the assertion is not
+    just "some number", it is "this width and explicitly not the neighbouring
+    one", which is what a "minus one" bug actually produces.
+    """
+    src = three_section_doc(tmp_path)
+    widths = section_widths_mm(src)
+    assert_three_distinct_sections(widths)
+    expected = {3: widths[1], 4: widths[1], 6: widths[2], 7: widths[2]}
+    wrong = {3: widths[0], 4: widths[0], 6: widths[1], 7: widths[1]}
+    for insert_at, want in expected.items():
+        out = tmp_path / ("oob_%d.docx" % insert_at)
+        code = toc.main([str(src), "-o", str(out), "--insert-at", str(insert_at)])
+        assert code == 0, capsys.readouterr().err
+        report = json.loads(capsys.readouterr().out)
+        assert report["tab_pos_mm"] == pytest.approx(want, abs=0.01), (
+            "--insert-at %d must use its own section (%r), not the previous "
+            "one (%r)" % (insert_at, want, wrong[insert_at]))
+        assert entry_tab_stop_mm(out) == pytest.approx(want, abs=0.01)
+
+
+# ---- CLI: a path that is not a .docx is a usage error, not a crash ------------
+#
+# Every mode of this CLI prints JSON to stdout on success, so a failure must not
+# look like an empty-but-successful run.  Before the guard below, a missing file
+# died inside ``Document()``: 19 lines of traceback on stderr, exit 1, and the
+# caller had to parse a Python stack to learn the path was wrong.
+
+
+def bad_input_paths(tmp_path):
+    """The four ways the named path can fail to be a Word package."""
+    missing = tmp_path / "no_such_file.docx"
+    directory = tmp_path / "a_directory.docx"
+    directory.mkdir()
+    not_a_zip = tmp_path / "not_a_zip.docx"
+    not_a_zip.write_bytes(b"this is not a zip at all\n")
+    zip_without_word = tmp_path / "zip_without_word.docx"
+    with zipfile.ZipFile(zip_without_word, "w") as zf:
+        zf.writestr("hello.txt", "a zip, but no [Content_Types].xml")
+    return {"missing": missing, "directory": directory,
+            "not-a-zip": not_a_zip, "zip-without-word": zip_without_word}
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "not-a-zip",
+                                  "zip-without-word"])
+def test_cli_bad_input_is_one_line_usage_error(tmp_path, capsys, kind):
+    src = bad_input_paths(tmp_path)[kind]
+    out = tmp_path / "never_written.docx"
+    code = toc.main([str(src), "-o", str(out)])
+    assert code == 2, "%s must be a usage error, not a crash" % kind
+    assert not out.exists(), "a refused run must not write"
+    captured = capsys.readouterr()
+    assert captured.out == "", "stdout stays empty; success is the only JSON"
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 1, "want one line, got %d:\n%s" % (len(lines), captured.err)
+    assert lines[0].startswith("error:"), captured.err
+    assert "Traceback" not in captured.err
+    assert str(src) in lines[0] or src.name in lines[0], (
+        "the message must name the path that was wrong: %r" % lines[0])
+
+
+def test_cli_bad_input_leaves_an_existing_output_untouched(tmp_path, capsys):
+    """Refusing must not truncate a file the caller already had there."""
+    src = bad_input_paths(tmp_path)["not-a-zip"]
+    out = tmp_path / "previous.docx"
+    out.write_bytes(b"previous contents, must survive\n")
+    before = sha256_of(out)
+    assert toc.main([str(src), "-o", str(out)]) == 2
+    assert sha256_of(out) == before, "the refused run must not touch the output"
+    capsys.readouterr()
+
+
+def test_toc_reuses_the_docx_read_input_guard():
+    """One guard for the whole skill: the shared names, not a private copy.
+
+    ``docx_read`` already knows the fourth failure (a ZIP with no
+    ``[Content_Types].xml``, which ``is_zipfile`` happily accepts); a private
+    copy here would drift away from it the first time that list changes.
+    """
+    import docx_read as dr
+
+    assert toc._check_input is dr._check_input
+    assert toc._open_document is dr._open_document
+    assert toc.InputError is dr.InputError

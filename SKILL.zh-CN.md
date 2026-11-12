@@ -128,11 +128,14 @@ python scripts/docx_template.py fill tpl.docx values.json out.docx --strict
 
 | 脚本 | `--index` 数的是什么 | 越界 |
 |---|---|---|
-| `docx_edit insert` | body 段落；`N` 合法，表示追加到末尾 | exit `2`，报错里给合法区间 |
-| `docx_edit delete` / `style` | body 段落 | exit `1`（`IndexError`） |
+| `docx_edit insert` | body 段落；下标指新段落**插在谁之前**，所以合法区间是 `[0, N-1]` | exit `2`，报错里给合法区间 |
+| `docx_edit delete` / `style` | body 段落 | exit `2`，报错里给合法区间 |
+| `docx_edit toc` | body 段落 | exit `2`，报错里给合法区间 |
 | `docx_crossref` | body 段落 | exit `2`，报错里给合法区间 |
 | `docx_numbering` | **body + 表格**段落，按文档顺序；`lo:hi` 是半开区间，`--index` 可重复传 | exit `1`，报「selection matched no paragraphs」 |
-| `docx_toc --insert-at` | body 段落 | 截到 body 末尾 |
+| `docx_toc --insert-at` | body 段落 | exit `2`，报错里给合法区间 |
+
+上表每一处拒绝都发生在**动文档之前**：不写文件、输入逐字节不变、stdout 保持空，报错走 stderr 一行 `error: …`，写清哪个选项、你给的值、以及什么区间才成立，例如 `error: delete --index 99 is out of range: legal range is [0, 3], current N=4`。负数下标同样按越界拒收，而不是交给 Python 的负索引去读：`-1` 在**任何持久意义上**都不是「最后一段」——增删一段，同一个参数就指向别处了。
 
 `docx_toc` 报告里的 `inserted_at` 是另一回事：它是目录**实际**写入的位置，插入后量出来的，不是入参。
 
@@ -155,9 +158,23 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 
 这两个名字看着像一对 `+`/`-`，实际写的是两个不同的 dest（`fix_formulas` / `omml_formulas`），所以早先同传会一边关掉 marker 通道、一边把裸 `_xx_` 标记交给 OMML 转换器 —— 转换随之失败，而 CLI 仍退 `0`。现在是 argparse 冲突，exit `2`。不给 `-o` 时 `apply --to` 就地改写目标、但先写一份 `<文件>.bak`；给了 `-o`，`--to` 那份原文件一个字节都不动。
 
+**`--fix-formulas` 会把 `docx_mathify` 的退出码原样往上报，包括 `3`。** OMML 通道是就地跑一遍 mathify，而那边的 `3` 意思是「文档已写出，但至少一条公式还是线性文本」—— 唯一一个「有产物 + 非零码」的出口。这里若仍旧报 `0`，就等于把半成品当完成品交给调用方。所以现在 `apply` 返回的就是 mathify 返回的那个值：`1` 和 `2` 原样透传，`3` 也透传为 `3`，只有 `0` 才归零。`--no-fix-formulas` 压根不调 mathify，行为与从前一致。
+
 ## 创建文档
 
 `docx_create.py` 读一份 JSON spec。顶层键：`page`、`styles`、`header`、`footer`、`footer_page_numbers`、`blocks`。每个 block 有一个 `type`：
+
+`footer_page_numbers`（顶层或 `section_break` 里）接受 `fmt`、`start`、`align`、`template`、`total`、`prefix`、`suffix`、`page_type`，以及 `font`、`size_pt`、`bold`——这三个作用于承载页码的 run：`font` 与 `size_pt` 文字 run 和域 run 都吃，`bold` 对承载页码数字的域 run 只在真值时生效（精确口径见下表）。它们早先一设就抛 `ValueError`，现在可用；中英混排的页脚里 `font` 会把四个 `w:rFonts` 槽（`ascii` / `hAnsi` / `eastAsia` / `cs`）一起绑死，`第 X 页 共 Y 页` 这种中文前缀才不会退回主题的东亚字体、让数字单独用你指定的那个。
+
+**`bold` 作用在两类 run 上，而这两类走两套规则——所以 `"bold": false` 与不传 `bold` 不是同一个请求。** 一份 `page_of` 页脚由文字 run（`"Page "`、`" of "`、中文前后缀）和域 run（`PAGE` / `NUMPAGES` 域：页码数字本身，外加它的 begin / separate / end 三根骨架）混成。文字 run 走 `run.font.bold`，三态；域 run 走 `_rpr()`，那里写的是 `if bold:`，两态。拿同一份页脚、把 `font` 与 `size_pt` 按住不动，XML 里的差别就是这三行：
+
+| `bold` | 文字 run | 域 run（页码数字） | `word/footer1.xml` | `<w:b` |
+|---|---|---|---|---|
+| `true` | `run.font.bold = True` → `<w:b/>` | 十个域 run 全写 `<w:b w:val="1"/>` **加** `<w:bCs w:val="1"/>` | 4232 字节 | 22 处：12 个 `w:b`（每个 run 一个）+ 10 个 `w:bCs` |
+| `false` | `run.font.bold = False` → `<w:b w:val="0"/>`，显式**关** | **一个字节都不写**；`False` 与「没传」走同一分支 | 3912 字节 | 2 处，只在文字 run 上 |
+| 不传 | 什么都不写，继续继承 | 什么都不写 | 3880 字节 | 0 处 |
+
+这三个数就是全部结论：`false` 与不传**差 32 字节**（每个文字 run 16 字节），**两者不等价**；而且这两种写法**都不会给页码数字取消粗体**——数字在域 run 里，而域 run 只在 `bold` 为真值时才会拿到 `w:b`。所以如果页脚的 `Footer` 样式本身是粗体，`"bold": false` 只把 `"Page "` 与 `" of "` 压成不加粗，数字照旧粗着——看着像 bug，其实是本文写明的行为。要么在样式层关掉粗体，要么让 `bold` 保持真值、两类一起粗。（`section_break` 的 `header_bold` / `footer_bold` 是另一回事：那两个写的是纯文字 run、里面没有域，所以 `false` 是干净的显式关——实测唯一那个 run 上就是一条 `<w:b w:val="0"/>`——「不加粗」这个意思成立。）
 
 | `type` | 字段 |
 |---|---|
@@ -171,7 +188,7 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 | `table` | `header`、`rows`，可选 `style`（默认 `Table Grid`）、`header_bold` |
 | `image` | `path`，可选 `width_mm` |
 | `page_break` | — |
-| `section_break` | `start_type`，可选 `page`、`header` / `footer`（及其 `_align` / `_font` / `_size_pt` / `_bold`）、`footer_page_numbers`、`different_first_page`、`cols`、`no_footer`、`reuse_last_paragraph`、`apply_to` |
+| `section_break` | `start_type`，可选 `page`、`header` / `footer`（及其 `_align` / `_font` / `_size_pt` / `_bold`）、`footer_page_numbers`（`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`，以及给页码 run 用的 `font` / `size_pt` / `bold`——见上面那张 `bold` 表：`false` 管得到文字 run，管不到域 run）、`different_first_page`、`cols`、`no_footer`、`reuse_last_paragraph`、`apply_to` |
 | `toc` | 可选 `instr` —— 默认 `TOC \o "1-3" \h \z \u`；要图目录就传 `TOC \h \c "图"`。**这是一个域**：Word 必须更新（F9）之后才有条目 |
 
 **spec 在写出任何一段之前先被校验；未知键与未知 block type 都是错误，不是 no-op。** 早先 `{"blockz": [...]}` 会造出一份合法但空白的文档、打印 `"blocks": 0`、退出 `0`，作者根本看不出内容没进去。现在一律 exit `2`，一行报错点名出问题的键，拼写接近时还给提示：
@@ -223,7 +240,7 @@ report = toc.build_static_toc(doc, levels=(1, 2, 3), pages=["1", "3", "7"],
 | `--levels` | 收哪几级大纲，`1,2` 或 `1-3`（默认 `1,2,3`） |
 | `--pages` | 每个条目一个页码；**个数与条目数不等就是用法错误（exit 2）** |
 | `--title` | 目录本身的标题文字 |
-| `--insert-at` | 插到这个 body 段落下标之前（默认：上次目录所在处，否则末尾） |
+| `--insert-at` | 插到这个 body 段落下标之前（默认：上次目录所在处，否则末尾）；越界是 exit `2` |
 | `--section-index` | 用哪一节的版心宽度定右制表位 |
 | `--indent-chars` | 每级左缩进字符数（默认 `0,2,4`） |
 | `--adopt-unmarked` | 连本模块没写的旧目录一起替换——默认关，因为那可能是用户自己的 |
@@ -278,7 +295,7 @@ Word 的编号是**两级间接**，本工具链别的脚本从没暴露过这�
 
 两个入口共用一个引擎（`math_omml.py`）：
 
-- **`docx_mathify.py` —— 批量。** 扫全篇，把写成 Unicode 字符 + 真上下标 run 的公式（`U`+sub`oc`、`√2`、`1kΩ=10³Ω`、`∠53.1°`）转成原生 OMML，中文行文、表格结构、字号都不动。`--dry-run` 只报不写；`--report md` 记下每对 before/after，另给计数与「哪些片段走了免排版阶」的逐段表。`--inplace` 会先写一份 `<名>.bak.docx`；`--inplace` 与 `-o` 同传是用法错误（exit `2`），因为落点无法判定。
+- **`docx_mathify.py` —— 批量。** 扫全篇，把写成 Unicode 字符 + 真上下标 run 的公式（`U`+sub`oc`、`√2`、`1kΩ=10³Ω`、`∠53.1°`）转成原生 OMML，中文行文、表格结构、字号都不动。`--dry-run` 只报不写；`--report md` 记下每对 before/after，另给计数与「哪些片段走了免排版阶」的逐段表。`--inplace` 会先写一份 `<名>.bak.docx`；`--inplace` 与 `-o` 同传是用法错误（exit `2`），因为落点无法判定；`-o` 与 `--dry-run` 同传同样是 exit `2` —— dry-run 一个文件都不写，`-o` 指定的落点永远不可能产生，原先却会静默并回显一个根本没被创建的路径。
 - **`insert_formula.py` —— 单条。** 吃 LaTeX，把一条公式插进解包目录的锚点上。
 
 `insert_formula.py` 有三条规矩，每一条都是为了让参数冲突当场报错、而不是静默走偏：
@@ -505,11 +522,17 @@ tests/       pytest 套件 —— 47 个 .py（46 个 test_*.py + _omml.py 辅�
 | 码 | 含义 |
 |---|---|
 | `0` | 成功 |
-| `1` | 预期内的失败 —— marker 没命中、未知或重名的书签、输入文件缺失或不是可读的 `.docx`、文档里没有你要的东西、运行期异常 |
-| `2` | 用法错误 —— argparse、`--index` 越界或负数（脚本做了这项校验的）、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传 |
-| `3` | **仅 `docx_mathify`**：文档已写出，但至少一条公式没转成 |
+| `1` | 预期内的失败 —— marker 没命中、未知或重名的书签、文档里没有你要的东西、运行期异常 |
+| `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包 |
+| `3` | **仅 `docx_mathify`**（以及把它的码透传出来的 `docx_template apply --fix-formulas`）：文档已写出，但至少一条公式没转成 |
+
+用法错误是**拒收，不是修补**：判定发生在任何读写之前，输入文件逐字节不变，消息是 stderr 上的一行 `error: …`，stdout 保持空。
+
+第 `2` 行里那条「输入路径」只约束**会打开文档的 CLI**，不是「仓里每个脚本都这样」：`docx_validate` 是刻意的例外——「这个包坏了」是它的**答案**，不是用错工具，所以它往 stdout 打 `{"ok": false, …}` 并 exit `1`，读它的 JSON 而不是它的退出码。其余那些以 `1` 报出来的失败（marker 没命中、书签不存在）都发生在**路径已经被接受之后**，那正是第 `2` 行划的界线。
 
 `docx_mathify` 返回 `3` 是**故意的**：输出文件有效、绝大多数公式已转，但至少一条公式还是线性文本。**交付前必须查退出码**，只看文件存不存在会把半个公式发出去。「缺 XSL」并不必然退 `3`——文档里全是可降级片段（文字 run / 文字角标）时压根不碰 XSL，仍退 `0`。
+
+`docx_read` 是 stdout 这条规矩最锋利的例子，因为它**每一种**成功模式都往 stdout 写 JSON：文件不存在、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，四种情况一律 exit `2`、stderr 一行、**stdout 一个字节都没有**。把失败当成 JSON 从 stdout 回传，会让每个 `json.loads(stdout)` 调用方把失败读成成功。「文档是真的、但里头有问题」归 `docx_validate` 管，那种走 exit `1`。
 
 ## 约定（Conventions）
 

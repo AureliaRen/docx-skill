@@ -37,9 +37,17 @@ import json
 import os
 import sys
 
-from docx import Document
-
 from docx_common import iter_all_paragraphs, replace_in_paragraph
+
+# Input validation is **not** reimplemented here. `docx_read` owns the single
+# definition (`InputError` / `_check_input` / `_open_document`) so the two CLIs
+# cannot drift apart — `docx_read` already learned the fourth case the hard way
+# (a ZIP with no `[Content_Types].xml` dies on a bare `KeyError`). Reusing the
+# underscore names is the established shape in this repo, not a new liberty:
+# `docx_toc.py` imports `docx_create._apply_tab_stops` /
+# `docx_create._bookmark_para` the same way. Both halves are in `scripts/`,
+# which `_bootstrap` already put on `sys.path`.
+from docx_read import InputError, _check_input, _open_document
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -55,13 +63,65 @@ def cmd_replace(doc, args) -> dict:
     return {"replacements": n}
 
 
+def _check_range(what: str, value: int, n: int) -> None:
+    """Refuse a ``value`` that does not name a real element of ``n`` items.
+
+    ``what`` is the ``--option`` name, so the message can say which of
+    ``--table`` / ``--row`` / ``--col`` / ``--index`` the caller got wrong.
+    ``set-cell`` needs that distinction: one call indexes three dimensions, and
+    a message that does not name the bad one forces the caller to guess which
+    argument to fix.
+
+    Negative values are rejected rather than read through Python's negative
+    indexing. ``-1`` is not "the last paragraph" in any durable sense — add or
+    delete one paragraph and the same argument means a different one — so a
+    caller that wrote ``-1`` has a bug, and echoing success hides it.
+    """
+    if n == 0:
+        raise IndexOutOfRangeError(
+            f"{what} {value} is out of range: there is nothing to index, "
+            f"so no index is legal (current N=0)")
+    if not 0 <= value <= n - 1:
+        raise IndexOutOfRangeError(
+            f"{what} {value} is out of range: "
+            f"legal range is [0, {n - 1}], current N={n}")
+
+
 def cmd_set_cell(doc, args) -> dict:
-    cell = doc.tables[args.table].cell(args.row, args.col)
-    cell.text = args.text
+    """Set one table cell's text, refusing any index that names nothing.
+
+    All three dimensions are checked, in order, before a cell is touched; the
+    message names the dimension that was wrong together with its own legal
+    range, so ``--row 9`` never reports the column count.
+
+    Column count comes from the row itself rather than ``table.columns``: a
+    cell grid can be ragged, and ``table.cell(row, col)`` indexes the row.
+    """
+    tables = doc.tables
+    _check_range("set-cell --table", args.table, len(tables))
+    table = tables[args.table]
+    rows = table.rows
+    _check_range("set-cell --row", args.row, len(rows))
+    _check_range("set-cell --col", args.col, len(rows[args.row].cells))
+    table.cell(args.row, args.col).text = args.text
     return {"table": args.table, "row": args.row, "col": args.col}
 
 
-class InsertIndexError(ValueError):
+class IndexOutOfRangeError(ValueError):
+    """A `--index` / `--table` / `--row` / `--col` that names nothing real.
+
+    Raised *before* the document is touched, so `main` can refuse with exit 2
+    and nothing is written — the file is exactly as it was.
+
+    Covers ``delete``, ``style`` and ``set-cell``. ``insert`` keeps its own
+    subclass (:class:`InsertIndexError`) because its message has to explain an
+    extra rule — an empty body still has one legal insertion point — but both
+    are caught by the same handler in `main`, so every one of these becomes
+    ``exit 2`` plus one line on stderr.
+    """
+
+
+class InsertIndexError(IndexOutOfRangeError):
     """`insert --index` cannot be honoured honestly.
 
     Raised *before* the document is touched, so `main` can refuse with exit 2
@@ -106,10 +166,7 @@ def _check_insert_index(index: int, n: int) -> None:
                 f"insert --index {index} is out of range: the body has no "
                 f"paragraphs, so the only valid index is [0, 0] (current N=0)")
         return
-    if not 0 <= index <= n - 1:
-        raise InsertIndexError(
-            f"insert --index {index} is out of range: legal range is "
-            f"[0, {n - 1}], current N={n}")
+    _check_range("insert --index", index, n)
 
 
 def cmd_insert(doc, args) -> dict:
@@ -139,14 +196,28 @@ def cmd_insert(doc, args) -> dict:
 
 
 def cmd_delete(doc, args) -> dict:
-    para = doc.paragraphs[args.index]
-    el = para._element
+    """Delete one body paragraph, refusing an ``--index`` that names nothing.
+
+    The check runs *before* the element is touched, so a refused call leaves
+    the document object — and therefore the file on disk — exactly as it was.
+    """
+    paras = doc.paragraphs
+    _check_range("delete --index", args.index, len(paras))
+    el = paras[args.index]._element
     el.getparent().remove(el)
     return {"deleted_index": args.index}
 
 
 def cmd_style(doc, args) -> dict:
-    doc.paragraphs[args.index].style = doc.styles[args.style]
+    """Apply a paragraph style, refusing an ``--index`` that names nothing.
+
+    The check runs *before* ``doc.styles[...]`` is consulted, so an
+    out-of-range index is reported as such rather than being masked by a
+    ``KeyError`` on a style name the caller never got to.
+    """
+    paras = doc.paragraphs
+    _check_range("style --index", args.index, len(paras))
+    paras[args.index].style = doc.styles[args.style]
     return {"index": args.index, "style": args.style}
 
 
@@ -211,12 +282,47 @@ def _add_field(para, instr: str, placeholder: str) -> None:
             r.append(t)
 
 
+def _check_toc_index(index: int, n: int) -> None:
+    """Refuse a ``toc --index`` that does not name a real insertion point.
+
+    Same contract as ``delete`` / ``style`` / ``insert``: the legal range is
+    ``0 <= index <= n - 1``, because the TOC paragraph is inserted *before*
+    paragraph ``index`` and therefore lands at exactly that index. Two silent
+    fallbacks used to hide caller bugs here:
+
+    * ``--index -1`` hit Python's negative indexing, inserted before the *last*
+      paragraph and echoed ``-1`` back as ``toc_inserted_at``;
+    * ``--index >= N`` fell through to ``doc.add_paragraph`` and appended to the
+      end, while still reporting ``99`` — a position the caller never got.
+
+    An empty body (N=0) is the one degenerate case with a single valid
+    insertion point: 0, which appends the document's first paragraph. Local to
+    ``toc`` rather than folded into ``_check_range`` because that helper is
+    shared with ``delete`` / ``style`` / ``set-cell``, where N=0 has no legal
+    index at all.
+    """
+    if n == 0:
+        if index != 0:
+            raise IndexOutOfRangeError(
+                f"toc --index {index} is out of range: the body has no "
+                f"paragraphs, so the only valid index is [0, 0] (current N=0)")
+        return
+    _check_range("toc --index", index, n)
+
+
 def cmd_toc(doc, args) -> dict:
+    """Insert a TOC field before body paragraph ``index``.
+
+    The index is checked *before* any element is touched, so a refused call
+    leaves the document — and therefore the file on disk — exactly as it was.
+    """
     paras = doc.paragraphs
-    if args.index < len(paras):
-        para = paras[args.index].insert_paragraph_before("")
-    else:
+    n = len(paras)
+    _check_toc_index(args.index, n)
+    if n == 0:
         para = doc.add_paragraph("")
+    else:
+        para = paras[args.index].insert_paragraph_before("")
     _add_field(para, r' TOC \o "1-3" \h \z \u ',
                "Table of contents - open in Word/LibreOffice and update "
                "fields to populate.")
@@ -327,7 +433,22 @@ def main() -> int:
     common(p)
 
     args = ap.parse_args()
-    doc = Document(args.path)
+    # The input file is validated here — before `Document()` and before any
+    # subcommand — because a broken package used to be a bare traceback with
+    # exit 1 on **every** subcommand (measured 2026-11-11: 19 lines for a
+    # missing/non-zip file, 23 for a directory, 31 for a ZIP with no
+    # `[Content_Types].xml`). Exit 2 is the project-wide code for "you named
+    # something that is not there / not usable as given"; exit 1 stays reserved
+    # for "the document is real but has a problem", which is `docx_validate`'s
+    # job. stdout stays empty: every success prints JSON, so a failure must not
+    # look like an empty-but-successful JSON document. `doc.save()` is the only
+    # writer and it is far below, so nothing is written on this path.
+    try:
+        _check_input(args.path)
+        doc = _open_document(args.path)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.cmd == "replace":
         if args.body_only:
@@ -337,27 +458,29 @@ def main() -> int:
             result = {"replacements": n}
         else:
             result = cmd_replace(doc, args)
-    elif args.cmd == "set-cell":
-        result = cmd_set_cell(doc, args)
-    elif args.cmd == "insert":
+    else:
         try:
-            result = cmd_insert(doc, args)
-        except InsertIndexError as exc:
+            if args.cmd == "set-cell":
+                result = cmd_set_cell(doc, args)
+            elif args.cmd == "insert":
+                result = cmd_insert(doc, args)
+            elif args.cmd == "delete":
+                result = cmd_delete(doc, args)
+            elif args.cmd == "normalize":
+                result = cmd_normalize(doc)
+            elif args.cmd == "toc":
+                result = cmd_toc(doc, args)
+            elif args.cmd == "page-numbers":
+                result = cmd_page_numbers(doc, args)
+            else:
+                result = cmd_style(doc, args)
+        except IndexOutOfRangeError as exc:
             # Same exit code argparse uses for a bad argument value: the
-            # caller passed an --index that cannot be honoured. Nothing has
-            # been saved at this point, so the input file is untouched.
+            # caller named a paragraph/table/row/column that does not exist.
+            # Nothing has been saved at this point — `doc.save()` is below —
+            # so the input file is byte-for-byte untouched.
             print(f"error: {exc}", file=sys.stderr)
             return 2
-    elif args.cmd == "delete":
-        result = cmd_delete(doc, args)
-    elif args.cmd == "normalize":
-        result = cmd_normalize(doc)
-    elif args.cmd == "toc":
-        result = cmd_toc(doc, args)
-    elif args.cmd == "page-numbers":
-        result = cmd_page_numbers(doc, args)
-    else:
-        result = cmd_style(doc, args)
 
     out = args.output or args.path
     # A no-op (-page-numbers on a footer that already carries the fields) must

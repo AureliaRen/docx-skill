@@ -44,6 +44,15 @@ import docx_create
 import docx_crossref
 import docx_read
 
+# Input validation is **not** reimplemented here.  ``docx_read`` owns the single
+# definition (``InputError`` / ``_check_input`` / ``_open_document``) so the
+# CLIs cannot drift apart -- it already knows the fourth failure (a ZIP with no
+# ``[Content_Types].xml``, which ``is_zipfile`` happily accepts and ``Document``
+# then dies on with a bare ``KeyError``).  Same shape as ``docx_edit``, which
+# imports the very same three names; both halves live in ``scripts/``, which
+# ``_bootstrap`` already put on ``sys.path``.
+from docx_read import InputError, _check_input, _open_document
+
 # Word's built-in TOC line styles are ``toc 1`` … ``toc 9``; their style ids are
 # ``TOC1`` … ``TOC9``.  python-docx knows neither (the default template keeps
 # them latent), so the style is created here and the id is pinned to what Word
@@ -407,6 +416,83 @@ def drop_existing_toc(doc, *, adopt_unmarked: bool = False) -> dict:
 
 # ---- building ----------------------------------------------------------------
 
+class InsertIndexError(ValueError):
+    """``--insert-at`` cannot be honoured honestly.
+
+    Raised *before* the document is touched, so ``main`` can refuse with exit 2
+    and nothing is written -- the file is exactly as it was.  Mirrors
+    ``docx_edit.InsertIndexError``: "put the TOC before paragraph i" and "put the
+    paragraph before index i" need the same answer for the same question.
+    """
+
+
+def _check_insert_index(insert_at, n) -> None:
+    """Refuse an ``--insert-at`` that does not name a real insertion point.
+
+    ``insert_at`` is a 0-based position in ``doc.paragraphs`` (body only -- table
+    cell paragraphs are not counted), and must name a paragraph that exists: the
+    TOC is inserted *before* it, so it lands at exactly that index.  Anything
+    else is a caller bug, and clamping it silently is worse than failing, because
+    the caller is told a position it will never get:
+
+    * ``--insert-at 999`` on a 3-paragraph body used to fall through to an append
+      and report ``inserted_at: null`` with exit 0, having written the file;
+    * ``--insert-at -1`` used to hit Python's negative indexing, insert before the
+      *last* paragraph (landing at N-1) and echo the argument back.
+
+    An empty body (N=0) is the one degenerate case with a single valid insertion
+    point: 0, which appends the TOC -- there is no paragraph to go before.
+    """
+    index = int(insert_at)
+    if n == 0:
+        if index != 0:
+            raise InsertIndexError(
+                f"--insert-at {index} is out of range: the body has no "
+                f"paragraphs, so the only valid index is [0, 0] (current N=0)")
+        return
+    if not 0 <= index <= n - 1:
+        raise InsertIndexError(
+            f"--insert-at {index} is out of range: legal range is "
+            f"[0, {n - 1}], current N={n}")
+
+
+def _check_insert_index_shrunk(insert_at, n) -> None:
+    """Second check, against the body left *after* the previous TOC was removed.
+
+    :func:`_check_insert_index` judges ``--insert-at`` against the body the
+    caller named, which is the only honest reading of the argument.  But
+    rebuilding a TOC first removes the old one, and that removal shortens the
+    body.  An index that was legal a moment ago can now point past the end.
+
+    Falling back to an append at that point is *silent misplacement*, not a
+    convenience: the TOC ends up somewhere the caller never asked for, in a
+    document that exits 0.  So the request is refused instead, and the message
+    says which of the two checks failed -- otherwise the caller would see an
+    index that looked legal against the document on disk and be told it is out
+    of range, with no way to reconcile the two.
+    """
+    index = int(insert_at)
+    if n == 0:
+        # Same degenerate case the first check allows through: with no
+        # paragraphs left there is no "before which" to honour, and 0 is the
+        # single index that means "append".  Refusing it would break rebuilding
+        # a TOC-only document -- a document whose *only* paragraph was that TOC
+        # is back to N=0 once it is dropped.
+        if index != 0:
+            raise InsertIndexError(
+                f"--insert-at {index} is out of range: once the previous TOC "
+                f"was removed the body had no paragraphs left, so the only "
+                f"valid index is [0, 0] (current N=0)")
+        return
+    if index < n:
+        return
+    raise InsertIndexError(
+        f"--insert-at {index} is out of range after the previous TOC was "
+        f"removed: legal range is now [0, {n - 1}], current N={n} (the index "
+        f"was legal against the body before removal; pass an index within the "
+        f"shortened body, or omit --insert-at to land where the old TOC was)")
+
+
 def _target_section(doc, section_index=None, insert_at=None):
     """Which section's geometry the tab stop should follow.
 
@@ -419,22 +505,36 @@ def _target_section(doc, section_index=None, insert_at=None):
 
     A section's ``sectPr`` is attached to the **last paragraph of that section**
     and only the final section's hangs off ``<w:body>``.  So the section owning
-    paragraph *n* is "how many section-closing paragraphs come before *n*",
-    counting *n* itself: a paragraph that carries ``w:pPr/w:sectPr`` is the last
-    one of its own section, not the first of the next.
+    paragraph *n* is "how many section-closing paragraphs come **strictly
+    before** *n*": a paragraph that carries ``w:pPr/w:sectPr`` is the last one of
+    its own section, not the first of the next, so it must not be counted for
+    its own index -- the TOC inserted *before* it lands inside that same section.
     """
     sections = list(doc.sections)
     if not sections:
         return None, None
 
     if section_index is not None:
+        # An index that names no section cannot be answered honestly.  Falling
+        # back to section 0 used to hand back a width nobody asked for and
+        # misplaced every dotted leader by the margin difference (measured: 40 mm
+        # on a three-section sample), in a document that exited 0 -- silent
+        # misplacement, so the request is refused instead.  Negative indices are
+        # the usual "count from the end" spelling and stay legal down to -N,
+        # which is the behaviour every other index in this skill already has.
         try:
             want = int(section_index)
         except (TypeError, ValueError):
-            want = 0
-        if -len(sections) <= want < len(sections):
-            return sections[want], want % len(sections)
-        return sections[0], 0
+            raise InsertIndexError(
+                f"--section-index {section_index!r} is not an integer: legal "
+                f"range is [0, {len(sections) - 1}] or "
+                f"[-{len(sections)}, -1], current N={len(sections)}") from None
+        if not -len(sections) <= want < len(sections):
+            raise InsertIndexError(
+                f"--section-index {want} is out of range: legal range is "
+                f"[0, {len(sections) - 1}] or [-{len(sections)}, -1], current "
+                f"N={len(sections)}")
+        return sections[want], want % len(sections)
 
     if insert_at is not None:
         paras = doc.paragraphs
@@ -442,15 +542,22 @@ def _target_section(doc, section_index=None, insert_at=None):
             at = int(insert_at)
         except (TypeError, ValueError):
             at = 0
+        # ``build_static_toc`` has already refused an ``insert_at`` that names no
+        # real paragraph, so ``at`` is in range whenever this is reached with a
+        # caller-supplied index.  The guard stays because this helper is called
+        # with the same argument from two places, and falling back to section 0
+        # is the documented behaviour for "there is no paragraph to ask" -- only
+        # now it can no longer happen for a *bad* index, which used to make the
+        # tab stop follow the wrong section's geometry in silence.
         if 0 <= at < len(paras):
             closing = 0
             for i, para in enumerate(paras):
+                if i >= at:
+                    break
                 pPr = para._p.find(qn("w:pPr"))
                 if pPr is not None and pPr.find(qn("w:sectPr")) is not None:
                     closing += 1
-                if i == at:
-                    break
-            idx = min(max(closing - 1, 0), len(sections) - 1)
+            idx = min(max(closing, 0), len(sections) - 1)
             return sections[idx], idx
 
     return sections[0], 0
@@ -505,12 +612,21 @@ def _add_entry_paragraph(doc, style_name, text, page_text, tab_pos_mm,
 
 
 def _body_insert_reference(doc, anchor, insert_at):
-    """Element the new paragraphs must be inserted *before* (``None`` = append)."""
+    """Element the new paragraphs must be inserted *before* (``None`` = append).
+
+    ``insert_at`` has already been checked twice by the time this runs: once
+    against the body the caller *named*, and again against the body that is
+    left after the previous TOC was dropped (see
+    :func:`_check_insert_index_shrunk`).  So an index that survives both
+    checks is honoured as-is, and the ``None`` this returns for the
+    ``insert_at`` branch is no longer a "bad index means append" fallback.
+    """
     if insert_at is not None:
         paragraphs = doc.paragraphs
         index = int(insert_at)
-        if index < 0:
-            index = max(0, len(paragraphs) + index)
+        # ``index == 0`` on an empty body is the one "append" spelling: both
+        # checks let it through, and ``_place`` with ``None`` puts the new
+        # paragraphs where the body ends, which is exactly what appending means.
         if index < len(paragraphs):
             return paragraphs[index]._p
         return None
@@ -606,8 +722,25 @@ def build_static_toc(doc, *, levels=DEFAULT_LEVELS, pages=None, title=None,
     """
     wanted = _wanted_levels(levels)
 
+    # Judged against the body the caller described, and judged *first*: the
+    # build below appends title and entry paragraphs to ``doc``, so a check any
+    # later would have to undo writes to report the same thing.  See
+    # :func:`_check_insert_index`.
+    if insert_at is not None:
+        _check_insert_index(insert_at, len(doc.paragraphs))
+
     fallback = drop_existing_toc(doc, adopt_unmarked=adopt_unmarked)
     anchor = fallback["anchor"]
+
+    # The index was checked against the body the caller *named*; dropping the
+    # previous TOC just shortened that body, so check again before anything is
+    # appended.  Appending an index that no longer exists is silent
+    # misplacement -- measured: a 9-paragraph document whose TOC sat at the top
+    # accepted `--insert-at 8`, removed the old TOC (N back to 6), then appended
+    # the rebuilt one at the bottom and exited 0, i.e. the TOC silently jumped
+    # from the front to the end.  The caller has to hear about that instead.
+    if insert_at is not None:
+        _check_insert_index_shrunk(insert_at, len(doc.paragraphs))
 
     outline = [entry for entry in collect_outline(doc)
                if wanted is None or entry["level"] in wanted]
@@ -695,7 +828,6 @@ def main(argv=None) -> int:
     import argparse
     import json
     import sys
-    from docx import Document
 
     ap = argparse.ArgumentParser(
         description="Build a static (readable-without-Word) table of contents.")
@@ -730,7 +862,22 @@ def main(argv=None) -> int:
     levels = _levels_arg(args.levels)
     pages = _pages_arg(args.pages) if args.pages else None
 
-    doc = Document(args.docx)
+    # The path is judged before the package is opened, and long before
+    # ``doc.save()`` at the bottom, so a refusal writes nothing and leaves the
+    # file exactly as it was.  Without this guard a mistyped path died inside
+    # ``Document()``: nineteen lines of traceback on stderr and exit 1, which a
+    # caller has to read as Python internals to learn that the path is wrong.
+    # Exit 2 is the project-wide code for "you named something that is not there
+    # / not usable as given"; exit 1 stays reserved for "the document is real but
+    # has a problem" (``docx_validate``'s job).  stdout stays empty: every
+    # success prints JSON, so a failure must not look like an empty-but-
+    # successful JSON document.
+    try:
+        _check_input(args.docx)
+        doc = _open_document(args.docx)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # ``--pages`` is positional-by-ordinal: the *n*-th value lands on the
     # *n*-th entry.  A count mismatch therefore is not a style question — the
@@ -750,16 +897,23 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 2
 
-    report = build_static_toc(
-        doc,
-        levels=levels,
-        pages=pages,
-        title=args.title,
-        insert_at=args.insert_at,
-        indent_chars=_levels_arg(args.indent_chars),
-        section_index=args.section_index,
-        adopt_unmarked=args.adopt_unmarked,
-    )
+    try:
+        report = build_static_toc(
+            doc,
+            levels=levels,
+            pages=pages,
+            title=args.title,
+            insert_at=args.insert_at,
+            indent_chars=_levels_arg(args.indent_chars),
+            section_index=args.section_index,
+            adopt_unmarked=args.adopt_unmarked,
+        )
+    except InsertIndexError as exc:
+        # Same exit code argparse uses for a bad argument value: the caller
+        # passed an --insert-at that cannot be honoured.  Nothing has been saved
+        # at this point, so the file on disk is byte-for-byte what it was.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not args.dry_run:
         doc.save(args.output or args.docx)
     report["output"] = None if args.dry_run else (args.output or args.docx)

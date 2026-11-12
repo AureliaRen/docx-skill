@@ -91,8 +91,12 @@ def fix_docx(src: Path, dst: Path | None = None, percent: int = 100) -> int:
     try:
         zin = zipfile.ZipFile(src)
     except (OSError, zipfile.BadZipFile) as exc:
+        # An unreadable input path is a usage error (`2`), not "the document
+        # says something I cannot act on" (`1`): the caller named a file that
+        # is not there, or not a package.  Nothing has been written at this
+        # point, so the refusal is total.
         print(f"error: {src} is not a readable zip: {exc}", file=sys.stderr)
-        return 1
+        return 2
     with zin:
         names = zin.namelist()
         if "word/settings.xml" not in names:
@@ -131,8 +135,11 @@ def main() -> int:
 
     src = Path(args.docx)
     if not src.is_file():
-        print(f"error: {src} not found", file=sys.stderr)
-        return 1
+        # Usage error, not "the document says something I cannot act on": the
+        # caller named a path that is not a file, and nothing has been opened.
+        why = "is a directory, not a file" if src.is_dir() else "not found"
+        print(f"error: {src} {why}", file=sys.stderr)
+        return 2
     dst = Path(args.output) if args.output else src
     return fix_docx(src, dst, args.percent)
 
