@@ -27,11 +27,13 @@ import json
 import sys
 from copy import deepcopy
 
-from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from lxml import etree
 
 from docx_common import iter_part_roots
+# 输入校验的三件套由 `docx_read` 单一拥有（`InputError` / `_check_input` /
+# `_open_document`），这里只 import，不复制判定 —— 与 `docx_edit.py` 同形。
+from docx_read import InputError, _check_input, _open_document
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 COMMENTS_CT = ("application/vnd.openxmlformats-officedocument"
@@ -252,7 +254,18 @@ def main() -> int:
     p.add_argument("--id", required=True, help="comment id")
 
     args = ap.parse_args()
-    doc = Document(args.path)
+    # ---- 输入校验（P9-D）：必须在 `_open_document` 之前、在任何写盘之前 ----
+    # 旧版直接 `Document(args.path)`：缺文件 / 是目录 / 非 zip / 非 Word 包 四档
+    # 全部崩成裸 traceback + exit 1（实测 2026-11-11：19 / 23 / 19 / 31 行）。
+    # 现在统一在**每个**子命令（list / add / delete）共用的这一条出口上退 2，
+    # stdout 保持空：三个子命令的成功路径都会打 JSON，空 stdout 不能被读成
+    # "空但成功"的 JSON。`doc.save()` 在下面，所以拒绝路径零写盘。
+    try:
+        _check_input(args.path)
+        doc = _open_document(args.path)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.cmd == "list":
         print(json.dumps({"ok": True, "comments": list_comments(doc)},

@@ -290,10 +290,27 @@ def main():
                     help="usable text width in cm for 'auto' (default 14.6 = A4 - 3.17cm margins)")
     args = ap.parse_args()
 
-    doc_xml = Path(args.unpacked_dir) / "word" / "document.xml"
+    # ---- 输入校验（P9-C）-------------------------------------------------
+    # 本脚本的输入是**解包目录**而不是 .docx，三档坏输入在这里平移成：
+    #   路径不存在 → 解包目录根本不在
+    #   是目录     → 传进来的是文件，`<file>/word/document.xml` 必然不存在
+    #   非 zip     → 目录在，但缺 `word/document.xml`（解包没解全 / 解错了目录）
+    # 旧版三者共用一句 `error: <p>/word/document.xml not found` + **exit 1**，
+    # 与「文档有问题」混为一谈。本脚本对「目录对、XML 坏了」已经退 2
+    # （`ET.ParseError` / 非 `<w:document>` 根元素），输入本身不对更该退 2。
+    root_dir = Path(args.unpacked_dir)
+    if not root_dir.exists():
+        print(f"error: {root_dir}: no such file", file=sys.stderr)
+        return 2
+    if not root_dir.is_dir():
+        print(f"error: not a directory: {root_dir}", file=sys.stderr)
+        return 2
+
+    doc_xml = root_dir / "word" / "document.xml"
     if not doc_xml.is_file():
-        print(f"error: {doc_xml} not found", file=sys.stderr)
-        return 1
+        print(f"error: {root_dir} is not an unpacked .docx: "
+              f"{doc_xml} is missing", file=sys.stderr)
+        return 2
 
     register_all()
     try:

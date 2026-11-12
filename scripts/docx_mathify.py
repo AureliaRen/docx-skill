@@ -30,7 +30,7 @@ Usage
     python docx_mathify.py in.docx -o out.docx
     python docx_mathify.py in.docx -o out.docx --report conv.md --tex formulas.tex
     python docx_mathify.py in.docx --inplace --no-merged-script-fix
-    python docx_mathify.py in.docx -o out.docx --dry-run     # 只出报告，不写 docx
+    python docx_mathify.py in.docx --dry-run        # 只出报告，不写 docx
 
 打开输出后建议在真 Word 里验一遍：
     python verify_word.py out.docx --out verify        # latex-fix 工作区的校验脚本
@@ -42,6 +42,10 @@ Usage
   ``PackageNotFoundError`` 走 traceback（同属 1 的退出码，但消息不是本文写的）。
 * **2** —— 用法错误，且**一律在任何读写之前**判定：
   ``--inplace`` 与 ``-o/--out`` 同时给（互斥，不许静默择一）；
+  ``--inplace`` 与 ``--dry-run`` 同时给（语义相反，argparse 互斥组直接拒，
+  P8-D3 起）；
+  ``-o/--out`` 与 ``--dry-run`` 同时给（``--dry-run`` 不写文件，故 ``-o``
+  无处落地，显式拒；P8-D6 起 —— 旧版静默不写盘却回显 ``输出: <路径>``）；
   三个落点标志（``-o`` / ``--inplace`` / ``--dry-run``）一个都没给。
 * **3** —— **部分成功**：文档写出去了，但至少一条公式没转成（``stats["failed"]``
   非空），该片段按原文留着。这是唯一一个「有产物 + 非零码」的出口，调用方必须查。
@@ -72,6 +76,9 @@ from docx.shared import Emu, Twips
 from docx.text.paragraph import Paragraph
 
 import linear_to_latex as L
+# 输入校验的三件套由 `docx_read` 单一拥有（`InputError` / `_check_input` /
+# `_open_document`），这里只 import，不复制判定 —— 与 `docx_edit.py` 同形。
+from docx_read import InputError, _check_input, _open_document
 from math_omml import latex_to_omml_lxml
 from fix_phasor_dot import fix_phasor_dots
 
@@ -1230,13 +1237,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("input", help="源 .docx（只读）")
     p.add_argument("-o", "--out", help="输出 .docx；省略则需配 --inplace 或 --dry-run")
-    p.add_argument("--inplace", action="store_true",
-                   help="就地覆盖（会先备份成 <名>.bak.docx）")
+    # ---- 落点语义互斥（P8-D3）--------------------------------------------
+    # `--inplace` = **要**写盘（原地覆盖）、`--dry-run` = **不**写盘 —— 两个
+    # flag 的语义正好相反，同时给时自相矛盾。旧版它们是两个并列独立 flag，
+    # argparse 不拦，落到 `if args.inplace and not args.dry_run:` 上就静默择一：
+    # `--dry-run` 吃掉 `--inplace`，不备份、不写盘、exit 0，stdout 那行汇总
+    # 也不说它到底按哪条跑的，用户无从判断写没写。
+    # 与 docx_template.py 的 `--no-fix-formulas | --fix-formulas`（C5d）同型，
+    # 收进 mutually_exclusive_group 让 argparse 在解析阶段就退 2。
+    # `-o/--out` **刻意不进这个组**：它和 `--inplace` 的互斥仍由下面那段
+    # C5F 检查负责（同传退 2，报错文案逐字不变），而 `-o` 与 `--dry-run`
+    # 同传的既有行为本单不动：`-o` 与 `--dry-run` 同传目前仍走下面的检查，
+    # 不并进互斥组，属于本单明确留下的遗留问题。
+    landing = p.add_mutually_exclusive_group()
+    landing.add_argument("--inplace", action="store_true",
+                         help="就地覆盖（会先备份成 <名>.bak.docx）")
+    landing.add_argument("--dry-run", action="store_true", help="只出报告，不改文档")
     p.add_argument("--report", help="写出 Markdown 报告（原写法 ↔ LaTeX）")
     p.add_argument("--tex", help="写出 LaTeX 清单（去重）")
     p.add_argument("--no-merged-script-fix", action="store_true",
                    help="不自动拆开源文档里合并过头的上下标")
-    p.add_argument("--dry-run", action="store_true", help="只出报告，不改文档")
     p.add_argument("--number-align", action="store_true",
                    help="align/gather 里没有 \\tag 的行按顺序自动编号（默认只认 \\tag{...}）")
     args = p.parse_args(argv)
@@ -1254,10 +1274,45 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    # ---- 落点标志互斥（P8-D6/B）------------------------------------------
+    # `--dry-run` 承诺**不写任何文件**，`-o/--out` 却是「写到这个路径」的明确
+    # 要求 —— 同传时两者必然互相违背。旧版没有这道检查，落到下面的分流链上
+    # `elif args.out:` 先命中、`out = Path(args.out)`，随后 `mathify(...,
+    # dry_run=True)` 里 `if not dry_run and out is not None:` 把落盘整个跳过，
+    # 于是：文件没生成、源文件没动、退出码 0，而 stdout 却打印
+    # `输出: <out>`（`if out:` 只看变量非空，不看有没有真写）。那句回显是假的，
+    # 用户读汇总行会以为 out.docx 已经好了。
+    # 与 C5F 的 `--inplace` × `-o` 同类：不许静默择一，明确报错退 2，且**在
+    # 任何读写之前**判定。刻意**不用** argparse 互斥组 —— `-o` 一进组，
+    # `--inplace` × `-o` 的报错就会从下面的中文文案变成 argparse 英文格式，
+    # 那是 C5F 已验收的行为，本单不许回退。
+    if args.out and args.dry_run:
+        print("error: --dry-run 不写任何文件，-o/--out 却要求写到指定路径，"
+              "两者无法共存；请只保留一个"
+              "（要预览报告就只留 --dry-run，要落盘就只留 -o）。",
+              file=sys.stderr)
+        return 2
+
     src = Path(args.input)
-    if not src.is_file():
-        print(f"error: {src} 不存在", file=sys.stderr)
-        return 1
+    # ---- 输入校验（P9-C）：必须在**任何**写盘之前 ------------------------
+    # 旧版只查 `src.is_file()`：缺文件/目录退 1（语义错——输入不对不等于文档
+    # 处理不了），非 zip 放行通过、随后在 `mathify()` 的 `Document()` 上抛
+    # PackageNotFoundError 崩成 22 行 traceback。
+    #
+    # 最脏的一条是 `--inplace`：它的第一件事是 `shutil.copy2(src, bak)`，
+    # 于是「输入是垃圾」反而**保证**留下了 `renamed.bak.docx`，stdout 还回显
+    # 「备份: …」93 字节。校验排在这行之前，这条路径才可能零写盘。
+    #
+    # `_open_document` 也跑一遍（不做 `_check_input` 单点）：`is_zipfile` 只看
+    # 文件尾，一个 zip 壳子能过检却在 `Document()` 上死在 KeyError。代价是多
+    # 解析一次包；相对本脚本每次公式转换一次 XSLT 的耗时，这个量级可以接受，
+    # 换来的是四档坏输入在**同一条出口**上退 2。
+    try:
+        _check_input(str(src))
+        _open_document(str(src))
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.inplace and not args.dry_run:
         bak = src.with_suffix(".bak.docx")

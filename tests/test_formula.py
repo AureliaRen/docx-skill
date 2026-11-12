@@ -635,6 +635,63 @@ def test_mathify_inplace_only_still_rewrites(tmp_path: Path):
     assert "vertAlign" in doc_xml(src), "纯上下标片段没落成文字角标"
 
 
+def test_mathify_rejects_inplace_with_dry_run(tmp_path: Path):
+    """``--inplace`` + ``--dry-run`` 是用法错误：退 2，且**一个字节都不许写**。
+
+    P8-D3：两个标志的语义正好相反（``--inplace`` = 要写盘（原地）、
+    ``--dry-run`` = 不写盘）。旧版 argparse 里它们是两个并列独立 flag，
+    同传时 ``if args.inplace and not args.dry_run`` 静默择一 —— 表现为
+    ``--dry-run`` 吃掉 ``--inplace``：不备份、不写盘、exit 0，用户无从判断
+    到底按哪条跑了。收进 ``add_mutually_exclusive_group()`` 后由 argparse
+    在解析阶段拒掉（与 ``docx_template.py`` 的 C5d、本脚本 C5f 同一口径）。
+
+    本用例只碰 argparse 层（``_degradable_docx`` 是可降级片段，连 OMML 分支
+    都不进），因此**不挂 ``needs_omml``**：无 XSL 的机器上也照样 pass。
+    """
+    src = _degradable_docx(tmp_path)
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--inplace", "--dry-run")
+
+    assert proc.returncode == 2, (
+        f"退出码应为 2（用法错误），实际 {proc.returncode}；"
+        f"stdout={proc.stdout.decode('utf-8', 'replace')!r}")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "--inplace" in stderr and "--dry-run" in stderr, (
+        f"报错没说清是哪两个标志冲突：{stderr!r}")
+    assert "error:" in stderr, f"用法错误必须走 stderr 且以 error: 开头：{stderr!r}"
+
+    # a) 源文件字节不变（旧版虽然也没写，但这条锁的是「判定先于任何读写」）
+    assert _sha256(src) == before, "报错路径上源文件被改了 —— 判定必须发生在任何读写之前"
+    # b) 备份文件没被创建（旧版 --dry-run 挡在前面，但组合一变就可能漏）
+    assert not (tmp_path / "in.bak.docx").exists(), "备份文件被创建，说明已开始写盘"
+    # c) 光有报错还不够：stdout 不许出现「输出:」那种「我写了」的自述
+    assert "输出:" not in proc.stdout.decode("utf-8", "replace"), (
+        "报错路径上还打印了「输出:」，与「零写盘」自相矛盾")
+
+
+def test_mathify_dry_run_only_still_reports(tmp_path: Path):
+    """单用 ``--dry-run``：退 0，出汇总报告，源文件不动、无备份。
+
+    这是互斥组改动的**反向保护**：把 ``--inplace`` / ``--dry-run`` 收进同一个
+    组时，最容易顺手把 ``--dry-run`` 单传也打成用法错误（比如误写成
+    ``required=True`` 或 required 组）。这条钉住单传照旧。
+    """
+    src = _degradable_docx(tmp_path)
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--dry-run")
+
+    assert proc.returncode == 0, (
+        f"单用 --dry-run 应成功，实际 {proc.returncode}；"
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    out_text = proc.stdout.decode("utf-8", "replace")
+    assert "段落" in out_text and "失败" in out_text, f"stdout 汇总报告不见了：{out_text!r}"
+    assert "输出:" not in out_text, "--dry-run 不写盘，不该打印「输出:」"
+    assert _sha256(src) == before, "--dry-run 改了源文件"
+    assert not (tmp_path / "in.bak.docx").exists(), "--dry-run 不该产生备份"
+
+
 def test_mathify_exit_3_when_xsl_missing(tmp_path: Path):
     """缺 XSL → 文档仍写出，但退出码 3（部分成功），报告里失败数 > 0。
 
@@ -667,3 +724,188 @@ def test_mathify_exit_3_when_xsl_missing(tmp_path: Path):
     assert rep.is_file()
     text = rep.read_text(encoding="utf-8")
     assert "失败：0" not in text, "报告里失败数为 0，与退出码 3 自相矛盾"
+
+
+def test_mathify_rejects_out_with_dry_run(tmp_path: Path):
+    """``-o X`` + ``--dry-run`` 是用法错误：退 2，零写盘，且有产物 + 非零码不成立。
+
+    P8-D6/B。旧版：``-o`` 与 ``--dry-run`` 同传时被静默择一 —— 不写盘、exit 0，
+    stdout 却打出 ``输出: <X>``。那句回显是**假的**：文件根本没生成，用户读
+    汇总行会以为 out.docx 已经好了。``--dry-run``（只出报告）与 ``-o``（要求
+    写到那个路径）语义冲突，和 C5f 的 ``--inplace`` × ``-o`` 同一类，所以同样
+    在 argparse 之后、任何读写之前显式拒（**不进互斥组**，否则会连带改掉 C5f
+    的中文文案）。
+
+    本用例只碰前置检查层（``_degradable_docx`` 连 OMML 分支都不进），所以
+    **不挂 ``needs_omml``**：无 XSL 的机器上也必须 pass，不是 skip。
+    """
+    src = _degradable_docx(tmp_path)
+    out = tmp_path / "out.docx"
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "-o", out, "--dry-run")
+
+    assert proc.returncode == 2, (
+        f"退出码应为 2（用法错误），实际 {proc.returncode}；"
+        f"stdout={proc.stdout.decode('utf-8', 'replace')!r}")
+    stdout = proc.stdout.decode("utf-8", "replace")
+    stderr = proc.stderr.decode("utf-8", "replace")
+
+    # a) 单行 error: 前缀
+    err_lines = [ln for ln in stderr.splitlines() if ln.strip()]
+    assert len(err_lines) == 1, f"用法错误应当只有一行，实际 {err_lines!r}"
+    assert err_lines[0].startswith("error:"), f"必须以 error: 开头：{err_lines[0]!r}"
+    assert "--dry-run" in err_lines[0] and ("-o" in err_lines[0] or "--out" in err_lines[0]), \
+        f"报错没说清是哪两个标志冲突：{err_lines[0]!r}"
+
+    # b) 零写盘：目标文件没被创建，源文件字节不变
+    assert not out.exists(), "-o 指定的文件被创建了，与「--dry-run 不写盘」矛盾"
+    assert _sha256(src) == before, "报错路径上源文件被改了 —— 判定必须发生在任何读写之前"
+    assert not (tmp_path / "in.bak.docx").exists(), "备份文件被创建，说明已开始写盘"
+
+    # c) 假回显必须消失：stdout 一行都不许有
+    assert stdout == "", f"报错路径上 stdout 应为空（那句「输出:」是假的），实际 {stdout!r}"
+
+
+def test_mathify_dry_run_only_stdout_unchanged(tmp_path: Path):
+    """单用 ``--dry-run``：退 0，stdout 有汇总报告，**不含**「输出:」行。
+
+    这是显式检查的反向保护：加检查时最容易顺手把 ``--dry-run`` 单传也拒了。
+    """
+    src = _degradable_docx(tmp_path)
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--dry-run")
+
+    assert proc.returncode == 0, (
+        f"单用 --dry-run 应成功，实际 {proc.returncode}；"
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "段落" in stdout and "失败" in stdout, f"stdout 汇总报告不见了：{stdout!r}"
+    assert "输出:" not in stdout, "--dry-run 不写盘，不该打印「输出:」"
+    assert _sha256(src) == before
+    assert not (tmp_path / "in.bak.docx").exists()
+
+
+def test_mathify_out_with_dry_run_keeps_c5f_wording_intact(tmp_path: Path):
+    """C5f 回归保护：``-o`` × ``--inplace`` 的文案与退出码一个字都不许变。
+
+    加了 ``-o`` × ``--dry-run`` 的新检查之后，这条锁住另一条组合没被动过。
+    """
+    src = _degradable_docx(tmp_path)
+    out = tmp_path / "out.docx"
+    before = _sha256(src)
+
+    proc = run_cli("docx_mathify.py", src, "--inplace", "-o", out)
+
+    assert proc.returncode == 2
+    stderr = proc.stderr.decode("utf-8", "replace")
+    expected = ("error: --inplace 与 -o/--out 互斥：--inplace 就地覆盖输入文件，"
+                "-o/--out 写另一份输出文件，同时给无法判定落点；请只保留一个。")
+    assert stderr.strip() == expected, f"C5f 文案被改动了：{stderr!r}"
+    assert proc.stdout.decode("utf-8", "replace") == "", "用法错误路径 stdout 应为空"
+    assert not out.exists()
+    assert _sha256(src) == before
+    assert not (tmp_path / "in.bak.docx").exists()
+
+
+# ===========================================================================
+# 输入错误契约（P9-C）
+#
+# ⚠️ 本节**刻意不挂 ``@needs_omml``**：这些用例只在 CLI 入口判定「这个路径是不是
+#    一个能打开的 .docx」，全程不碰 ``latex2mathml`` / ``MML2OMML.XSL`` / Office。
+#    给它们挂 ``needs_omml`` 会让 CI（无 Office）把**唯一能真跑**的输入校验整段
+#    skip 掉，只在开发机上跑——正好反了。实测口径：把 ``MML2OMML_XSL`` 指向不存在的路径后
+#    本节仍然 pass。
+#
+# 旧行为（实测 2026-11-11）：
+#   * 缺文件 / 目录  → exit 1，stderr **1 行**（``error: <p> 不存在``，但语义错：
+#     缺文件是「你给的输入不对」，不是「这个文档处理不了」）；
+#   * 非 zip        → exit 1，**22 行 traceback**；
+#   * 非 zip + ``--inplace`` → **先** ``shutil.copy2`` 写出 ``<名>.bak.docx``，
+#     **再**在 ``Document()`` 上崩 —— 输入是垃圾却留下了一份垃圾备份，
+#     stdout 还回了 93 字节的「备份: …」。
+# ===========================================================================
+def _nonzip(tmp_path: Path, name: str = "renamed.docx") -> Path:
+    p = tmp_path / name
+    p.write_text("i am not a zip package", encoding="utf-8")
+    return p
+
+
+def one_error_line(stderr: str) -> str:
+    """stderr 必须**恰好一行**（``error: ...``），没有 traceback 前导。"""
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {stderr}"
+    return lines[0]
+
+
+def test_mathify_missing_input_is_a_usage_error(tmp_path: Path):
+    """路径不存在 → exit 2 + 单行 ``no such file`` + stdout 空。"""
+    missing = tmp_path / "no-such.docx"
+    assert not missing.exists()
+
+    proc = run_cli("docx_mathify.py", missing, "--dry-run")
+    assert proc.returncode == 2, proc.stderr
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "Traceback" not in stderr
+    line = one_error_line(stderr)
+    assert line.startswith("error: ")
+    assert "no such file" in line
+    assert str(missing) in line
+    assert proc.stdout == b""
+
+
+def test_mathify_directory_is_a_usage_error(tmp_path: Path):
+    """路径是目录 → exit 2 + 单行 ``not a file``。"""
+    adir = tmp_path / "a-directory"
+    adir.mkdir()
+
+    proc = run_cli("docx_mathify.py", adir, "--dry-run")
+    assert proc.returncode == 2, proc.stderr
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "Traceback" not in stderr
+    assert one_error_line(stderr) == f"error: not a file: {adir}"
+    assert proc.stdout == b""
+
+
+def test_mathify_non_zip_is_a_usage_error(tmp_path: Path):
+    """存在的普通文件但不是 zip → exit 2 + 单行 ``not a ZIP package``，不再 22 行 traceback。"""
+    bogus = _nonzip(tmp_path)
+
+    proc = run_cli("docx_mathify.py", bogus, "--dry-run")
+    assert proc.returncode == 2, proc.stderr
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "Traceback" not in stderr
+    assert one_error_line(stderr) == f"error: not a ZIP package: {bogus}"
+    assert proc.stdout == b""
+
+
+def test_mathify_non_zip_inplace_leaves_no_bak_behind(tmp_path: Path):
+    """★ 非 zip + ``--inplace`` → **一个文件都不生成**（旧版留下 ``renamed.bak.docx``）。
+
+    `--inplace` 的第一件事是 ``shutil.copy2(src, bak)``，校验若排在它后面，
+    输入越烂、垃圾备份越确定会被写出来。这条同时钉三件事：
+    rc=2、stdout 空、目录里没有 ``.bak.docx``。
+    """
+    bogus = _nonzip(tmp_path)
+    before = {p.name for p in tmp_path.iterdir()}
+
+    proc = run_cli("docx_mathify.py", bogus, "--inplace")
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == b"", "拒绝时不许回显「备份: …」"
+    after = {p.name for p in tmp_path.iterdir()}
+    assert after == before, f"拒绝时写盘了：新增 {sorted(after - before)}"
+    assert not (tmp_path / "renamed.bak.docx").exists()
+    assert bogus.read_text(encoding="utf-8") == "i am not a zip package"
+
+
+def test_mathify_valid_document_dry_run_still_works(tmp_path: Path):
+    """合法文档 ``--dry-run`` 仍是 exit 0 + 既有汇总行（加校验没把成功路径改坏）。"""
+    src = _degradable_docx(tmp_path)
+
+    proc = run_cli("docx_mathify.py", src, "--dry-run")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    out = proc.stdout.decode("utf-8", "replace")
+    assert out.startswith("段落 ")
+    assert "备份" not in out, "--dry-run 不许出现备份回显"
+    assert not (tmp_path / "in.bak.docx").exists()

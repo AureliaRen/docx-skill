@@ -1489,8 +1489,16 @@ def main() -> int:
     # stdout; this script must keep stdout JSON-only (SKILL.md: "Machine-
     # readable scripts write JSON to stdout; diagnostics go to stderr"), so
     # reroute its stdout to stderr for the duration of the call.
+    #
+    # The return code is *not* discarded: fix_docx() reports 2 for an input it
+    # cannot read or a package it cannot patch, and a build that hands back a
+    # document Word will refuse is not a success.  Returning 0 there would tell
+    # the caller "ok" for a file that never got its w:percent -- the same class
+    # of defect as echoing an --index that was never applied.
     with contextlib.redirect_stdout(sys.stderr):
-        fix_docx(Path(args.output))
+        zoom_code = fix_docx(Path(args.output))
+    if zoom_code:
+        return zoom_code
     print(json.dumps({"ok": True, "output": args.output,
                       "blocks": len(spec.get("blocks", [])),
                       "sections": len(doc.sections),

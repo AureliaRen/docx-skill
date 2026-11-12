@@ -23,6 +23,7 @@ import sys
 import zipfile
 
 from docx import Document
+from docx.opc.exceptions import PackageNotFoundError
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -263,6 +264,63 @@ def to_markdown(doc, image_dir: str | None = None,
     return "\n".join(out).rstrip() + "\n"
 
 
+class InputError(Exception):
+    """The path named on the command line is not a readable .docx package.
+
+    Raised *before* any output is produced, so `main` can refuse with exit 2,
+    one line on stderr, and an empty stdout. That separation matters here
+    because every successful mode writes **JSON to stdout**: relaying a
+    failure through stdout as JSON would make every `json.loads(stdout)`
+    caller read a failure as a success. Exit 2 is the project-wide code for
+    "you named something that is not there / not usable as given"; exit 1 is
+    reserved for "the document is real but has a problem", which is
+    `docx_validate`'s job, not this one's.
+    """
+
+
+def _check_input(path: str) -> None:
+    """Reject a path that cannot possibly be a Word package, before opening it.
+
+    Three distinct failures, each with its own wording, because they call for
+    three different fixes from the caller:
+
+    * ``no such file``      → the path is wrong (typo, wrong cwd, bad quoting);
+    * ``not a file``        → it exists but is a directory (a common shell glob);
+    * ``not a ZIP package`` → it is a file but not a ZIP (usually a .doc/.rtf/
+      .txt that somebody renamed to .docx).
+
+    ``zipfile.is_zipfile`` is used rather than letting ``Document()`` raise:
+    it reads only the tail of the file, so a 3 GB non-zip is refused cheaply.
+    """
+    if not os.path.exists(path):
+        raise InputError(f"--path {path}: no such file")
+    if not os.path.isfile(path):
+        raise InputError(f"not a file: {path}")
+    if not zipfile.is_zipfile(path):
+        raise InputError(f"not a ZIP package: {path}")
+
+
+def _open_document(path: str):
+    """``Document(path)`` with the package errors turned into :class:`InputError`.
+
+    Defence in depth against TOCTOU: `_check_input` runs first, but the file
+    can be replaced, truncated or deleted between that check and this open —
+    and ``is_zipfile`` only inspects the tail, so a package can pass the check
+    and still lack ``word/document.xml``. Both cases surface as one usage
+    error instead of a python-docx traceback.
+    """
+    try:
+        return Document(path)
+    except PackageNotFoundError:
+        raise InputError(f"not a Word package: {path}") from None
+    except zipfile.BadZipFile:
+        raise InputError(f"not a ZIP package: {path}") from None
+    except KeyError:
+        # A ZIP with no ``[Content_Types].xml``: ``is_zipfile`` accepts it,
+        # ``Document`` then dies on a bare KeyError while reading the package.
+        raise InputError(f"not a Word package: {path}") from None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Read/inspect a .docx file.")
     ap.add_argument("path", help=".docx file to read")
@@ -281,15 +339,39 @@ def main() -> int:
                     help="with --md: extract images here and link them")
     args = ap.parse_args()
 
+    try:
+        _check_input(args.path)
+        return _run(args)
+    except InputError as exc:
+        # stdout stays empty on every failure: success is the only thing that
+        # prints, and it prints JSON. Nothing has been written at this point
+        # either — `--images` / `--md` only create their targets below.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run(args) -> int:
+    """Dispatch one output mode. Assumes the input already passed validation."""
     if args.images:
-        print(json.dumps({"images": extract_images(args.path, args.images)},
-                         ensure_ascii=False))
+        try:
+            written = extract_images(args.path, args.images)
+        except (zipfile.BadZipFile, OSError) as exc:
+            # `_check_input` already accepted this path; if it fails now the
+            # file changed underneath us. Same one-line usage error, and the
+            # output directory is only created inside `extract_images`, so a
+            # refused run leaves no directory behind.
+            raise InputError(f"cannot read {args.path}: {exc}") from None
+        print(json.dumps({"images": written}, ensure_ascii=False))
         return 0
     if args.revisions:
-        print(json.dumps(detect_revisions(args.path), ensure_ascii=False))
+        try:
+            revisions = detect_revisions(args.path)
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise InputError(f"cannot read {args.path}: {exc}") from None
+        print(json.dumps(revisions, ensure_ascii=False))
         return 0
 
-    doc = Document(args.path)
+    doc = _open_document(args.path)
     if args.md:
         if args.image_dir:
             extract_images(args.path, args.image_dir)

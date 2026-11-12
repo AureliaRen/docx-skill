@@ -438,3 +438,103 @@ def test_dirty_fixture_fix_is_idempotent(tmp_path: Path):
     assert second["total"] == first["total"], (
         f"第二次跑改了 rFonts 数量：{first['total']} → {second['total']}")
     assert count_runs(f) == runs_first, "第二次跑动到了 run 数量"
+
+
+# ===========================================================================
+# 输入错误契约（P9-C）
+#
+# `fix_fonts.py` 是**就地改写**工具（临时文件 + `shutil.move`），所以输入校验
+# 的两个失误都会留下真实痕迹：
+#
+#   * 校验太晚 → `zipfile.ZipFile(src)` 抛 `BadZipFile` / `IsADirectoryError`，
+#     命令行上是 13~14 行 traceback + exit 1（实测 2026-11-11）；
+#   * 只校验「存在」不校验「是包」→ 非 zip 一路走到 `_fix_docx` 才崩。
+#
+# 更要紧的是 `nargs="+"`：旧版**边校验边处理**，第一个文件已经就地改写完了
+# 才发现第二个是垃圾 —— 一次「用法错误」的调用改掉了别的文件。本节最后一条
+# 用例把「先全量校验、再动手」钉住。
+# ===========================================================================
+def _nonzip(tmp_path: Path, name: str = "renamed.docx") -> Path:
+    p = tmp_path / name
+    p.write_text("i am not a zip package", encoding="utf-8")
+    return p
+
+
+def one_error_line(stderr: str) -> str:
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {stderr}"
+    return lines[0]
+
+
+def run_fix_fonts_many(*paths) -> subprocess.CompletedProcess:
+    """多文件调用（``nargs="+"``）。与其他 helper 一致取 **bytes** 输出。"""
+    env = dict(os.environ, LC_ALL="C", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / "fix_fonts.py"), *map(str, paths)],
+        capture_output=True, env=env, check=False)
+
+
+def test_missing_path_is_a_usage_error(tmp_path: Path):
+    """缺文件 → exit 2 + 单行 ``no such file`` + stdout 空。"""
+    missing = tmp_path / "no-such.docx"
+    proc = run_fix_fonts(missing)
+    assert proc.returncode == 2, proc.stderr.decode("utf-8", "replace")
+    line = one_error_line(proc.stderr.decode("utf-8", "replace"))
+    assert "no such file" in line
+    assert str(missing) in line
+    assert proc.stdout == b""
+
+
+def test_directory_is_a_usage_error(tmp_path: Path):
+    """传目录 → exit 2 + 单行 ``not a file``，而非 13 行 traceback。"""
+    adir = tmp_path / "a-directory"
+    adir.mkdir()
+    proc = run_fix_fonts(adir)
+    assert proc.returncode == 2, proc.stderr.decode("utf-8", "replace")
+    assert one_error_line(proc.stderr.decode("utf-8", "replace")) == \
+        f"error: not a file: {adir}"
+    assert proc.stdout == b""
+
+
+def test_non_zip_is_a_usage_error(tmp_path: Path):
+    """非 zip → exit 2 + 单行 ``not a ZIP package``，且文件一个字节没被改。"""
+    bogus = _nonzip(tmp_path)
+    proc = run_fix_fonts(bogus)
+    assert proc.returncode == 2, proc.stderr.decode("utf-8", "replace")
+    assert one_error_line(proc.stderr.decode("utf-8", "replace")) == \
+        f"error: not a ZIP package: {bogus}"
+    assert proc.stdout == b""
+    assert bogus.read_text(encoding="utf-8") == "i am not a zip package"
+
+
+def test_bad_second_file_leaves_the_first_byte_identical(tmp_path: Path):
+    """★ 第一个合法、第二个是垃圾 → **第一个文件一个字节都不许变**。
+
+    旧版边校验边处理，`good.docx` 已经被就地改写过一次才轮到 `renamed.docx`
+    崩掉。这条钉的是「先全量校验，再逐个动手」。
+    """
+    good = tmp_path / "good.docx"
+    d = docx.Document()
+    d.add_paragraph("hello")
+    d.save(str(good))
+    before = good.read_bytes()
+    bogus = _nonzip(tmp_path)
+
+    proc = run_fix_fonts_many(good, bogus)
+    assert proc.returncode == 2, proc.stderr.decode("utf-8", "replace")
+    assert proc.stdout == b""
+    assert good.read_bytes() == before, "第二个文件不合格时，第一个文件被改写了"
+
+
+def test_valid_document_still_gets_its_fonts_fixed(tmp_path: Path):
+    """合法文档仍是 exit 0 + 既有计数行（加校验没把成功路径改坏）。"""
+    f = tmp_path / "doc.docx"
+    d = docx.Document()
+    d.add_paragraph("中文正文 english body")
+    d.save(str(f))
+
+    proc = run_fix_fonts(f)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    out = proc.stdout.decode("utf-8", "replace")
+    assert out.startswith("  正文 "), out
+    assert "[doc.docx]" in out

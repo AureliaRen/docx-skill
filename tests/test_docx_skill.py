@@ -538,12 +538,24 @@ class TestValidate:
         assert all(i["severity"] != "error" for i in res["issues"])
 
     def test_not_a_zip(self, tmp_path: Path):
+        """非 zip → **exit 2**（P9-C 改口；旧断言是 exit 1 + ``not-a-zip`` JSON）。
+
+        旧语义把「你给的路径根本不是 docx」也塞进 ``issues`` 里，退 1 —— 于是
+        「路径写错了」和「文档坏了」在调用方眼里是同一件事，任何
+        ``if rc: 去修文档`` 的自动化都会去修一份根本不是 docx 的文件。
+
+        P9-C 定的双契约：**输入错误退 2（stdout 空）**，**内容问题仍退 1
+        （stdout 是带 ``issues`` 的 JSON）**。后一半由
+        ``tests/test_validate_errors.py`` 单独钉住（缺 ``[Content_Types].xml``
+        的那条），所以这里只验前一半。
+        """
         bad = tmp_path / "bad.docx"
         bad.write_bytes(b"this is not a zip file")
         proc = run_raw("docx_validate.py", bad)
-        assert proc.returncode == 1
-        rep = json.loads(proc.stdout.decode("utf-8"))
-        assert rep["issues"][0]["code"] == "not-a-zip"
+        assert proc.returncode == 2
+        assert proc.stdout == b"", "输入错误路径 stdout 必须为空"
+        assert b"not a ZIP package" in proc.stderr
+        assert b"Traceback" not in proc.stderr
 
     def test_dangling_rel_and_empty_image(self, created: Path,
                                           tmp_path: Path):
@@ -836,15 +848,12 @@ class TestSpecValidation:
                                     "gutter": 0}},
             "header": "Header",
             "footer": "Footer",
-            # ``font`` / ``size_pt`` / ``bold`` on the page-number field are
-            # documented but currently blow up inside docx_section._rpr
-            # (``qn("ascii")`` without the ``w:`` prefix) — a separate defect,
-            # so the vocabulary test uses the switches that work.
             "footer_page_numbers": {"template": "page_of", "fmt": "decimal",
                                     "start": 1, "align": "center",
                                     "total": "numpages", "prefix": "p ",
                                     "suffix": " / ",
-                                    "page_type": "default"},
+                                    "font": "Times New Roman", "size_pt": 10,
+                                    "bold": True, "page_type": "default"},
             "styles": [{"name": "KS", "base": "Normal", "font": "Arial",
                         "font_east_asia": "SimSun", "size_pt": 12,
                         "bold": False, "italic": False, "color": "1F4E79",
