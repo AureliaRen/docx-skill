@@ -166,11 +166,21 @@ two extra keys, `changed` and `already_present`, so a script can tell "added" fr
 
 | Script | What `--index` counts | Out of range |
 |---|---|---|
-| `docx_edit insert` | body paragraphs; `N` is legal and means "append" | exit `2`, message names the legal range |
-| `docx_edit delete` / `style` | body paragraphs | exit `1` (`IndexError`) |
+| `docx_edit insert` | body paragraphs; the index is the paragraph the new one goes **before**, so the legal range is `[0, N-1]` | exit `2`, message names the legal range |
+| `docx_edit delete` / `style` | body paragraphs | exit `2`, message names the legal range |
+| `docx_edit toc` | body paragraphs | exit `2`, message names the legal range |
 | `docx_crossref` | body paragraphs | exit `2`, message names the legal range |
 | `docx_numbering` | body **and table** paragraphs, in document order; `lo:hi` is half-open and `--index` is repeatable | exit `1`, "selection matched no paragraphs" |
-| `docx_toc --insert-at` | body paragraphs | clamped to the end of the body |
+| `docx_toc --insert-at` | body paragraphs | exit `2`, message names the legal range |
+
+Every one of those refusals is decided **before the document is touched**: no
+file is written, the input is byte-for-byte as it was, and stdout stays empty —
+the message goes to stderr as a single `error: …` line naming the option, the
+value you passed, and the range that would have worked
+(`error: delete --index 99 is out of range: legal range is [0, 3], current N=4`).
+A negative index is refused on the same footing rather than read through Python's
+negative indexing: `-1` is not "the last paragraph" in any durable sense — add or
+delete one paragraph and the same argument means a different one.
 
 `docx_toc`'s `inserted_at` in its report is a different thing: it is where the
 TOC was actually written, measured after insertion, not an input.
@@ -207,10 +217,56 @@ while the CLI still exited `0`. It is now an argparse conflict, exit `2`. Withou
 `-o`, `apply --to` rewrites the target in place and writes a `<file>.bak` first;
 with `-o`, the `--to` file is left byte-for-byte alone.
 
+**`--fix-formulas` passes `docx_mathify`'s exit code back up, including `3`.** The
+OMML channel runs mathify in place, and `3` there means "the document was written,
+but at least one formula is still linear text" — the one exit that combines an
+artifact with a non-zero code. Reporting `0` for that would hand a half-converted
+file to the caller as finished, so `apply` now returns exactly what mathify
+returned: `1` and `2` unchanged, and `3` as `3`. Only `0` collapses back to `0`.
+`--no-fix-formulas` never calls mathify, so it behaves as before.
+
 ## Creating a document
 
 `docx_create.py` takes a JSON spec. Top-level keys: `page`, `styles`, `header`,
 `footer`, `footer_page_numbers`, and `blocks`. Each block has a `type`:
+
+`footer_page_numbers` (top level or inside a `section_break`) accepts `fmt`,
+`start`, `align`, `template`, `total`, `prefix`, `suffix`, and `page_type` — and
+`font`, `size_pt`, `bold`, which style the runs that carry the page number:
+`font` and `size_pt` reach both the literal runs and the field runs, while
+`bold` reaches the field runs holding the digits only when it is truthy — the
+table below is the precise statement. The last three used to raise `ValueError` the
+moment you set them; they now apply, and on a mixed-script footer `font` binds all
+four `w:rFonts` slots (`ascii` / `hAnsi` / `eastAsia` / `cs`) so a Chinese
+`第 X 页 共 Y 页` prefix does not fall back to the theme's East Asian face while the
+digits use the font you asked for.
+
+**`bold` styles two different kinds of run by two different rules, so `"bold":
+false` and leaving `bold` out are not the same request.** A `page_of` footer is a
+mix of literal runs (`"Page "`, `" of "`, a Chinese prefix/suffix) and field runs
+(the `PAGE` / `NUMPAGES` fields — the digits themselves plus their begin /
+separate / end plumbing). The literal runs go through `run.font.bold`, which is
+three-state; the field runs go through `_rpr()`, which tests `if bold:` and is
+therefore two-state. Measure it on one footer with `font` and `size_pt` held
+constant and the difference is visible in the XML:
+
+| `bold` | literal runs | field runs (the digits) | `word/footer1.xml` | `<w:b` |
+|---|---|---|---|---|
+| `true` | `run.font.bold = True` → `<w:b/>` | `<w:b w:val="1"/>` **and** `<w:bCs w:val="1"/>` on all ten | 4232 bytes | 22 — 12 `w:b` (one per run) plus 10 `w:bCs` |
+| `false` | `run.font.bold = False` → `<w:b w:val="0"/>`, an explicit *off* | **nothing written**; `False` and "unset" take the same branch | 3912 bytes | 2 — the literal runs only |
+| omitted | nothing written, the run keeps inheriting | nothing written | 3880 bytes | 0 |
+
+Those three numbers are the whole point: `false` and omitted differ by 32 bytes
+(16 per literal run) and are **not equivalent**, and neither one un-bolds the page
+number **digit**. The digits sit in field runs, and a field run only ever receives
+`w:b` when `bold` is truthy — so on a footer whose `Footer` style is bold,
+`"bold": false` suppresses bold on `"Page "` and `" of "` while the number stays
+bold, which looks like a bug and is the documented behaviour. Either turn bold off
+at the style, or leave `bold` truthy and let both kinds be bold. (The
+`section_break` keys `header_bold` / `footer_bold` are a different story: those
+write plain text runs with no fields in them, so `false` there is a real explicit
+off — measured, one `<w:b w:val="0"/>` on the only run — and does mean "not
+bold".)
 
 | `type` | Fields |
 |---|---|
@@ -224,7 +280,7 @@ with `-o`, the `--to` file is left byte-for-byte alone.
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold` |
 | `image` | `path`, optional `width_mm` |
 | `page_break` | — |
-| `section_break` | `start_type`, optional `page`, `header` / `footer` (+ their `_align` / `_font` / `_size_pt` / `_bold`), `footer_page_numbers`, `different_first_page`, `cols`, `no_footer`, `reuse_last_paragraph`, `apply_to` |
+| `section_break` | `start_type`, optional `page`, `header` / `footer` (+ their `_align` / `_font` / `_size_pt` / `_bold`), `footer_page_numbers` (`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`, plus `font` / `size_pt` / `bold` for the page-number runs — see the `bold` table above, `false` reaches the literal runs but not the field runs), `different_first_page`, `cols`, `no_footer`, `reuse_last_paragraph`, `apply_to` |
 | `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures. **A field**: Word must update it (F9) before any entry exists |
 
 **The spec is validated before a single paragraph is built, and an unknown key
@@ -296,7 +352,7 @@ The flags worth knowing:
 | `--levels` | outline levels to include, `1,2` or `1-3` (default `1,2,3`) |
 | `--pages` | one page number per entry; **a different count is a usage error (exit 2)** |
 | `--title` | the heading text of the TOC itself |
-| `--insert-at` | body paragraph index to insert before (default: where the previous TOC was, else the end) |
+| `--insert-at` | body paragraph index to insert before (default: where the previous TOC was, else the end); out of range is exit `2` |
 | `--section-index` | which section's text width sets the right tab stop |
 | `--indent-chars` | per-level left indent in characters (default `0,2,4`) |
 | `--adopt-unmarked` | also replace an unmarked TOC this module did not write — off by default, because that may be the user's own |
@@ -385,7 +441,10 @@ Two entry points share one engine (`math_omml.py`):
   writing; `--report md` records every before/after pair, plus a count and a
   per-paragraph table for spans that took the no-layout tier. `--inplace` writes
   a `<name>.bak.docx` first; `--inplace` together with `-o` is a usage error
-  (exit `2`), because the write target would be ambiguous.
+  (exit `2`), because the write target would be ambiguous. So is `-o` together
+  with `--dry-run` (exit `2`): dry-run writes nothing, so the path `-o` names can
+  never be produced — accepting it silently meant echoing a destination that was
+  never created.
 - **`insert_formula.py` — single.** Takes LaTeX and drops one equation into an
   unpacked document at an anchor.
 
@@ -761,15 +820,34 @@ tests/       pytest suite — 47 .py (46 test_*.py + _omml.py helper)
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, a missing or unreadable input file, "the document does not contain what you asked for", a runtime exception |
-| `2` | usage error — argparse, an `--index` outside the legal range (or negative, where the script validates it), an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together |
-| `3` | **`docx_mathify` only**: the document was written, but at least one formula failed to convert |
+| `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception |
+| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together, an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package |
+| `3` | **`docx_mathify` only** (and `docx_template apply --fix-formulas`, which passes it through): the document was written, but at least one formula failed to convert |
+
+A usage error is a **refusal, not a repair**: it is decided before anything is read
+or written, the input file is byte-for-byte untouched, the message is one
+`error: …` line on stderr, and stdout stays empty.
+
+The input-path clause in row `2` is scoped to the CLIs that open a document, and it
+is not a claim that the whole tree answers the same way: `docx_validate` is the
+deliberate exception, because "this package is broken" is its *answer* rather than
+a misuse of the tool — it prints `{"ok": false, …}` on stdout and exits `1`, so
+read its JSON, not its exit code. Every other failure that a document-reading CLI
+reports as `1` (a marker that did not match, a bookmark that is not there) happens
+*after* the path was accepted, which is exactly the line row `2` draws.
 
 `docx_mathify` returning `3` is deliberate: the output file is valid and mostly
 converted, but at least one equation is still linear text. Check the exit code if
 you are delivering the result. "Missing XSL" does not always mean `3` — a
 document whose spans are all degradable (text runs, text scripts) never touches
 the XSL and still exits `0`.
+
+`docx_read` is the sharpest case of the stdout rule, because *every* one of its
+success modes writes JSON: on a missing file, a directory, a non-ZIP, or a ZIP
+that is not a Word package it exits `2` with one line on stderr and **nothing at
+all on stdout**. Relaying the failure through stdout as JSON would make every
+`json.loads(stdout)` caller read a failure as a success. "The document is real but
+has a problem" is `docx_validate`'s job and exits `1` instead.
 
 ## Conventions
 

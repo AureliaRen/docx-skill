@@ -42,10 +42,10 @@ import json
 import random
 import sys
 
-from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+from docx_read import InputError, _check_input, _open_document
 from docx_utils import insert_ordered
 
 # Formats Word accepts for <w:numFmt w:val="...">.
@@ -433,7 +433,22 @@ def main() -> int:
             and args.cmd in ("apply", "detach", "restart"):
         ap.error("one of --index / --style / --match is required")
 
-    doc = Document(args.path)
+    # The input file is validated here — before `Document()` and before any
+    # sub-command — because a broken package used to be a bare traceback with
+    # exit 1 (measured 2026-11-11: 19 lines for a missing/non-zip file,
+    # `IsADirectoryError` for a directory). Exit 2 is the project-wide code for
+    # "you named something that is not there / not usable as given"; exit 1
+    # stays reserved for "the document is real but the selection matched
+    # nothing" (see the module docstring's exit-code table). stdout stays
+    # empty: `list` prints JSON on success, so a failure must not look like an
+    # empty document with no numbering. `doc.save()` is far below, so a refused
+    # run writes nothing.
+    try:
+        _check_input(args.path)
+        doc = _open_document(args.path)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     result = {
         "list": lambda: cmd_list(doc),
         "define": lambda: cmd_define(doc, args),

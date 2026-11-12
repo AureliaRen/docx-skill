@@ -60,7 +60,6 @@ import argparse
 import json
 import sys
 
-from docx import Document
 from docx.enum.section import (
     WD_HEADER_FOOTER, WD_ORIENTATION, WD_SECTION_START,
 )
@@ -69,6 +68,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm
 
+from docx_read import InputError, _check_input, _open_document
 from docx_utils import fix_child_order, insert_ordered
 
 XMLSPACE = "{http://www.w3.org/XML/1998/namespace}space"
@@ -501,24 +501,76 @@ def _rpr(font=None, size_pt=None, bold=None):
 
     ``EG_RPrBase`` is an ``xsd:choice`` with ``maxOccurs="unbounded"``, so run
     properties may appear in any order — no sequencing work needed here.
+
+    **``bold`` is deliberately two-state here, not three.** This uses
+    ``if bold:``, so ``False`` and ``None`` take the same branch and neither
+    writes ``w:b``. ``python-docx``'s ``_set_bool_val`` would instead store
+    ``False`` as ``<w:b w:val="0"/>`` — an *explicit* off, meant to cancel a
+    style's ``<w:b/>`` through inheritance. That is right for the text runs in
+    :func:`add_page_number_field` (they go through ``run.font.bold``, which is
+    naturally three-state) but wrong here: ``_rpr`` builds formatting for
+    footer page-number runs, and a footer is not bold by default, so writing
+    ``w:val="0"`` on every run would push a pile of declarations into the
+    document whose only job is to cancel an inheritance that was never on.
+    ``add_page_number_field(font=…, bold=…)`` also means "set it to this", not
+    "distinguish unset from off". Should an explicit "turn bold off" ever be
+    needed, add a *new* parameter rather than changing this test — flipping it
+    to ``is not None`` would silently restyle every existing caller that
+    passes ``bold=False`` today.
     """
     rpr = OxmlElement("w:rPr")
     if font:
         fonts = OxmlElement("w:rFonts")
-        for a in ("ascii", "hAnsi", "eastAsia", "cs"):
+        # ``qn()`` needs a prefixed name; a bare ``"ascii"`` is the ``ValueError``
+        # "not enough values to unpack".  All four are set because OOXML picks
+        # the slot per script -- ascii/hAnsi for Latin, eastAsia for CJK, cs for
+        # complex scripts -- so a partial set silently keeps the theme font.
+        for a in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
             fonts.set(qn(a), font)
         rpr.append(fonts)
     if bold:
-        for tag in ("b", "bCs"):
+        for tag in ("w:b", "w:bCs"):
             e = OxmlElement(tag)
-            e.set(qn("val"), "1")
+            e.set(qn("w:val"), "1")
             rpr.append(e)
     if size_pt:
-        for tag in ("sz", "szCs"):
+        for tag in ("w:sz", "w:szCs"):
             e = OxmlElement(tag)
-            e.set(qn("val"), str(int(round(float(size_pt) * 2))))
+            e.set(qn("w:val"), str(int(round(float(size_pt) * 2))))
             rpr.append(e)
     return rpr if len(rpr) else None
+
+
+def _set_run_fonts(run, font) -> None:
+    """Bind all four ``w:rFonts`` slots on a *text* run, as ``_rpr`` does.
+
+    ``run.font.name = font`` goes through ``docx/text/font.py``, whose setter
+    is only::
+
+        rPr.rFonts_ascii = value
+        rPr.rFonts_hAnsi = value
+
+    so ``eastAsia`` and ``cs`` keep inheriting the theme font.  On an English
+    ``"Page "`` prefix that is invisible; with a Chinese prefix
+    (``第 X 页 共 Y 页``) the CJK glyphs then render in the theme's East Asian
+    font while the digits use the requested one — the mixed-script jump
+    ``fix_fonts.py`` exists to prevent, and an inconsistency *inside a single
+    footer*, where the field runs already carried four attributes.
+
+    ``scripts/fix_fonts.py`` states the rule: every ``w:r`` must have
+    ``ascii``/``hAnsi``/``cs`` bound, and ``eastAsia`` must be *explicitly*
+    managed rather than left to inheritance.  Getting the element through
+    ``get_or_add_rFonts()`` (rather than appending one) also keeps it in its
+    ``CT_RPr`` schema slot, ahead of ``b`` / ``sz``— ``_add_field`` ordering is
+    covered by ``test_style_fonts.py``.
+
+    Nothing is written when ``font`` is falsy: the caller's "no font asked
+    for" must not grow a stray ``w:rFonts``.
+    """
+    rpr = run._r.get_or_add_rPr()
+    fonts = rpr.get_or_add_rFonts()
+    for a in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        fonts.set(qn(a), font)
 
 
 def _field_runs(instr: str, cached: str, rpr=None) -> list:
@@ -639,7 +691,7 @@ def add_page_number_field(section, template="page_of", fmt=None, start=None,
                 continue
             run = para.add_run(value)
             if font:
-                run.font.name = font
+                _set_run_fonts(run, font)
             if size_pt:
                 run.font.size = _pt(size_pt)
             if bold is not None:
@@ -936,7 +988,21 @@ def main() -> int:
     p.add_argument("--space", type=int, default=425, help="w:space in twips")
 
     args = ap.parse_args()
-    doc = Document(args.path)
+    # The input file is validated here — before `Document()` and before any
+    # sub-command — because a broken package used to be a bare traceback with
+    # exit 1 (measured 2026-11-11: 19 lines for a missing/non-zip file).
+    # Exit 2 is the project-wide code for "you named something that is not
+    # there / not usable as given"; exit 1 stays reserved for "the document is
+    # real but the requested change cannot be made". stdout stays empty: every
+    # success prints JSON, so a failure must not look like an empty-but-OK
+    # document. `doc.save()` is the only writer and it is far below, so a
+    # refused run writes nothing.
+    try:
+        _check_input(args.path)
+        doc = _open_document(args.path)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.cmd == "list":
         print(json.dumps(cmd_list(doc), ensure_ascii=False))

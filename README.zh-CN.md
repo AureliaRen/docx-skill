@@ -225,11 +225,13 @@ python scripts/docx_create.py spec.json report.docx
 | 码 | 含义 |
 |---|---|
 | `0` | 成功 |
-| `1` | 预期内失败——文件不存在、锚点段没找到、spec 不合法 |
-| `2` | 用法错误——argparse 拦下，或某个必需的模式开关没给 |
+| `1` | 预期内失败——锚点段没找到、spec 不合法 |
+| `2` | 用法错误——argparse 拦下、某个必需的模式开关没给、`--index` / `--insert-at` 越界，或输入路径不存在、是目录、不是 Word 包 |
 | `3` | 部分成功——`docx_mathify` 把文档写出去了，但至少还有一条公式是线性文本 |
 
-`3` 只会从 `docx_mathify` 出来，且是刻意的：产物有效、绝大多数已转换，所以交付前要看一眼退出码。
+`3` 出自 `docx_mathify`，而 `docx_template apply --fix-formulas` 会把它原样透传——因为那条通道就是就地跑一遍 mathify；`--no-fix-formulas` 压根不调 mathify。两种情况都是刻意的：产物有效、绝大多数已转换，所以交付前要看一眼退出码。
+
+用法错误只往 stderr 写一行、stdout 留空、什么都不碰——输入文件逐字节不变。这条在 `docx_read` 上最要紧：它每一种成功模式都出 JSON，所以缺文件、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，一律 exit `2` 且 stdout **一个字节都没有**，而不是回一份会被每个 `json.loads(stdout)` 调用方读成成功的失败 JSON。
 
 ## 脚本清单（`scripts/`，27 个文件）
 
@@ -240,39 +242,50 @@ python scripts/docx_create.py spec.json report.docx
 | **CLI** | **25** | 带 `__main__` 守卫，能直接从命令行跑 |
 | **纯库** | **1** | `_bootstrap.py` —— 私有模块，在解析参数之前就被 import，永远不单独运行 |
 
-这 25 个 CLI 里，**18 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。
+这 25 个 CLI 里，**18 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。每个命令的完整参数见 [SKILL.zh-CN.md](SKILL.zh-CN.md)。
 
-下表末列含义：`✔` = 有 argparse 表面｜`自检` = 有 `__main__`、跑自检｜`库` = 无 argparse 表面（6 个带一行 `__main__` 自述；`_bootstrap` 连 `__main__` 都没有）｜`PS` = PowerShell。
+**CLI 工具（18 个带 argparse 的 `.py`）**
 
-| 文件 | 作用 | CLI |
-|---|---|---|
-| `docx_create.py` | 按 JSON spec 生成 .docx（`page` / `styles` / `header` / `footer` / `blocks`） | ✔ |
-| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` | ✔ |
-| `docx_read.py` | `--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` | ✔ |
-| `docx_validate.py` | 包级健康检查，`ok:false` 时 exit 1 | ✔ |
-| `docx_comments.py` | 批注 `list` / `add --target` / `delete --id`（**id 从 `0` 起**） | ✔ |
-| `docx_revisions.py` | 修订 `list` / `accept-all` / `reject-all` / `accept` / `reject` | ✔ |
-| `docx_template.py` | `extract` / `apply`（`-o` 需 node + docx-js，`--to` 打回现有文档）/ `fill`（`{{token}}`） | ✔ |
-| `docx_numbering.py` | 自动编号 `list` / `define` / `apply` / `detach` / `restart` | ✔ |
-| `docx_crossref.py` | 交叉引用与题注 `caption` / `ref` / `bookmark` / `renumber` / `list` | ✔ |
-| `docx_toc.py` | 静态目录 `build_static_toc` / `collect_outline` / `drop_existing_toc` | ✔ |
-| `docx_section.py` | 分节 `list` / `break` / `pagenum` / `pagenums` / `header` / `footer` / `cols` | ✔ |
-| `fix_zoom.py` | 给 `<w:zoom>` 补 schema 强制的 `w:percent` | ✔ |
-| `fix_fonts.py` | 字体统一：样式层 + run 层 + 手动放大标题 | ✔ |
-| `table_width.py` | 表宽 `report` / `set --widths` / `sync` / `auto --content-width` | ✔ |
-| `merge_docs.py` | 合并两份 docx（样式/编号/图片关系/sectPr） | ✔ |
-| `docx_mathify.py` | 批量把线性公式换成 OMML（`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`） | ✔ |
-| `insert_formula.py` | 解包目录插单条 LaTeX 公式（`--after` / `--before` / `--display` / `--dump`） | ✔ |
-| `docx_pack.py` | 解包/重打包（`unpack` / `pack`）：按原条目顺序与压缩方式回写 | 库 |
-| `docx_common.py` | 共享段落遍历：`iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`；`--api` 打印导出面 | ✔ |
-| `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` | 库 |
-| `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts` / `UNITS` | 库 |
-| `math_omml.py` | LaTeX → MathML → OMML（`latex_to_omml_lxml` / `assert_legal`） | 库 |
-| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`，修相量点浮大（`__main__` 跑自检） | 自检 |
-| `encoding.py` | Windows 下 stdout/stderr 切 UTF-8（`_bootstrap` 已触发） | 库 |
-| `minidom_compat.py` | `defusedxml.minidom` 缺失时兜底 stdlib | 库 |
-| `_bootstrap.py` | 平铺布局自举：`sys.path` + 运行时兜底 | 库 |
-| `pdf_export.ps1` | docx → PDF（Word COM，`ExportAsFixedFormat(17)`，ReadOnly） | PS |
+| 文件 | 作用 |
+|---|---|
+| `docx_create.py` | 按 JSON spec 生成 `.docx`（`page` / `styles` / `header` / `footer` / `blocks`） |
+| `docx_read.py` | 读回文档：`--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` |
+| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` |
+| `docx_validate.py` | 包级健康检查，`ok:false` 时 exit 1 |
+| `docx_comments.py` | 批注 `list` / `add --target` / `delete --id`（**id 从 `0` 起**） |
+| `docx_revisions.py` | 修订 `list` / `accept-all` / `reject-all` / `accept` / `reject` |
+| `docx_common.py` | 共享段落遍历：`iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`；`--api` 打印导出面 |
+| `docx_template.py` | `extract` / `apply`（`-o` 需 node + docx-js，`--to` 打回现有文档，`--fix-formulas` 透传 mathify 的退出码）/ `fill`（`{{token}}`） |
+| `docx_numbering.py` | 自动编号 `list` / `define` / `apply` / `detach` / `restart` |
+| `docx_crossref.py` | 交叉引用与题注 `caption` / `ref` / `bookmark` / `renumber` / `list` |
+| `docx_toc.py` | 静态目录 `build_static_toc` / `collect_outline` / `drop_existing_toc` |
+| `docx_section.py` | 分节 `list` / `break` / `pagenum` / `pagenums` / `header` / `footer` / `cols` |
+| `docx_mathify.py` | 批量把线性公式换成 OMML（`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`）；`--dry-run` 与 `-o` 同传是 exit `2` |
+| `insert_formula.py` | 解包目录插单条 LaTeX 公式（`--after` / `--before` / `--display` / `--dump`） |
+| `table_width.py` | 表宽 `report` / `set --widths` / `sync` / `auto --content-width` |
+| `fix_fonts.py` | 字体统一：样式层 + run 层 + 手动放大标题（`--heading-threshold`） |
+| `fix_zoom.py` | 给 `<w:zoom>` 补 schema 强制的 `w:percent`（`--percent`） |
+| `merge_docs.py` | 合并两份 docx（样式/编号/图片关系/sectPr，`base src out`） |
+
+第 27 个文件不是 `.py`：`pdf_export.ps1` 是 PowerShell 导出通道——Word COM、`ExportAsFixedFormat(17)`、以 `ReadOnly` 打开（`-DocxPath` / `-PdfPath`）。详见 [导出 PDF](SKILL.zh-CN.md#pdf-导出附加能力)。
+
+**库与自述模块（7 个）**——按裸模块名 import；前六个带一行 `__main__` 自述，`fix_phasor_dot` 跑的是自检。`_bootstrap.py` 是唯一的纯库，单独列在最后。
+
+| 模块 | 提供什么 |
+|---|---|
+| `docx_pack.py` | `unpack` / `pack` —— 把 `.docx` 解成目录再打回去，还原原始条目顺序与逐条目压缩方式。`table_width.py` 与 `insert_formula.py` 吃的就是它产出的目录，虽然两者都没 import 它。 |
+| `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` |
+| `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts`，外加 `UNITS` 白名单 |
+| `math_omml.py` | LaTeX → MathML → OMML：`latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
+| `fix_phasor_dot.py` | `m:limUpp` → `m:acc`，修相量点浮大；`python scripts/fix_phasor_dot.py` 跑自检 |
+| `encoding.py` | `_fix_stdio()` —— Windows 下把 stdout 与 stderr 切到 UTF-8 |
+| `minidom_compat.py` | `defusedxml.minidom`，缺包时退回 stdlib |
+
+还有唯一一个**纯库**文件：
+
+| 模块 | 提供什么 |
+|---|---|
+| `_bootstrap.py` | 平铺布局自举：`sys.path` 自定位加 minidom / UTF-8 兜底。没有 `__main__`、没有 argparse——其余每个脚本都在解析参数之前 import 它。 |
 
 ## 仓内目录与 import 纪律（Layout）
 

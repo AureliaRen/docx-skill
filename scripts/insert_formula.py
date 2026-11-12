@@ -27,14 +27,21 @@ Usage
    （pandoc issue #11674 的官方修法）。
 3. ``\quad \, \; \: \!`` 与普通空格都会被 XSLT 丢弃 → 默认改写成 ``\ ``（NBSP）。
 
-退出码契约（P6-FIX-C2 起明确，此前是隐含行为）
----------------------------------------------
+退出码契约（P6-FIX-C2 起明确，此前是隐含行为；P9-D 修订 ``1``/``2`` 的边界）
+----------------------------------------------------------------------------
 * **0** —— 成功（写入分支或 ``--dump`` 打印）。
-* **2** —— **用法错误**：``--dump`` 与 ``--after``/``--before`` 同时给、
+* **2** —— **用法错误 / 输入不可用**：``--dump`` 与 ``--after``/``--before`` 同时给、
   ``--after``/``--before`` 给了空串、``--after`` 与 ``--before`` 同时给、
-  LaTeX 转换环境缺失。全部**在任何读写之前**判定，文档一个字节都不动。
-* **1** —— **文档/运行期错误**：``word/document.xml`` 不存在、``<w:body>`` 缺失、
-  marker 在文档里找不到。
+  LaTeX 转换环境缺失，以及 **``unpacked_dir`` 不可用**（目录不存在 / 里面没有
+  ``word/document.xml`` / 那个 ``word/document.xml`` 不是良构 XML）。
+  全部**在任何写盘之前**判定，文档一个字节都不动。
+  ⚠️ P9-D 之前后三档（``word/document.xml`` 不存在、XML 不良构）报 **1**，
+  其中 XML 不良构那条还是裸 traceback。它们是「你给的东西不是一个可用的解包
+  .docx 目录」，与 `docx_edit` / `docx_read` / `docx_validate` 等兄弟 CLI 的
+  输入错误同义，所以统一提到 2（全仓口径：输入不对 = 2）。
+* **1** —— **文档是真实的、但内容有问题**：``<w:body>`` 缺失、marker 在文档里
+  找不到。这两档都要求 ``word/document.xml`` 已经被成功解析，属于「合并/插入
+  做不下去」，不再是「输入给错了」。
 
 不静默说谎的两条硬约束（P6-FIX-C2，依据 P5-AUDIT-QUALITY §5.7）
 --------------------------------------------------------------
@@ -185,6 +192,44 @@ def main(argv: list[str] | None = None) -> int:
     regm()
     ET.register_namespace("m", M_NS)
 
+    # ---- 输入校验（P9-D）：`unpacked_dir` 不可用一律退 2，先于任何写盘 ----
+    # 本脚本的输入**不是** .docx 包而是**解包后的目录**，所以不套 `_check_input`
+    # （那个函数判的是「文件是不是 zip 包」，对着目录用会得出相反结论）。
+    # 三档坏输入：目录不存在 / 目录里没有 word/document.xml / 那个 XML 不良构。
+    # 前两档旧版已经是 `error:` 前缀 + 1 行，只差返回码（实测 rc=1）；
+    # 第三档旧版是 16 行裸 traceback（`ET.ParseError`），这里收成同样的一行。
+    #
+    # ★ 为什么排在 `build_para()` **之前**（且只对写入分支生效）
+    #   ① 语义：「你给的目录不对」不该被「本机没装 Office」抢先报出来。排在后面
+    #      时，无 XSL 的机器上 `build_para()` 先炸成 exit 2 + ``MML2OMML_XSL``
+    #      报错，输入问题永远看不到 —— 与 P6-FIX-C2 把用法校验提到 build_para
+    #      之前同因。
+    #   ② 可测：排在后面时这三档的用例在无 XSL 的机器上会以「同一个 rc=2、不同
+    #      的原因」**假绿**，只能被迫挂 ``@needs_omml``；提前之后它们真的不依赖
+    #      XSL，坏输入用例得以裸跑 pass。
+    # ``--dump`` 不读文档（语义是「只打印」），所以整块跳过：它从不要求目录存在。
+    tree = None
+    body = None
+    doc_xml = Path(args.unpacked_dir) / "word" / "document.xml"
+    if not args.dump:
+        if not doc_xml.exists():
+            print(f"error: {doc_xml} not found", file=sys.stderr)
+            return 2
+        try:
+            tree = parse(doc_xml)
+        except Exception as exc:        # ET.ParseError / OSError（读不了）
+            # 只取首行：ElementTree / lxml 的多行报错会把上下文一起打出来，
+            # 这里刻意保持「stderr 恰好一行」的 CLI 契约。
+            first = (str(exc).splitlines() or [""])[0]
+            print(f"error: {doc_xml} is not well-formed XML: "
+                  f"{type(exc).__name__}: {first}", file=sys.stderr)
+            return 2
+        body = tree.getroot().find(wtag("body"))
+        if body is None:
+            # <w:body> 缺失是「文档真实但内容不对」，仍是 exit 1，不是用法错误。
+            print("error: <w:body> not found", file=sys.stderr)
+            return 1
+
     try:
         para = build_para(args.formula, args.display, args.raw_spacing)
     except (RuntimeError, FileNotFoundError) as exc:
@@ -199,18 +244,6 @@ def main(argv: list[str] | None = None) -> int:
         if _LAST_PHASOR_ERROR:
             print(f"# warning: 相量点修复失败：{_LAST_PHASOR_ERROR}", file=sys.stderr)
         return 0
-
-    doc_xml = Path(args.unpacked_dir) / "word" / "document.xml"
-    if not doc_xml.exists():
-        print(f"error: {doc_xml} not found", file=sys.stderr)
-        return 1
-
-    tree = parse(doc_xml)
-    root = tree.getroot()
-    body = root.find(wtag("body"))
-    if body is None:
-        print("error: <w:body> not found", file=sys.stderr)
-        return 1
 
     marker = args.after if args.after is not None else args.before
     position = "after" if args.after is not None else "before"

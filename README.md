@@ -304,12 +304,21 @@ worth branching on rather than testing against zero:
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | expected failure — missing file, marker not found, bad spec |
-| `2` | usage error — argparse, or a required mode flag missing |
+| `1` | expected failure — marker not found, bad spec |
+| `2` | usage error — argparse, a required mode flag missing, an `--index` / `--insert-at` outside the legal range, or an input path that is missing, a directory, or not a Word package |
 | `3` | partial success — `docx_mathify` wrote the document but at least one formula is still linear text |
 
-`3` only ever comes from `docx_mathify`, and it is deliberate: the output file is
-valid and mostly converted, so check the code before you deliver it.
+`3` comes from `docx_mathify`, and `docx_template apply --fix-formulas` passes it
+through unchanged, because it runs mathify in place; `--no-fix-formulas` never
+calls mathify. Either way it is deliberate: the output file is valid and mostly
+converted, so check the code before you deliver it.
+
+A usage error writes one line to stderr, leaves stdout empty, and touches nothing —
+the input file is byte-for-byte as it was. `docx_read` is where that matters most:
+every one of its success modes emits JSON, so a missing file, a directory, a
+non-ZIP, or a ZIP that is not a Word package exits `2` with **nothing** on stdout
+rather than a JSON failure that every `json.loads(stdout)` caller would read as
+success.
 
 ## Scripts
 
@@ -341,12 +350,12 @@ like `_bootstrap`. Full flags per command are in [SKILL.md](SKILL.md).
 | `docx_comments.py` | Comments: `list` / `add --target` / `delete --id` (**ids start at `0`**) |
 | `docx_revisions.py` | Tracked changes: `list` / `accept-all` / `reject-all` / `accept` / `reject` |
 | `docx_common.py` | Shared paragraph walkers: `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`; `--api` prints the exported surface |
-| `docx_template.py` | `extract` / `apply` (`-o` needs node + docx-js, `--to` writes into an existing file) / `fill` (`{{token}}`) |
+| `docx_template.py` | `extract` / `apply` (`-o` needs node + docx-js, `--to` writes into an existing file, `--fix-formulas` passes mathify's exit code through) / `fill` (`{{token}}`) |
 | `docx_numbering.py` | Real auto-numbering: `list` / `define` / `apply` / `detach` / `restart` |
 | `docx_crossref.py` | Captions and cross-references: `caption` / `ref` / `bookmark` / `renumber` / `list` |
 | `docx_toc.py` | Static TOC as ordinary paragraphs: `build_static_toc` / `collect_outline` / `drop_existing_toc` |
 | `docx_section.py` | Sections: `list` / `break` / `pagenum` / `pagenums` / `header` / `footer` / `cols` |
-| `docx_mathify.py` | Bulk-converts linear formulas to OMML (`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`) |
+| `docx_mathify.py` | Bulk-converts linear formulas to OMML (`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`); `--dry-run` with `-o` is exit `2` |
 | `insert_formula.py` | Inserts one LaTeX formula into an unpacked directory (`--after` / `--before` / `--display` / `--dump`) |
 | `table_width.py` | Table geometry: `report` / `set --widths` / `sync` / `auto --content-width` |
 | `fix_fonts.py` | Font normalisation across style layer, run layer, and over-sized headings (`--heading-threshold`) |

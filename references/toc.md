@@ -282,6 +282,20 @@ validate_bookmark_name("图\x07")       # ["name contains control characters, ..
 所以同一个 `insert_at` 值可以反复用；`insert_at=None` 时重建落在旧目录原来的位置
 （`drop_existing_toc` 会返回 `anchor`＝被删第一条的前一个段落），不会跑到文档末尾。
 
+**`--insert-at` 越界或负数一律 exit `2`、零写盘、stdout 为空**，合法区间 `[0, N-1]`
+（`N` 是当前 body 段落数；空文档是唯一特例，只有 `0` 合法，代表追加）。
+
+重建目录时这道检查要做**两遍**，因为删掉旧目录会让 body 变短：第一遍按调用方给的
+文档判，第二遍按"旧目录已删"的 body 再判一次。第一遍合法、第二遍落空的索引会在
+第二遍被拒，报错里写明是哪一遍没通过：
+
+```
+error: --insert-at 5 is out of range after the previous TOC was removed: legal range is now [0, 2], current N=3 (the index was legal against the body before removal; pass an index within the shortened body, or omit --insert-at to land where the old TOC was)
+```
+
+这里**刻意不退回"追加到末尾"**：那会把目录放到调用方从没要求的位置，而文档照样 exit `0`，
+是最难发现的一种错位。要么给一个落在缩短后 body 里的索引，要么干脆不传 `--insert-at`。
+
 > 一个实测到的边界：如果旧目录原本在文档最前面（`anchor is None`），
 > `_body_insert_reference()` 会退化成"插到 body 第一个非 `sectPr` 子元素之前"，
 > 结果落在原位——行为正确，但 `inserted_at` 可能比预期小 1，读返回值确认即可。

@@ -30,6 +30,10 @@ import zipfile
 
 from lxml import etree
 
+# 输入校验的三件套由 `docx_read` 单一拥有（`InputError` / `_check_input`），
+# 这里只 import、不复制判定 —— 与 `docx_edit.py` / `docx_mathify.py` 同形。
+from docx_read import InputError, _check_input
+
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PR = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -149,6 +153,25 @@ def main() -> int:
         description="Health-check a .docx (not XSD schema validation).")
     ap.add_argument("path", help="the .docx file to check")
     args = ap.parse_args()
+
+    # ---- 双契约：输入错误退 2，内容问题仍退 1（P9-C）---------------------
+    # 本脚本是全仓唯一一个「1 有正当语义」的 CLI：`ok:false` + `issues` 是它的
+    # 正常产出，`1` 表示**文档是真的、但内容有 error**。所以这里只把「输入根本
+    # 不是包」这三档提到 2，**内容那一档的 JSON 输出一个字都不动**。
+    #
+    # 旧行为（实测 2026-11-11）：三档全部落进 `validate()` 的 `zipfile.ZipFile`
+    # except 分支，被收成一条 `not-a-zip` issue → **exit 1 + JSON**。于是
+    # 「路径写错了」和「文档坏了」在调用方眼里是同一件事，唯一区别是 issue 的
+    # code —— 而任何 `if rc: 报错` 的调用方都会把它当成文档问题去修文档。
+    #
+    # stdout 在拒绝路径上必须为空：成功与「内容有问题」两条路都会打 JSON，
+    # 空的 stdout 才不会被 `json.loads` 读成一个空报告。
+    try:
+        _check_input(args.path)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     report = validate(args.path)
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report["ok"] else 1

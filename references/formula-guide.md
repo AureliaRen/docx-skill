@@ -472,42 +472,45 @@ and exit `1`, because the script is not in the working directory.
 | `--dry-run` | report only; no document is written |
 | `--number-align` | number the rows of an `align`/`gather` that carry no `\tag` |
 
-At least one landing flag is required, but the three flags are **not** three
-interchangeable choices — `-o` and `--inplace` are mutually exclusive, and
-`--dry-run` overrides whichever of them is present. Measured 2026-11-11 on the
-same input document (SHA256 checked before and after each run):
+At least one landing flag is required, and the three flags are **not** three
+interchangeable choices: each pair is a usage error. `-o` and `--inplace` name two
+different write targets; `--dry-run` writes nothing at all, so a path given to `-o`
+can never come into existence. Measured 2026-11-11 on the same input document
+(SHA256 checked before and after each run):
 
 | Flags | Exit | What is written |
 |---|---|---|
 | `-o out.docx` | `0` | `out.docx`; the source is untouched; no `.bak` |
 | `--inplace` | `0` | the source is rewritten after a copy to `<name>.bak.docx` |
 | `--dry-run` | `0` | nothing at all |
-| `-o out.docx --dry-run` | `0` | **no** document (dry-run wins); `out.docx` is not created |
-| `--inplace --dry-run` | `0` | nothing, and **no** `.bak` (dry-run wins, `--inplace` is ignored) |
+| `-o out.docx --dry-run` | **`2`** | nothing; `out.docx` is not created, stdout is empty |
+| `--inplace --dry-run` | **`2`** | nothing, and **no** `.bak` (argparse rejects the pair before any work) |
 | `--inplace -o out.docx` | **`2`** | nothing; neither file is touched, no `.bak` |
 | none of the three | **`2`** | nothing |
 
-The `--inplace` + `-o` case is a usage error, not a silent choice between them:
-writing to one path and overwriting another is a contradiction the script refuses
-to resolve on the caller's behalf. It is rejected **before any read or write**, so
-the input is byte-identical afterwards. That is a deliberate choice — a batch
-rewrite that quietly does nothing, or one that picks a destination you did not
+Both refusals are **usage errors, not silent choices**: writing to one path while
+overwriting another is a contradiction, and `--dry-run` announcing a destination it
+will never produce is a lie the caller cannot detect. Each is rejected **before any
+read or write**, so the input is byte-identical afterwards. That is deliberate — a
+batch rewrite that quietly does nothing, or one that picks a destination you did not
 mean, looks identical to success until someone opens the document expecting
 formulas.
-
-`-o` together with `--dry-run` stays legal: `-o` only names the path the report
-displays, and no document is written. `--inplace` together with `--dry-run` is
-tolerated rather than refused (dry-run wins) — the one remaining silent
-combination, recorded here so nobody relies on the reverse.
 
 ### Exit codes, and `3` in particular
 
 | Code | Meaning |
 |---|---|
 | `0` | the document was written (or `--dry-run` wrote nothing, as asked) and no span failed |
-| `1` | expected failure: the input file does not exist |
-| `2` | usage error, decided **before** any read or write: `--inplace` with `-o`, or none of the three landing flags |
+| `1` | expected failure that is **not** about the input path — the conversion chain raised on a document it did manage to open |
+| `2` | usage error, decided **before** any read or write: `--inplace` with `-o`, `--dry-run` with either of them, or none of the three landing flags — and an input path that is missing, is a directory, or is not a Word package |
 | `3` | **partial success**: the document was written, but at least one formula did not convert and that span stays as its source text |
+
+A missing input file used to sit in row `1`. It belongs in row `2`, because the
+path is checked before anything is read: nothing is written either way, but a
+caller that branches on the code wants "your argument was wrong, fix it and retry"
+(`2`) to be distinguishable from "the document itself has a problem" (`1`). The
+`--dry-run` / `-o` conflicts are checked first, so a run with both a bad flag pair
+*and* a missing path reports the flags.
 
 `3` is the only exit that combines an artifact with a non-zero code, so a caller
 must check it — a silent `0` would let a document with broken equations ship as
@@ -538,8 +541,10 @@ the partial-success shape `3` exists to report.
 Missing `MML2OMML.XSL` is not a synonym for `3`: a document whose spans all
 degrade to plain text runs never touches the stylesheet and still exits `0`; only
 a span that needs an equation object (a fraction, a radical, …) reaches the
-failure. `3` belongs to `docx_mathify.py` alone — no other script in `scripts/`
-returns it.
+failure. `3` belongs to `docx_mathify.py` — and to `docx_template.py apply
+--fix-formulas`, which passes mathify's code back up unchanged (`1`/`2` as-is, `3`
+as `3`, and only `0` collapses to `0`), because it runs mathify in place. No other
+script in `scripts/` returns it.
 
 `--report` and `--tex` are worth running together. The report is for reading: it
 pairs each original notation with the LaTeX that came out, one row per span,
