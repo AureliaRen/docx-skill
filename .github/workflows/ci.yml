@@ -212,7 +212,7 @@ jobs:
         #      breaks the identity. With nothing failing and no xfail in the
         #      suite this reduces to the plain `passed + skipped == collected`.
         #
-        #   3. FLOOR: passed >= MIN_PASSED (1440, measured on a clean clone with no
+        #   3. FLOOR: passed >= MIN_PASSED (1655, measured on a clean clone with no
         #      Office; see the arithmetic below). Monotone: it only ever moves
         #      up, so tests that really execute can never quietly stop
         #      executing. This is also what catches a single pass -> skip flip,
@@ -223,7 +223,7 @@ jobs:
         #      A ratio, not a count: adding a new test that skips on CI (no
         #      Office on the runner) can no longer force a false red, while a
         #      whole category of tests degrading into skips still trips it.
-        #      Today 375/1815 = 20.7%, i.e. about 78 slots of slack.
+        #      Today 376/2031 = 18.5%, i.e. about 131 slots of slack.
         #
         # What replaced what, and why (P5-AUDIT-QUALITY 4.1-4.3 and 10 item 8):
         #   MIN_PASSED was 1356 when this gate was written (P5). It was never the
@@ -243,19 +243,29 @@ jobs:
         #     sits on that floor: the floor is a measurement, not slack.
         #
         # The numbers are the hosted-runner reality, not this workstation.
-        # P6 measurement (2026-11-11, after the P6 fix batch; this is the
-        # current truth, four legs agree): 1440 passed / 375 skipped / collected 1815.
+        # P9 measurement (2026-11-12, after the P10 test-coverage batch): 1655
+        # passed / 376 skipped / collected 2031. This figure is a *simulation*, not a
+        # hosted reading: it was produced on a workstation with the XSL path
+        # pointed at a nonexistent file and no _smoke/ in the parent dir, i.e.
+        # the runner's shape reproduced by hand. It has NOT been confirmed by a
+        # four-leg run yet -- the last real run predates this batch. The first
+        # run of this commit is therefore the measurement: if any leg reports
+        # fewer than 1655 passed, lower MIN_PASSED to that leg's number and say
+        # so here, rather than leaving a floor no leg can reach.
         # Measure it on a clone of this repository, not inside the development
         # tree -- see the `_smoke/` note above.
+        # P6 measurement (historical, do not use as the floor):
+        #   1440 passed / 375 skipped / collected 1815.
         # P5 measurement (historical, do not use as the floor):
         #   passed 1356 / skipped 371 / collected 1727.
         # Re-measured on a simulated runner after the P5 round landed
         # (no Office -> no MML2OMML.XSL, no _smoke/ in the parent dir, no
         # work/r7_final/): 1356 passed / 371 skipped / collect 1727.
-        # A developer machine with Office reports 1576 passed / 239 skipped on
-        # the same collect 1815 (P6 numbers; before P6 it was 1488 / 239 on
-        # collect 1727) -- the ~135 extra passes are the OMML-dependent tests
-        # flipping back to pass. Do NOT use that number here.
+        # A developer machine with Office reports 1781 passed / 239 skipped on
+        # the same collect 2031 (P9 numbers; P6 was 1576 / 239 on collect 1815,
+        # before P6 it was 1488 / 239 on collect 1727) -- the ~140 extra passes
+        # are the OMML-dependent tests flipping back to pass. Do NOT use that
+        # number here.
         #
         # How the floor is built, so the next person can audit it instead of
         # just bumping it:
@@ -279,6 +289,14 @@ jobs:
         #        verified one by one, so it is deliberately not written here.
         #        The +3 skips are tests that need the XSL at run time.
         #   =                                                1440 / 375  (P6)
+        #   + P9 batch (exit-code and input-guard work, +205 tests collected:
+        #        +203 that run here, +2 that skip for want of the XSL)
+        #        mostly new assertions on the refusal path, which needs no
+        #        Office; the OMML-dependent ones carry @needs_omml and land in
+        #        the skip bucket instead.
+        #   + P10 batch  tests/test_fix_zoom.py 11 tests      +11 /   0
+        #        fix_docx return-code passthrough; touches no OMML
+        #   =                                                1655 / 376  (P9)
         #
         # Adding tests from now on (details in docs/reports/P6-FIX-C4.md):
         #   new test that RUNS on the runner  -> raise MIN_PASSED to the freshly
@@ -312,14 +330,14 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1440                        # monotone floor, measured on a clean clone
+          MIN_PASSED = 1655                        # monotone floor, measured on a clean clone
           SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
           run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
           collect_log = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
 
           # The summary is the last line carrying a duration, e.g.
-          #   "1440 passed, 375 skipped, 5 warnings in 61.23s"
+          #   "1655 passed, 376 skipped, 5 warnings in 61.23s"
           summary = None
           for line in run_log.splitlines():
               if re.search(r"\bin\s+\d+(?:\.\d+)?s", line) and re.search(r"\d+ (?:passed|failed|error)", line):
