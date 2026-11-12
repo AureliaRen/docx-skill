@@ -388,3 +388,156 @@ def test_merged_output_opens_and_validates(tmp_path: Path):
     txt = "".join(t.text or "" for t in body_of(out).iter(q("t")))
     assert "base paragraph one" in txt
     assert "src paragraph one" in txt
+
+
+# ===========================================================================
+# P9-D · 输入守卫：base / src **每个**都过四档判定，坏输入 exit 2 + 零写盘
+# ===========================================================================
+# 为什么这条挡在 merge_docs 上特别重要：
+#   `main()` 的**第一件事**就是 `print(f"基底: …")` / `print(f"并入: …")`。旧版
+#   只查 `Path(p).exists()`，另外三档（是目录 / 非 zip / zip 但非 Word 包）会先
+#   把这几十字节打到 **stdout**、再在 `load()` / `bb["word/document.xml"]` 上崩成
+#   裸 traceback + exit 1（实测 2026-11-11：23 / 17 / 10 行，stdout 39–41 字节）。
+#   所以断言必须同时看 **stdout 为空**：只断 rc 的话，"先打印再崩"的形态照样过。
+BAD_INPUT_CASES = [
+    pytest.param("missing", "no such file", id="missing"),
+    pytest.param("directory", "not a file", id="directory"),
+    pytest.param("non-zip", "not a ZIP package", id="non-zip"),
+    pytest.param("zip-not-word", "not a Word package", id="zip-not-word"),
+]
+
+
+def _make_bad(kind: str, tmp_path: Path) -> Path:
+    """造一档坏输入（四档措辞与 ``docx_read._check_input`` 的契约一一对应）。"""
+    if kind == "missing":
+        return tmp_path / "no-such.docx"          # 刻意不创建
+    if kind == "directory":
+        p = tmp_path / "a-directory.docx"          # 目录顶着 .docx 名
+        p.mkdir()
+        return p
+    if kind == "non-zip":
+        p = tmp_path / "renamed.docx"
+        p.write_text("this is not a zip file", encoding="utf-8")
+        return p
+    # 合法 zip、无 [Content_Types].xml：`is_zipfile` 放行，`_open_document` 才拒
+    p = tmp_path / "bare-zip.docx"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("foo.txt", "bar")
+    return p
+
+
+def _one_error_line(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", "replace")
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {text}"
+    return lines[0]
+
+
+@pytest.mark.parametrize("kind,wording", BAD_INPUT_CASES)
+def test_bad_base_is_exit_2(kind, wording, tmp_path: Path):
+    """``base`` 位置的四档坏输入 → exit 2 + 单行 ``error: …`` + **stdout 空**。
+
+    argv 用完整形态 ``merge_docs.py BASE SRC OUT``：只给一个路径时 argparse 会以
+    ``the following arguments are required: src, out`` 退 2，那是**假绿**（根本没
+    走到业务代码）。这里的判别器是「stderr 里出现那个坏路径 + 特定措辞」。
+    """
+    bad = _make_bad(kind, tmp_path)
+    good_src = tmp_path / "good_src.docx"
+    make_src(good_src)
+    out = tmp_path / "out.docx"
+
+    proc = run_merge(bad, good_src, out)
+
+    assert proc.returncode == 2, (
+        f"坏 base 必须退 2：rc={proc.returncode}\n"
+        f"stdout={proc.stdout!r}\n"
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    line = _one_error_line(proc.stderr)
+    assert line.startswith("error: "), f"stderr 不是 `error: ` 前缀：{line!r}"
+    assert wording in line, f"报错没指出坏在哪（期望 {wording!r}）：{line!r}"
+    assert str(bad) in line, f"报错没提那个坏路径：{line!r}"
+    assert proc.stdout == b"", (
+        f"失败路径不许有 stdout —— 旧版正是在这里先打「基底: …」再崩的："
+        f"{proc.stdout!r}")
+    assert not out.exists(), "坏输入路径仍然创建了输出文件（半成品落盘）"
+
+
+@pytest.mark.parametrize("kind,wording", BAD_INPUT_CASES)
+def test_bad_src_is_exit_2(kind, wording, tmp_path: Path):
+    """``src`` 位置的四档坏输入 → 同上（**每个输入**都要校验，不能只查第一个）。
+
+    只校验 base 是典型半修：`merge_docs good.docx NOPE.docx out.docx` 仍然崩，
+    而调用方会以为「我已经把 base 修好了」。
+    """
+    bad = _make_bad(kind, tmp_path)
+    good_base = tmp_path / "good_base.docx"
+    make_base(good_base)
+    out = tmp_path / "out.docx"
+
+    proc = run_merge(good_base, bad, out)
+
+    assert proc.returncode == 2, (
+        f"坏 src 必须退 2：rc={proc.returncode}\n"
+        f"stdout={proc.stdout!r}\n"
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    line = _one_error_line(proc.stderr)
+    assert line.startswith("error: "), f"stderr 不是 `error: ` 前缀：{line!r}"
+    assert wording in line, f"报错没指出坏在哪（期望 {wording!r}）：{line!r}"
+    assert str(bad) in line, f"报错没提那个坏路径：{line!r}"
+    assert proc.stdout == b"", f"失败路径不许有 stdout：{proc.stdout!r}"
+    assert not out.exists(), "坏输入路径仍然创建了输出文件（半成品落盘）"
+
+
+def test_bad_input_leaves_both_inputs_byte_identical(tmp_path: Path):
+    """坏输入路径**不动任何一个输入文件**（本脚本只读输入，但校验早于一切）。
+
+    这条不是防"merge_docs 会改输入"，是防将来有人在校验**前面**加一步写操作
+    （典型：临时解包目录就在输入旁边、先 `shutil.copy2` 备份）。校验排在它前面，
+    这条才恒成立。
+    """
+    import hashlib
+
+    good_base = tmp_path / "good_base.docx"
+    make_base(good_base)
+    bad = _make_bad("non-zip", tmp_path)
+
+    def sha(p: Path) -> str:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    base_sha, bad_sha = sha(good_base), sha(bad)
+    out = tmp_path / "out.docx"
+
+    assert run_merge(good_base, bad, out).returncode == 2
+
+    assert sha(good_base) == base_sha, "失败路径改动了 base 输入"
+    assert sha(bad) == bad_sha, "失败路径改动了 src 输入"
+    assert not out.exists(), "失败路径产出了输出文件"
+
+
+def test_valid_pair_still_merges_after_input_guard(tmp_path: Path):
+    """**合法对照**：两个真文档 → exit 0 + 输出文件真的生成且内容两份都在。
+
+    防「一律报错」的假修：校验加过头（比如把 `_open_document` 的结果当成必须
+    非空、或把 stdout 判据写反）时，先红的是这条。它同时锁住「加校验没顺手
+    清掉成功路径的进度输出」——`基底:`/`并入:` 两行仍在 stdout 里。
+    """
+    base, src = tmp_path / "base.docx", tmp_path / "src.docx"
+    make_base(base)
+    make_src(src)
+    out = tmp_path / "out.docx"
+
+    proc = run_merge(base, src, out)
+
+    assert proc.returncode == 0, (
+        f"合法输入必须照常合并：rc={proc.returncode} "
+        f"stderr={proc.stderr.decode('utf-8', 'replace')!r}")
+    assert proc.stderr == b"", "成功路径不该有 stderr"
+    assert out.is_file(), "没生成输出文件"
+
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "基底:" in stdout and "并入:" in stdout, (
+        f"成功路径的进度输出被误删（下游按这些行看进度）：{stdout!r}")
+
+    txt = "".join(t.text or "" for t in body_of(out).iter(q("t")))
+    assert "base paragraph one" in txt and "src paragraph one" in txt, (
+        "合并产物的内容不全（两份都应搬入）")

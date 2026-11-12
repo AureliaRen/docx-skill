@@ -1214,3 +1214,143 @@ def test_position_echo_inside_table_cell_reports_tc_index(tmp_path: Path):
     assert len(body_paras) == 2, (
         "公式段落漏到了 body 层（回显说 tc、实际在 body）："
         f"{[para_text(p) for p in body_paras]}")
+
+# ===========================================================================
+# P9-D · 输入守卫：`unpacked_dir` 的三档坏输入 → exit 2；`<w:body>` 缺失仍是 1
+# ===========================================================================
+# ⚠️ 本节**不挂** ``@needs_omml``，与模块 docstring 里「第 1/2/3 条必须挂」不矛盾
+#    —— 那说的是 **marker 类**用例（`insert_near` 在 `build_para()` 之后），本节的
+#    断言对象是**输入目录**，而 P9-D 已把目录校验整块挪到 `build_para()` **之前**。
+#    实测（`MML2OMML_XSL` 指到不存在路径后重跑）本节 4 条全 **pass**、不是 skip：
+#    目录不对时脚本在需要 XSL 之前就退 2，报的是 document.xml，不是 MML2OMML.XSL。
+#
+# 唯一要挂的是**合法对照**（最后一条）：它得真跑公式链，没有 XSL 就无从插公式。
+def _bad_unpacked(tmp_path: Path, kind: str) -> tuple[Path, str]:
+    """造一档坏 ``unpacked_dir``，返回 ``(目录, stderr 里应出现的措辞)``。"""
+    if kind == "missing":
+        # 刻意不创建：连目录本身都没有
+        return tmp_path / "no-such-unpacked", "not found"
+    d = tmp_path / f"bad-{kind}"
+    d.mkdir()
+    if kind == "no-document-xml":
+        # 目录在、但里面没有 word/document.xml（只有无关文件）
+        (d / "readme.txt").write_text("nothing here", encoding="utf-8")
+        return d, "not found"
+    # 目录在、document.xml 在，但不是良构 XML（标签不闭合）
+    (d / "word").mkdir()
+    (d / "word" / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main"><w:body></w:document>',
+        encoding="utf-8")
+    return d, "not well-formed XML"
+
+
+@pytest.mark.parametrize("kind",
+                         ["missing", "no-document-xml", "malformed-document-xml"])
+def test_bad_unpacked_dir_is_exit_2_single_line_no_traceback(kind, tmp_path: Path):
+    r"""三档坏 ``unpacked_dir`` → **exit 2** + stderr **恰好一行** + stdout 空 + 无 traceback。
+
+    本脚本的输入形态是**解包目录**而不是 .docx 包，所以不套 ``_check_input``
+    （那个函数判「文件是不是 zip」，对着目录用会得出相反结论）。三档：
+
+    | 档 | 旧版实测（2026-11-11） | 现在 |
+    |---|---|---|
+    | 目录不存在 | rc=1 + 1 行 ``error: …\word\document.xml not found`` | rc=**2** + 1 行 |
+    | 目录在但无 document.xml | rc=1 + 同上 1 行 | rc=**2** + 1 行 |
+    | document.xml 不良构 | rc=1 + **16 行裸 traceback** | rc=**2** + 1 行 |
+
+    前三档的 argv 都是完整的 ``insert_formula.py DIR FORMULA``：只给 DIR 会以
+    ``the following arguments are required: formula`` 退 2，那是 argparse 假绿
+    —— 判别器是「stderr 里出现那个坏目录路径 + 该档特定措辞」。
+
+    为什么必须同时断 stdout 为空与单行：旧版前两档的 rc 只差一个数字，第三个档
+    却是 traceback。只断 ``rc != 0`` 的用例对 traceback 完全免疫（那正是 P9 终审
+    抓到的形态）。
+    """
+    d, wording = _bad_unpacked(tmp_path, kind)
+    d_sha_before = None
+    docx_xml = d / "word" / "document.xml"
+    if docx_xml.is_file():
+        d_sha_before = hashlib.sha256(docx_xml.read_bytes()).hexdigest()
+
+    proc = run_insert(d, "E=mc^2")
+    stderr = proc.stderr.decode("utf-8", "replace")
+
+    assert proc.returncode == 2, (
+        f"[{kind}] 坏目录必须退 2：rc={proc.returncode}\n"
+        f"stdout={proc.stdout!r}\nstderr={stderr!r}")
+    assert "Traceback (most recent call last)" not in stderr, (
+        f"[{kind}] 仍然是裸 traceback（契约要求单行 error）：{stderr!r}")
+
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, (
+        f"[{kind}] stderr 必须恰好一行，实际 {len(lines)} 行：{stderr!r}")
+    assert lines[0].startswith("error: "), (
+        f"[{kind}] stderr 不是 `error: ` 前缀：{lines[0]!r}")
+    assert wording in lines[0], (
+        f"[{kind}] 报错没指出坏在哪（期望 {wording!r}）：{lines[0]!r}")
+    assert str(d) in lines[0], (
+        f"[{kind}] 报错没提那个坏目录 —— argparse 假绿的判别器：{lines[0]!r}")
+
+    assert proc.stdout == b"", (
+        f"[{kind}] 失败路径不许有 stdout（成功时打的是 Inserted …）：{proc.stdout!r}")
+
+    if d_sha_before is not None:
+        assert hashlib.sha256(docx_xml.read_bytes()).hexdigest() == d_sha_before, (
+            f"[{kind}] 失败路径改写了 document.xml（零写盘被破坏）")
+
+
+def test_missing_body_is_still_exit_1(tmp_path: Path):
+    r"""**不许顺手改掉的那条**：XML 良构但缺 ``<w:body>`` → 仍是 **exit 1**。
+
+    ``<w:body>`` 缺失是「文档真实存在、但内容不是一个可插入的文档」，属运行期
+    错误。把它也提到 2 就把「输入给错了」和「文档结构不对」混成一档 —— 本单只该
+    动输入档（目录不存在 / 无 document.xml / XML 不良构），不动这一档。
+
+    不需要 XSL：校验与 ``<w:body>`` 查找都在 ``build_para()`` 之前。所以裸跑，不挂
+    ``@needs_omml``。
+    """
+    d = tmp_path / "no-body"
+    (d / "word").mkdir(parents=True)
+    (d / "word" / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main"/>',
+        encoding="utf-8")
+
+    proc = run_insert(d, "E=mc^2")
+    stderr = proc.stderr.decode("utf-8", "replace")
+
+    assert proc.returncode == 1, (
+        f"缺 <w:body> 仍是 exit 1（运行期语义）：rc={proc.returncode} "
+        f"stderr={stderr!r}")
+    assert "<w:body> not found" in stderr, f"报错没点明缺 body：{stderr!r}"
+    assert proc.stdout == b"", "失败路径不许有 stdout"
+
+
+@needs_omml
+def test_valid_unpacked_dir_still_inserts_formula(tmp_path: Path):
+    r"""**合法对照**：真解包目录 → exit 0 + 公式真的落进文档（防「一律报错」假修）。
+
+    唯一挂 ``@needs_omml`` 的一条：它要真跑 LaTeX → MathML → OMML 转换链，
+    没有 ``MML2OMML.XSL`` 就没有公式可插。
+
+    断言三层：rc=0、stdout 是 ``Inserted inline formula``、``document.xml`` 里
+    真的多出 1 个 ``m:oMath``。只断 rc 会被「rc=0 但什么都没插」混过去。
+    """
+    up = make_unpacked(tmp_path, ["alpha one", "marker here", "omega three"])
+
+    assert omath_in(xml_root(up)) == 0, "fixture 前置假设失效：本文档本来就有 oMath"
+    paras_before = len(body_paragraphs(up))
+
+    proc = run_insert(up, "E=mc^2", "--after", "marker here")
+    assert proc.returncode == 0, (
+        "合法输入必须照常插入：rc=%s stderr=%r"
+        % (proc.returncode, proc.stderr.decode("utf-8", "replace")))
+    stdout = proc.stdout.decode("utf-8", "replace")
+    assert "Inserted inline formula" in stdout, f"没走到写入分支：{stdout!r}"
+
+    assert len(body_paragraphs(up)) == paras_before + 1, (
+        f"段落数没 +1（公式没插进去）：{paras_before} → "
+        f"{len(body_paragraphs(up))}")
+    assert omath_in(xml_root(up)) == 1, (
+        f"document.xml 里的 oMath 数不是 1：{omath_in(xml_root(up))}")

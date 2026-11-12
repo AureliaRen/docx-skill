@@ -61,6 +61,10 @@ import _bootstrap  # noqa: F401 - flat-layout bootstrap + minidom / UTF-8 fallba
 
 from lxml import etree
 
+# 输入校验的三件套由 `docx_read` 单一拥有（`InputError` / `_check_input` /
+# `_open_document`），这里只 import，不复制判定 —— 与 `docx_edit.py` 同形。
+from docx_read import InputError, _check_input, _open_document
+
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PR = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -305,10 +309,22 @@ def main_cli() -> int:
     ap.add_argument("src", help="source .docx to append")
     ap.add_argument("out", help="output .docx path")
     args = ap.parse_args()
-    for p in (args.base, args.src):
-        if not Path(p).exists():
-            print(f"error: {p} not found", file=sys.stderr)
-            return 1
+    # ---- 输入校验（P9-D）：base 与 src **每个**都过四档判定，先于 `main()` ----
+    # 旧版只查 `Path(p).exists()`：缺文件退 1（语义错——输入不对不等于合并失败），
+    # 其余三档（是目录 / 非 zip / zip 但非 Word 包）在 `main()` 里崩成裸 traceback
+    # + exit 1（实测 2026-11-11：23 / 17 / 10 行），且崩之前 `main()` 已经往
+    # **stdout** 打了「基底: …」「并入: …」几十字节——失败路径不能有 stdout。
+    #
+    # `_open_document` 也跑一遍（不做 `_check_input` 单点）：本脚本不用 python-docx
+    # 解析文档，`is_zipfile` 只读文件尾，一个 zip 壳子（有 foo.txt、无
+    # `word/document.xml`）能过检却在 `bb["word/document.xml"]` 上抛 KeyError。
+    try:
+        for p in (args.base, args.src):
+            _check_input(p)
+            _open_document(p)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     main(args.base, args.src, args.out)
     return 0
 

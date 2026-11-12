@@ -62,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _bootstrap  # noqa: F401 - flat-layout bootstrap + minidom / UTF-8 fallbacks
 
+from docx_read import InputError, _check_input
 from docx_utils import W, wtag, XML_SPACE, regw
 
 _RPR_MAP = {"rFonts":"font","b":"bold","bCs":"boldCs","i":"italic","iCs":"italicCs",
@@ -545,19 +546,26 @@ def _patch_page(root: ET.Element, tpl: dict) -> None:
 
 
 # ---- --fix-formulas: native OMML conversion (remote template.py lineage) ----
-def _convert_formulas(docx_path: Path) -> None:
-    """Run the real formula chain over ``docx_path`` in place.
+def _convert_formulas(docx_path: Path) -> int:
+    """Run the real formula chain over ``docx_path`` in place; return its code.
 
     Lazy-imports ``docx_mathify`` and hands it the file with ``--inplace``:
     linear formulas (LaTeX-ish) become native Office Math (OMML). This is a
     different mechanism from the default ``_fix_formula_markers`` pass
     (paired ``_xx_`` / ``^xx^`` -> vertAlign runs); the two coexist.
+
+    The return value is ``docx_mathify.main()``'s exit code (contract D-022:
+    ``0`` ok / ``1`` unprocessable / ``2`` usage error / ``3`` written but at
+    least one formula did not convert). Callers **must** keep it: the old
+    ``-> None`` signature threw it away, so a document that failed conversion
+    still made this CLI exit 0 -- the half-converted file looked finished
+    (P8-D6/A, measured 2026-11-11).
     """
     from docx_mathify import main as mathify_main
     argv = sys.argv
     try:
         sys.argv = ["docx_mathify.py", str(docx_path), "--inplace"]
-        mathify_main()
+        return mathify_main()
     finally:
         sys.argv = argv
 
@@ -625,6 +633,25 @@ def _with_default_subcommand(argv=None) -> list[str]:
     return argv
 
 
+def _guard_docx(path: Path) -> None:
+    """三档输入校验（缺文件 / 是目录 / 非 zip）→ ``error: ...`` + exit 2。
+
+    判定本身一行都不复制：`docx_read._check_input` 是全仓唯一实现（`docx_edit`
+    与本脚本都 import 它）。只有报错文案里的 `--path` 前缀要抹掉 —— 那是
+    `docx_read` / `docx_edit` 的参数名，本脚本的参数叫 `template` / `--to`。
+
+    三档的后果不一样，所以不能只查 `exists()`（实测 2026-11-11）：
+    缺文件是 1 行，**目录 17 行 traceback、非 zip 18 行 traceback**；
+    而 `apply --to <非 zip>` 更糟 —— 它先 `shutil.copyfile` 写出 `<名>.bak`
+    再崩。
+    """
+    try:
+        _check_input(str(path))
+    except InputError as exc:
+        print(f"error: {str(exc).replace('--path ', '', 1)}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Extract/apply docx formatting templates, fill {{token}} placeholders")
@@ -662,7 +689,7 @@ def main(argv=None):
     args = p.parse_args(_with_default_subcommand(argv))
     if args.cmd == "extract":
         src = Path(args.template)
-        if not src.exists(): print(f"error: {src} not found", file=sys.stderr); sys.exit(1)
+        _guard_docx(src)
         tpl = _extract(src)
         out = args.output or (src.stem + "_template.json")
         json.dump(tpl, open(out,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
@@ -670,8 +697,7 @@ def main(argv=None):
         return 0
     if args.cmd == "fill":
         tpl_path = Path(args.template)
-        if not tpl_path.exists():
-            print(f"error: {tpl_path} not found", file=sys.stderr); return 1
+        _guard_docx(tpl_path)
         values_path = Path(args.values)
         if not values_path.exists():
             print(f"error: {values_path} not found", file=sys.stderr); return 1
@@ -690,9 +716,13 @@ def main(argv=None):
         return 0 if result["ok"] else 1
     else:
         tpl = json.load(open(args.template, encoding="utf-8"))
+        # docx_mathify's exit code, when the OMML channel ran (0 = did not run or
+        # converted cleanly). Merged into this script's own exit code at the end;
+        # see the note there for the precedence rule.
+        omml_code = 0
         if args.to:
             target = Path(args.to)
-            if not target.exists(): print(f"error: {target} not found", file=sys.stderr); sys.exit(1)
+            _guard_docx(target)
             # P0-B: -o is the write path. Without this branch honouring it, the
             # flag was silently dropped and `apply tpl.json --to in.docx -o out.docx`
             # rewrote in.docx in place (no out.docx, no backup, exit 0).
@@ -709,7 +739,7 @@ def main(argv=None):
                 print(f"  backup → {backup}"
                       + ("  (previous backup overwritten)" if overwrote else ""))
                 if args.omml_formulas:
-                    _convert_formulas(target)
+                    omml_code = _convert_formulas(target)
             else:
                 if not dest.parent.is_dir():
                     print(f"error: output directory does not exist: {dest.parent}\n"
@@ -720,7 +750,7 @@ def main(argv=None):
                 print(f"Applied template → {dest}")
                 print(f"  source untouched → {target}")
                 if args.omml_formulas:
-                    _convert_formulas(dest)
+                    omml_code = _convert_formulas(dest)
         else:
             out = args.output or "output.docx"
             script = _gen_js(tpl)
@@ -741,10 +771,24 @@ def main(argv=None):
                         blobs["word/document.xml"] = _tree_to_bytes(tree)
                         _write_blobs(out_path, names, blobs)
                 if args.omml_formulas:
-                    _convert_formulas(out_path)
+                    omml_code = _convert_formulas(out_path)
                 print(f"Created → {out_path}")
             finally:
                 Path(spath).unlink(missing_ok=True)
+        # ---- merge docx_mathify's exit code (P8-D6/A) ----------------------
+        # Contract D-022 gives mathify 0 / 1 / 2 / 3, where 3 alone means
+        # "written, but at least one formula did not convert". Precedence:
+        #   * 1 or 2 -> hard errors, passed through untouched: "unprocessable"
+        #     and "usage error" must not be masked as success by this layer;
+        #   * 3      -> passed through as 3: the document IS on disk, so
+        #     collapsing it to 0 hides a half-converted file, and collapsing it
+        #     to 1 would claim nothing was written. 3 is the only channel that
+        #     carries both facts at once, so it is the one value we must not
+        #     reinterpret;
+        #   * 0      -> 0, the pre-existing behaviour (--fix-formulas absent or
+        #     every formula converted).
+        if omml_code:
+            return omml_code
         return 0
 
 

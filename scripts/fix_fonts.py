@@ -62,6 +62,9 @@ import _bootstrap  # noqa: F401 - flat-layout bootstrap + minidom / UTF-8 fallba
 
 from lxml import etree
 
+# 输入校验的三件套由 `docx_read` 单一拥有（`InputError` / `_check_input`），
+# 这里只 import、不复制判定 —— 与 `docx_edit.py` / `docx_mathify.py` 同形。
+from docx_read import InputError, _check_input
 # D-008: reuse the remote root-element repair so the bare-zipfile output gets
 # the same full xmlns declaration set + rewritten mc:Ignorable that
 # docx_utils.write() applies automatically to every part it serializes.
@@ -229,11 +232,25 @@ def main() -> int:
                          "treated as a manual heading (default: 14)")
     args = ap.parse_args()
     threshold_half_pt = int(round(args.heading_threshold * 2))  # pt → 半磅
-    for arg in args.docx:
-        p = Path(arg)
-        if not p.exists():
-            print(f"error: {p} not found", file=sys.stderr)
-            return 1
+    paths = [Path(a) for a in args.docx]
+
+    # ---- 输入校验（P9-C）：**全部**先过一遍，再逐个动手 --------------------
+    # 两个理由，都是实测（2026-11-11）：
+    #   1. 旧版只查 `p.exists()`，于是目录走 `zipfile.ZipFile` 抛
+    #      IsADirectoryError、非 zip 抛 BadZipFile —— 13~14 行 traceback + exit 1；
+    #   2. `nargs="+"` 下旧版**边校验边处理**：第一个文件已经被就地改写过，
+    #      才发现第二个是垃圾。一次「用法错误」的调用不该改动别的文件，所以
+    #      校验先全量跑完，再进改写循环。
+    # 判定本身来自 `docx_read._check_input`（全仓唯一实现）；只把消息里的
+    # `--path` 前缀抹掉，本脚本的位置参数叫 `docx`。
+    for p in paths:
+        try:
+            _check_input(str(p))
+        except InputError as exc:
+            print(f"error: {str(exc).replace('--path ', '', 1)}", file=sys.stderr)
+            return 2
+
+    for p in paths:
         _fix_docx(p, threshold_half_pt)
     return 0
 

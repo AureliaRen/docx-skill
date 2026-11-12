@@ -14,11 +14,15 @@
    而裸正则 ``r"<w:zoom\\s*/>"`` **抓不到**带属性的形式——最后一条用例专门
    把「朴素正则会失败」这件事固化成断言。
 """
+import os
+import subprocess
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 
 from docx_utils import (
     ET, wtag, insert_ordered, set_w_val, fix_child_order, cm_to_dxa,
@@ -296,6 +300,100 @@ class TestTableWidthFailureContract(unittest.TestCase):
         tbl = root.find(wtag("body")).find(wtag("tbl"))
         self.assertEqual(tw._read_grid(tbl),
                          [cm_to_dxa(1.0), cm_to_dxa(2.0), cm_to_dxa(3.0)])
+
+
+# ===========================================================================
+# 输入错误契约（P9-C）：`unpacked_dir` 不是「解包后的 docx」时退 2
+#
+# 本脚本的输入**不是 .docx 而是解包目录**，所以「缺文件 / 是目录 / 非 zip」
+# 三档在这里平移成：
+#
+#   缺        → 路径根本不存在
+#   是目录    → 传进来的是**文件**而不是目录（`<file>/word/document.xml` 必然不存在）
+#   非 zip    → 目录在，但里面没有 `word/document.xml`（解包没解全 / 解包错了目录）
+#
+# 旧版三者一律 `error: <p>/word/document.xml not found` + **exit 1**，与
+# 「文档有问题」混为一谈。本脚本对「解包目录对、但 XML 坏了」已经退 2
+# （`ET.ParseError` / 非 `<w:document>` 根元素那两条），所以输入本身不对
+# 更该退 2。
+# ===========================================================================
+def run_table_width(*args):
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / "table_width.py"), *map(str, args)],
+        capture_output=True, text=True, encoding="utf-8", env=env, check=False)
+
+
+def one_error_line(stderr: str) -> str:
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {stderr}"
+    return lines[0]
+
+
+def _unpacked_docx(tmp_path: Path) -> Path:
+    """造一个真的解包目录（从一份最小的 .docx 解出来）。"""
+    from docx import Document
+
+    src = tmp_path / "src.docx"
+    d = Document()
+    d.add_paragraph("hello")
+    d.save(str(src))
+    dst = tmp_path / "unpacked"
+    dst.mkdir()
+    with zipfile.ZipFile(src) as zf:
+        zf.extractall(dst)
+    return dst
+
+
+def test_missing_unpacked_dir_is_a_usage_error(tmp_path: Path):
+    """解包目录不存在 → exit 2 + 单行 ``no such file`` + stdout 空。"""
+    missing = tmp_path / "no-such-unpacked"
+    proc = run_table_width("report", missing)
+    assert proc.returncode == 2, proc.stderr
+    line = one_error_line(proc.stderr)
+    assert "no such file" in line
+    assert str(missing) in line
+    assert proc.stdout == ""
+
+
+def test_file_instead_of_unpacked_dir_is_a_usage_error(tmp_path: Path):
+    """传进来的是文件而不是目录 → exit 2 + 单行 ``not a file``... 语义换成「不是目录」。"""
+    from docx import Document
+
+    f = tmp_path / "a-file.docx"
+    d = Document()
+    d.add_paragraph("hello")
+    d.save(str(f))
+
+    proc = run_table_width("report", f)
+    assert proc.returncode == 2, proc.stderr
+    line = one_error_line(proc.stderr)
+    assert "not a directory" in line
+    assert str(f) in line
+    assert proc.stdout == ""
+
+
+def test_dir_without_document_part_is_a_usage_error(tmp_path: Path):
+    """目录在但缺 ``word/document.xml`` → exit 2 + 单行 ``not an unpacked .docx``。"""
+    empty = tmp_path / "empty-unpack"
+    (empty / "word").mkdir(parents=True)
+
+    proc = run_table_width("report", empty)
+    assert proc.returncode == 2, proc.stderr
+    line = one_error_line(proc.stderr)
+    assert "document.xml" in line
+    assert str(empty) in line
+    assert proc.stdout == ""
+
+
+def test_valid_unpacked_dir_still_reports(tmp_path: Path):
+    """合法解包目录 ``report`` 仍是 exit 0（空表读数是真答案，不是失败）。"""
+    up = _unpacked_docx(tmp_path)
+
+    proc = run_table_width("report", up)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert proc.stdout.strip() == "no tables found"
 
 
 if __name__ == "__main__":

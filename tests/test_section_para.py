@@ -18,6 +18,8 @@ suite still runs on CI.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,6 +60,82 @@ def footer_id(section, page_type="default"):
 
 def footer_part(d, section, page_type="default"):
     return d.part.related_parts[footer_id(section, page_type)]
+
+
+def create_cli(tmp_path, spec, name="spec.json"):
+    """Run ``docx_create.py`` as a CLI; return (process, output path).
+
+    A real subprocess rather than ``dc.main()``: the defect this covers
+    surfaced as a bare traceback and exit ``2`` from *the command line*, and
+    an in-process call would not show the exit code a user actually sees.
+    """
+    spec_path = tmp_path / name
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False),
+                         encoding="utf-8")
+    out = tmp_path / (name + ".docx")
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "docx_create.py"),
+         str(spec_path), str(out)],
+        capture_output=True, check=False,
+        env=dict(os.environ, LC_ALL="C", PYTHONIOENCODING="utf-8"))
+    return proc, out
+
+
+def _classify_runs(part):
+    """Split a header/footer's runs into ``(field_runs, text_runs)``。
+
+    按文档顺序走一遍，用 ``w:fldChar`` 的状态机判定归属——不能只看「有没有
+    ``fldChar``/``instrText`` 子元素」：一个**域结果 run** 只带 ``<w:t>``，
+    看上去和 ``Page `` 这类文字 run 一模一样，但它位于 ``separate`` 与 ``end``
+    之间，属于域。漏判它会让「文字 run 有几个」直接翻倍（``Page ``/`` of ``
+    两个真文字 run + 两个 ``1`` 结果 run = 4）。
+    """
+    field, text = [], []
+    depth = 0
+    for run in part.element.iter(qn("w:r")):
+        fld = run.find(qn("w:fldChar"))
+        if fld is not None:
+            kind = fld.get(qn("w:fldCharType"))
+            field.append(run)
+            if kind == "begin":
+                depth += 1
+            elif kind == "end":
+                depth = max(0, depth - 1)
+            continue
+        if run.find(qn("w:instrText")) is not None:
+            field.append(run)
+            continue
+        # `w:fldSimple` 的结果 run 是它的子元素，不在段落层级上
+        in_simple = any(a.tag == qn("w:fldSimple")
+                        for a in run.iterancestors())
+        (field if depth > 0 or in_simple else text).append(run)
+    return field, text
+
+
+def field_rprs(part):
+    """Every ``<w:rPr>`` that decorates a *field* run in a header/footer.
+
+    The plain-text runs around the fields get their formatting from
+    ``python-docx``; only the field runs take the ``_rpr()`` path under test,
+    so the assertion has to isolate them: a run that carries
+    ``<w:fldChar>``/``<w:instrText>``, or a field *result* run sitting between
+    ``separate`` and ``end``.
+    """
+    runs, _ = _classify_runs(part)
+    return [r.find(qn("w:rPr")) for r in runs if r.find(qn("w:rPr")) is not None]
+
+
+def text_rprs(part):
+    """Every ``<w:rPr>`` that decorates a *plain-text* run in a header/footer.
+
+    The mirror image of :func:`field_rprs`: a run outside every field carries
+    one of the literal strings around them (``Page `` / `` of ``, or a
+    caller's own ``prefix``/``suffix``), so it is the one written through
+    ``python-docx``'s ``run.font.name``.  Runs with no ``w:rPr`` at all cannot
+    carry a font and are left out.
+    """
+    _, runs = _classify_runs(part)
+    return [r.find(qn("w:rPr")) for r in runs if r.find(qn("w:rPr")) is not None]
 
 
 def three_sections():
@@ -598,3 +676,319 @@ def test_section_cli_rejects_a_bad_section_index(tmp_path):
         assert "no such section" in str(e.value)
     finally:
         sys.argv = old
+
+
+
+# ---------------------------------------------------------------------------
+# the page-number field's run properties
+# ---------------------------------------------------------------------------
+# ``footer_page_numbers`` accepts ``font`` / ``size_pt`` / ``bold`` (they are
+# in ``docx_create.PAGE_NUMBER_KEYS``), and the field runs read them through
+# ``docx_section._rpr``.  Writing an attribute needs a *qualified* name: a bare
+# ``qn("ascii")`` raises ``ValueError: not enough values to unpack``, which the
+# builder reports as exit ``2`` -- no document at all.  These tests pin the
+# whole path: the CLI exit code, the four ``w:rFonts`` attributes, the
+# half-point size, and the absence of properties nobody asked for.
+#
+# Pure python-docx: the assertions read the saved footer XML, so they hold on a
+# runner with no Office and no ``MML2OMML.XSL``.  Nothing here touches OMML, so
+# no ``@needs_omml`` gate is warranted -- and adding one would hide the test on
+# exactly the machines where it can run.
+def fpn_spec(**fpn):
+    """A minimal spec whose page-number field carries *fpn*."""
+    settings = {"template": "page_of", "fmt": "decimal", "start": 1,
+                "align": "center"}
+    settings.update(fpn)
+    return {"page": {"width_mm": 210, "height_mm": 297,
+                     "margins_mm": {"top": 25, "bottom": 25, "left": 20,
+                                    "right": 20}},
+            "footer_page_numbers": settings,
+            "blocks": [{"type": "paragraph", "text": "Body."}]}
+
+
+def test_page_number_field_font_writes_all_four_rfonts_attributes(tmp_path):
+    """``font`` must reach ``w:ascii``/``hAnsi``/``eastAsia``/``cs``."""
+    proc, out = create_cli(tmp_path, fpn_spec(font="Times New Roman"),
+                           name="font.json")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 0, (
+        "docx_create must accept a page-number font, not blow up in _rpr\n"
+        "exit: %d\nstdout: %s\nstderr: %s"
+        % (proc.returncode, proc.stdout.decode("utf-8", "replace"), stderr))
+    assert "Traceback" not in stderr
+    assert out.exists(), "exit 0 promises a document"
+
+    d = Document(out)
+    rprs = field_rprs(footer_part(d, d.sections[0]))
+    assert rprs, "the page-number field runs carry no w:rPr at all"
+    for rpr in rprs:
+        rfonts = rpr.find(qn("w:rFonts"))
+        assert rfonts is not None, "w:rPr is missing w:rFonts"
+        for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+            assert rfonts.get(qn(attr)) == "Times New Roman", (
+                "w:rFonts/@%s is %r, expected the font the spec asked for"
+                % (attr, rfonts.get(qn(attr))))
+
+
+def test_page_number_field_size_is_halved_into_w_sz(tmp_path):
+    """``size_pt`` is points; OOXML stores half-points."""
+    proc, out = create_cli(tmp_path, fpn_spec(size_pt=10, bold=True),
+                           name="size.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    assert out.exists()
+
+    d = Document(out)
+    rprs = field_rprs(footer_part(d, d.sections[0]))
+    assert rprs
+    for rpr in rprs:
+        assert rpr.find(qn("w:sz")).get(qn("w:val")) == "20"
+        assert rpr.find(qn("w:szCs")).get(qn("w:val")) == "20"
+        assert rpr.find(qn("w:b")) is not None
+        assert rpr.find(qn("w:bCs")) is not None
+
+    # A fractional point value must round, not truncate.
+    proc, out = create_cli(tmp_path, fpn_spec(size_pt=10.5), name="halfpt.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    d = Document(out)
+    for rpr in field_rprs(footer_part(d, d.sections[0])):
+        assert rpr.find(qn("w:sz")).get(qn("w:val")) == "21"
+
+
+def test_page_number_field_does_not_invent_a_size_or_bold(tmp_path):
+    """Only ``font`` was asked for, so ``w:sz``/``w:b`` must stay absent.
+
+    ``_rpr`` builds one ``<w:rPr>`` per field run, so a default that leaked in
+    here would silently restyle every page number in the document.
+    """
+    proc, out = create_cli(tmp_path, fpn_spec(font="Arial"), name="bare.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    d = Document(out)
+    rprs = field_rprs(footer_part(d, d.sections[0]))
+    assert rprs
+    for rpr in rprs:
+        assert tags(rpr) == ["rFonts"], (
+            "asked for font only, got %r" % (tags(rpr),))
+        assert rpr.find(qn("w:sz")) is None
+        assert rpr.find(qn("w:b")) is None
+
+
+def test_page_number_field_without_run_properties_has_no_rpr(tmp_path):
+    """No ``font``/``size_pt``/``bold`` means no ``<w:rPr>`` on field runs."""
+    proc, out = create_cli(tmp_path, fpn_spec(), name="plain.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    d = Document(out)
+    part = footer_part(d, d.sections[0])
+    assert instr(part) == ["PAGE", "NUMPAGES"]
+    assert field_rprs(part) == []
+    # 文字 run 也该干净：没要求字体就不许凭空长出一个 w:rFonts
+    assert text_rprs(part) == []
+
+
+# ---------------------------------------------------------------------------
+# The *text* runs of the footer (``Page `` / `` of ``), i.e. the prefix/suffix
+# around the fields, must carry the same four ``w:rFonts`` attributes as the
+# field runs.  ``run.font.name = font`` only writes ``@ascii`` and ``@hAnsi``
+# (``docx/text/font.py``: ``rPr.rFonts_ascii = value`` / ``rFonts_hAnsi``), so
+# the ``eastAsia`` slot stayed on the theme font.  With the default English
+# ``"Page "`` prefix that is invisible; a Chinese prefix (``第 X 页 共 Y 页``)
+# then renders its CJK glyphs in the theme's East Asian font while the digits
+# come from the requested font -- the exact mixed-script jump ``fix_fonts.py``
+# exists to prevent.  It also made one footer self-inconsistent: four
+# attributes on the field runs, two on the text runs.
+# ---------------------------------------------------------------------------
+def test_page_number_text_runs_carry_all_four_rfonts_attributes(tmp_path):
+    """The ``Page `` / `` of `` text runs get ``ascii``/``hAnsi``/``eastAsia``/``cs``."""
+    proc, out = create_cli(tmp_path, fpn_spec(font="Times New Roman"),
+                           name="textfont.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    d = Document(out)
+    part = footer_part(d, d.sections[0])
+    rprs = text_rprs(part)
+    assert len(rprs) == 2, (
+        "expected one w:rPr per text run (prefix + suffix), got %d" % len(rprs))
+    for rpr in rprs:
+        rfonts = rpr.find(qn("w:rFonts"))
+        assert rfonts is not None, "text run's w:rPr is missing w:rFonts"
+        for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+            assert rfonts.get(qn(attr)) == "Times New Roman", (
+                "text run w:rFonts/@%s is %r, expected the font the spec "
+                "asked for" % (attr, rfonts.get(qn(attr))))
+
+
+def test_page_number_text_and_field_runs_agree_on_the_font(tmp_path):
+    """Field run and text run in *one* footer resolve to the same four values.
+
+    This is the self-consistency check: two writers (``_rpr`` vs
+    ``run.font.name``) used to disagree inside a single paragraph.
+    """
+    proc, out = create_cli(tmp_path, fpn_spec(font="SimSun"), name="agree.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    d = Document(out)
+    part = footer_part(d, d.sections[0])
+    field_vals = [{a: rf.get(qn(a)) for a in
+                   ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs")}
+                  for rf in (r.find(qn("w:rFonts")) for r in field_rprs(part))]
+    text_vals = [{a: rf.get(qn(a)) for a in
+                  ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs")}
+                 for rf in (r.find(qn("w:rFonts")) for r in text_rprs(part))]
+    assert field_vals and text_vals
+    assert set(map(tuple, (v.items() for v in field_vals))) == \
+        set(map(tuple, (v.items() for v in text_vals)))
+
+
+def test_chinese_page_prefix_gets_east_asia_font_on_the_text_run(tmp_path):
+    """中文前缀 ``第 X 页 共 Y 页``：文字 run 的 ``eastAsia`` 必须是请求的字体。
+
+    这是本单最有说服力的一条——默认 ``"Page "`` 前缀是纯西文，``eastAsia``
+    缺省也看不出来；换成中文前缀才暴露「中英混排字体跳变」。
+    """
+    spec = fpn_spec(font="SimSun", template="page_of",
+                    prefix="第 ", suffix=" 页 共 ")
+    proc, out = create_cli(tmp_path, spec, name="cjk.json")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 0, stderr
+    assert "Traceback" not in stderr
+
+    d = Document(out)
+    part = footer_part(d, d.sections[0])
+    rprs = text_rprs(part)
+    assert rprs, "no text run carries a w:rPr"
+    for rpr in rprs:
+        rfonts = rpr.find(qn("w:rFonts"))
+        assert rfonts is not None
+        assert rfonts.get(qn("w:eastAsia")) == "SimSun", (
+            "中文前缀的文字 run 没写 eastAsia，会退回主题东亚字体")
+        assert rfonts.get(qn("w:cs")) == "SimSun"
+
+
+def test_page_number_text_run_size_and_bold_keep_their_own_paths(tmp_path):
+    """``size_pt`` / ``bold`` on text runs stay as they were (not part of this change).
+
+    Guards the boundary: only the *font* handling was unified with ``_rpr``.
+    A text run asked for a size still stores half-points, and ``bold=True``
+    still writes ``<w:b/>``.
+    """
+    proc, out = create_cli(tmp_path, fpn_spec(font="Arial", size_pt=9,
+                                              bold=True), name="textsize.json")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    d = Document(out)
+    for rpr in text_rprs(footer_part(d, d.sections[0])):
+        assert rpr.find(qn("w:sz")).get(qn("w:val")) == "18"
+        assert rpr.find(qn("w:b")) is not None
+
+
+# ===========================================================================
+# 输入错误契约（P9-C）
+#
+# 本文件此前的每一条用例都假设「输入是一个能打开的 .docx」。这一节补的是
+# **打不开的那种输入**：实测旧行为是 `Document(args.path)` 直接抛
+# `PackageNotFoundError` / `IsADirectoryError`，于是命令行上看到十九行
+# traceback + exit 1 —— 用户无法分辨「路径写错了」和「文档坏了」。
+#
+# 全仓口径（P8 定案）：`2` = 用法/输入错误 → stderr 单行 `error: ...`、
+# stdout 空、零写盘；`1` 留给「输入合法但处理不了」。
+# ===========================================================================
+def run_section(*args):
+    """以真子进程跑 ``docx_section.py``。
+
+    必须走子进程：本单修的是**命令行上看到的**退出码与 stderr 行数，
+    in-process 调 ``main()`` 拿不到解释器的退出码，也看不到 traceback。
+    """
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / "docx_section.py"), *map(str, args)],
+        capture_output=True, text=True, encoding="utf-8", check=False,
+        env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
+
+
+def one_error_line(stderr):
+    """stderr 必须**恰好一行**（``error: ...``），没有 traceback 前导。"""
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one line on stderr, got {len(lines)}: {stderr}"
+    return lines[0]
+
+
+# (子命令, 追加参数) —— `list` 只读、`pagenum` / `cols` 会 `doc.save()`，
+# 后者是「零写盘」的关键（校验若落到 save 之后，就会留下半截输出文件）。
+_SECTION_MODES = [
+    ("list", ()),
+    ("pagenum", ("--fmt", "decimal")),
+    ("cols", ("--num", "2")),
+]
+
+
+@pytest.mark.parametrize("cmd,extra", _SECTION_MODES,
+                         ids=[m[0] for m in _SECTION_MODES])
+def test_missing_path_is_a_usage_error(tmp_path, cmd, extra):
+    """路径不存在 → exit 2 + 单行 ``no such file`` + stdout 空。"""
+    missing = tmp_path / "no-such.docx"
+    assert not missing.exists()
+
+    cp = run_section(cmd, missing, *extra)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    line = one_error_line(cp.stderr)
+    assert line.startswith("error: ")
+    assert "no such file" in line
+    assert str(missing) in line
+    assert cp.stdout == ""
+
+
+@pytest.mark.parametrize("cmd,extra", _SECTION_MODES,
+                         ids=[m[0] for m in _SECTION_MODES])
+def test_directory_path_is_a_usage_error(tmp_path, cmd, extra):
+    """路径是目录 → exit 2 + 单行 ``not a file``。"""
+    adir = tmp_path / "a-directory"
+    adir.mkdir()
+
+    cp = run_section(cmd, adir, *extra)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == f"error: not a file: {adir}"
+    assert cp.stdout == ""
+
+
+@pytest.mark.parametrize("cmd,extra", _SECTION_MODES,
+                         ids=[m[0] for m in _SECTION_MODES])
+def test_non_zip_file_is_a_usage_error(tmp_path, cmd, extra):
+    """存在的普通文件但不是 zip → exit 2 + 单行 ``not a ZIP package``。"""
+    bogus = tmp_path / "renamed.docx"
+    bogus.write_text("i am not a zip package", encoding="utf-8")
+
+    cp = run_section(cmd, bogus, *extra)
+    assert cp.returncode == 2, cp.stderr
+    assert "Traceback" not in cp.stderr
+    assert one_error_line(cp.stderr) == f"error: not a ZIP package: {bogus}"
+    assert cp.stdout == ""
+
+
+def test_non_zip_input_leaves_the_output_path_untouched(tmp_path):
+    """``-o out.docx`` + 坏输入 → **不生成** out.docx（零写盘）。"""
+    bogus = tmp_path / "renamed.docx"
+    bogus.write_text("i am not a zip package", encoding="utf-8")
+    out = tmp_path / "out.docx"
+
+    cp = run_section("pagenum", bogus, "-o", out, "--fmt", "decimal")
+    assert cp.returncode == 2, cp.stderr
+    assert cp.stdout == ""
+    assert not out.exists()
+
+
+def test_valid_document_list_is_unchanged(tmp_path):
+    """合法文档 ``list`` 仍是 exit 0 + 纯 JSON（加校验没把成功路径改坏）。"""
+    src = tmp_path / "good.docx"
+    d = Document()
+    d.add_paragraph("hello")
+    d.save(str(src))
+
+    cp = run_section("list", src)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stderr == ""
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is True
+    assert payload["sections"] == 1
+    assert len(payload["section_detail"]) == 1
