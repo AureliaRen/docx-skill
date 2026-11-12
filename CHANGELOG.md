@@ -43,9 +43,9 @@ of silently doing something else.
   range instead of being clamped.
 - **`docx_mathify.py --inplace` together with `-o` is a usage error** — exit `2`,
   both files untouched, no `.bak`. `--inplace` used to win silently: the `-o` path
-  was never created and the *input* file was overwritten instead. `-o` with
-  `--dry-run` stays legal, and a run with none of the three landing flags still
-  exits `2`. `insert_formula.py` follows the same rule for `--dump` with
+  was never created and the *input* file was overwritten instead. A run with none
+  of the three landing flags still exits `2`. `insert_formula.py` follows the same
+  rule for `--dump` with
   `--after`/`--before` and for an empty marker, and now prints the anchor it
   measured (`… at body[1]`, `at tc[i]` inside a table cell) rather than echoing
   the argument.
@@ -65,11 +65,55 @@ of silently doing something else.
   part that never reached the disk; `evil.txt ` is created as `evil.txt`, so two
   distinct entries collide on one file.
 
-### Notes
+### Fixed
 
-- `docx_mathify.py --inplace --dry-run` is still tolerated rather than refused:
-  `--dry-run` wins and no backup is written. It is the one remaining silent
-  combination, recorded so nobody relies on the reverse.
+- **`docx_mathify.py` refuses every pair of landing flags that disagree with each
+  other.** `--inplace` together with `--dry-run` is an argparse usage error (exit
+  `2`), and so is `-o` together with `--dry-run` (exit `2`, one stderr line, no
+  file created). `--dry-run` used to win over `--inplace` silently, and `-o` with
+  `--dry-run` used to print `输出: <path>` for a file that was never written --
+  a reported output path that no pass would ever produce is the same defect as an
+  echoed `--index`, just in a different flag. No silent landing-flag combination
+  remains.
+- **Page-number footers with `font`, `size_pt` or `bold` no longer crash.**
+  `docx_section._rpr` built its `w:rFonts` element from bare `qn("ascii")` /
+  `OxmlElement("b")` names, so every one of those three options raised
+  `KeyError`/`ValueError` and `footer_page_numbers` was unusable in the shape the
+  documentation described. The qualified names are now used in all three
+  branches. Note that this helper only decorates the literal text run, not the
+  `PAGE` field result: `bold: false` and omitting `bold` are not equivalent, and
+  neither affects the number Word renders.
+- **`docx_toc.py --insert-at` and `--section-index` refuse an index that names no
+  real position** — exit `2`, nothing written. `--insert-at 999` on a short body
+  used to append and report `inserted_at: null` with exit `0`; `--insert-at -1`
+  used to hit Python's negative indexing and land before the *last* paragraph
+  while echoing the argument back. A rebuild checks the index twice, before and
+  after the previous TOC is removed, because that removal shortens the body. An
+  out-of-range `--section-index` used to fall back to section 0 silently, which
+  put the tab stops on the wrong section's geometry — 40 mm off on the sample;
+  it now exits `2`. Negative `--section-index` (`-1` = last section) is kept.
+- **`fix_zoom.py` reports an unreadable input as a usage error** (`2`) rather
+  than a traceback, and `docx_create.py` now propagates that return code instead
+  of discarding it. `fix_docx()` is called right after `doc.save()` to patch the
+  schema-required `w:percent` that python-docx omits; its result used to be
+  dropped, so the one failure it can report — a package that is not a readable
+  zip — reached the caller as `{"ok": true}` and exit `0`. That path is narrow in
+  practice (the file was written a line earlier), and the guard is what makes it
+  closed rather than merely unlikely: any future failure mode `fix_docx()` learns
+  to report will surface without another edit here.
+
+### Added
+
+- **`tests/test_fix_zoom.py` — 11 tests for the `fix_zoom` contract.** `fix_zoom`
+  had no test file at all: `test_table_layout.py` imported its pure
+  `fix_settings_xml` and never touched `fix_docx`, so both of that function's
+  `return 2` paths were unpinned. The new file covers the refusal paths (a
+  non-zip, a missing path, and "refused input must not be rewritten"), the
+  success paths (idempotence on an already-valid `w:percent`, repair of a bare
+  `<w:zoom/>`), and the passthrough itself — `docx_create.main()` must return `2`
+  when `fix_docx` does, and `0` when it does not. The passthrough cases inject a
+  stub through `monkeypatch`: the failure branch is not reachable from a real
+  build, so an end-to-end test alone would have left the guard unasserted.
 
 ## [1.0.0] - 2026-11-11
 
