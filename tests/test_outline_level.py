@@ -224,13 +224,45 @@ def test_heading_block_keeps_its_style_and_level():
     assert [docx_read.heading_level(p) for p in doc.paragraphs] == [1, 3]
 
 
-def test_a_heading_style_that_already_exists_raises():
-    """``add_style`` crashing on a name clash is the reason ``ensure_toc_styles``
-    looks first; this pins that the crash is real rather than a superstition."""
+def test_a_heading_style_that_already_exists_is_updated_in_place():
+    """A name that already exists is edited, not refused.
+
+    ⚠️ History, so this is not "fixed" back: until P12 this test was
+    ``test_a_heading_style_that_already_exists_raises`` and asserted
+    ``pytest.raises(ValueError)`` — it pinned a **defect**, not a contract.
+    ``Styles.add_style`` does raise on a duplicate name, and that made
+    ``styles[]`` unable to touch any built-in style at all: restyling
+    ``Heading 1`` was an error, so the only reachable move was a copy under a
+    new name (which then has no ``outlineLvl``, no navigation entry and no TOC
+    collection).  P12 turns the clash into an in-place modify.  The crash is
+    therefore *not* a behaviour to preserve; ``ensure_toc_styles`` never relied
+    on it either — it looks the name up first (``try/except KeyError``).
+    """
     doc = Document()
-    with pytest.raises(ValueError):
-        dc.add_styles(doc, [{"name": "Heading 2", "base": "Normal",
-                             "outline_level": 2}])
+    before = doc.styles["Heading 2"]
+    dc.add_styles(doc, [{"name": "Heading 2", "base": "Normal",
+                         "outline_level": 2}])
+
+    after = doc.styles["Heading 2"]
+    assert after.element is before.element, "the style must be edited, not replaced"
+    assert style_outline_val(after) == "1"
+    matching = [s for s in doc.styles
+                if str(s.name).strip().lower() == "heading 2"]
+    assert len(matching) == 1, "a second w:style with the same name breaks Word"
+
+
+def test_repeated_apply_of_the_same_style_leaves_one_w_style(tmp_path):
+    """Applying the same entry twice must not grow ``styles.xml``."""
+    doc = Document()
+    entry = {"name": "Heading 3", "font": "黑体", "size_pt": 14}
+    dc.add_styles(doc, [entry])
+    dc.add_styles(doc, [entry])
+    out = tmp_path / "twice.docx"
+    doc.save(out)
+    with zipfile.ZipFile(out) as archive:
+        styles = archive.read("word/styles.xml").decode("utf-8")
+    assert styles.count('w:styleId="Heading3"') == 1
+    assert styles.count('<w:name w:val="heading 3"/>') == 1
 
 
 # ---- 4. symmetric read-back --------------------------------------------------

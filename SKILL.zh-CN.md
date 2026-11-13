@@ -6,13 +6,14 @@ license: MIT
 
 # docx — 离线 docx 处理
 
-`scripts/` 全平铺，**26 个 `.py` + 1 个 `.ps1` = 27 个文件**。**25 个是 CLI**（各自带 `if __name__ == "__main__"`
-守卫，能直接从命令行跑），**`_bootstrap.py` 是唯一的纯库**；这 25 个里 **18 个有 argparse 表面**（`--help` 打印 `usage: …`），另 7 个有 `__main__` 但没有 argparse——6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot.py` 跑的是自检。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码，`--page-probe` 只属于它）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
+`scripts/` 全平铺，**27 个 `.py` + 1 个 `.ps1` = 28 个文件**。**26 个是 CLI**（各自带 `if __name__ == "__main__"`
+守卫，能直接从命令行跑），**`_bootstrap.py` 是唯一的纯库**；这 26 个里 **19 个有 argparse 表面**（`--help` 打印 `usage: …`），另 7 个有 `__main__` 但没有 argparse——6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot.py` 跑的是自检。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码，`--page-probe` 只属于它）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
 
 输出约定按脚本而异，这是刻意的：
 
 - **stdout 给 JSON** —— `docx_create`、`docx_read`、`docx_edit`、`docx_validate`、`docx_comments`、`docx_revisions`、`docx_section`、`docx_numbering`、`docx_crossref`、`docx_toc`。这些拿去解析。
 - **人类可读文本** —— `docx_mathify`、`table_width`、`insert_formula`、`docx_template`（`fill` 除外，它往 stdout 写 JSON）、`fix_fonts`、`fix_zoom`、`merge_docs`、`pdf_export`、`docx_pack`（裸跑会告诉你该怎么 import）、以及 `docx_common --api`（函数名 + 签名清单）。这些是给你看的进度。
+- **两者按需给** —— `docx_preview` 默认打人类可读的行，加 `--json` 打一个 JSON 对象；同一次运行两种格式不会混。
 
 退出码是可依赖的：`0` 成功、`1` 预期内的失败、`2` 用法错误。完整表与唯一的「部分成功」码 `3` 见[退出码](#退出码)。
 
@@ -110,6 +111,7 @@ pack("unpacked/", "out.docx", original="in.docx")
 | 合并两份文档 | `python scripts/merge_docs.py base.docx src.docx out.docx` |
 | `<w:zoom>` 缺 `w:percent` | `python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]` |
 | docx → PDF（文本层不掉） | `pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]` |
+| 渲染 + 版面自检（PDF、每页 PNG、半空页报告） | `python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json` |
 
 常用命令（均已对本机 `--help` 验过 exit=0）：
 
@@ -149,6 +151,10 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 
 中间那行的 `lowerRoman start=1` 正是 `docx_toc` 提醒过的情形：该节会把 `i` 打在它物理起始的那一页上，所以**显示页码**与**物理页序**是两个不同的数。
 
+**`pagenums --template` 有五种形态**，中文交付用 `zh`：`第 <PAGE> 页　共 <NUMPAGES> 页`。`页` 与 `共` 之间那个分隔符是**全角空格 U+3000**，不是普通空格——半角那道缝在印刷尺寸上读起来像排版事故。加 `--total sectionpages` 就把第二个域换成 `SECTIONPAGES`，于是「共 Y 页」数的是本节而不是整篇。`zh` 会忽略 `--prefix` / `--suffix`（它自己拼文本），但**不会静默吞掉**：返回的报告里多一条 `"ignored": ["prefix"]` 自报。
+
+`--template custom` 拿 `--prefix` / `--suffix`，并把里面的 **`{page}`** 与 **`{total}`** 按出现顺序展开成 PAGE 与 total 域，所以 `--prefix "{page}/" --suffix " of {total}"` 得到 `1/ of 12`。两个串里都没有占位符时，`custom` 的行为与从前逐字节一致。同一套键在 spec 里同样成立：顶层 `footer_page_numbers`，或者 `section_break` 里的那一个，都接受 `"template": "zh"`，也接受带占位符的 `custom`。
+
 **`docx_template.py apply` 带两条独立的公式通道、两套各自的默认值，命令行上互斥：**
 
 | flag | 通道 | 默认 |
@@ -185,8 +191,8 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 | `caption` | `label`（默认 `图`）、`text`、可选 `bookmark` —— 写入 `图 N  题注`，带 `SEQ` 计数器 + 书签 |
 | `table_caption` | 字段同 `caption`，用于表格 |
 | `crossref` | `target`（书签名），可选 `prefix`、`suffix`、`format`（`default`/`full`/`above-below`/`page`/`number`）、`cached`、`own_paragraph` |
-| `table` | `header`、`rows`，可选 `style`（默认 `Table Grid`）、`header_bold` |
-| `image` | `path`，可选 `width_mm` |
+| `table` | `header`、`rows`，可选 `style`（默认 `Table Grid`）、`header_bold`、`keep_together` |
+| `image` | `path`，以及 `width_mm` **或** `width_frac`（二者互斥） |
 | `page_break` | — |
 | `section_break` | `start_type`，可选 `page`、`header` / `footer`（及其 `_align` / `_font` / `_size_pt` / `_bold`）、`footer_page_numbers`（`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`，以及给页码 run 用的 `font` / `size_pt` / `bold`——见上面那张 `bold` 表：`false` 管得到文字 run，管不到域 run）、`different_first_page`、`cols`、`no_footer`、`reuse_last_paragraph`、`apply_to` |
 | `toc` | 可选 `instr` —— 默认 `TOC \o "1-3" \h \z \u`；要图目录就传 `TOC \h \c "图"`。**这是一个域**：Word 必须更新（F9）之后才有条目 |
@@ -211,7 +217,33 @@ exit `2` 的承诺是**什么都没写**，所以改完 spec 直接重试，不�
 
 `outline_level` 是 1 基（`1` → `w:outlineLvl val="0"`）。`0` 表示「显式正文」（`val="9"`），给那种永远不该被收集的样式用。
 
+**`styles[]` 条目点名一个已存在的样式时，是就地修改，不是报错，而且只动你给出的键。** `{"name": "Heading 1", "size_pt": 16}` 改的是 Word 内置 `Heading 1` 的字号，它的字体、粗细、颜色、`outlineLvl` 一律原样留着；同一个条目再 apply 一次，`<w:style>` 仍然只有一个。没给出来的键永远不会被重置，所以不会有东西悄悄退回原值。想把颜色改回去就显式写 `color`——另外注意：本工具生成的文档里 `Heading 1`–`Heading 9`、`Title`、`Subtitle` **默认就是黑色**（见 [标题默认是黑的](#标题默认是黑的)），所以你没染过色的标题本来就是 `000000`，不是主题蓝。
+
 `heading.level` 是 `0`–`9`，不是 `1`–`9`：python-docx 的 `add_heading` 把 `0` 当 Word 的 **Title** 样式、`1`–`9` 当 Heading 1–9。`10` 是 spec 错误，不会被钳。
+
+### 标题默认是黑的
+
+本工具生成的每一份文档，在套用任何 `styles[]` 条目**之前**都会先过一遍 `Heading 1`–`Heading 9`、`Title` 与 `Subtitle`：摘掉主题色绑定（`w:themeColor` / `w:themeShade` / `w:themeTint`），写上 `w:val="000000"`；四个字符变体（`Heading1Char` … `TitleChar`、`SubtitleChar`）同样处理；`Title` 的段落下边框换成黑色（`w:pBdr` 上写 `w:color="000000"`，`w:sz` 与 `w:space` 不动）；`Subtitle` 去掉斜体（`w:i` 与 `w:iCs`）。理由是：标题不该因为某台机器的主题色不同而变色，生成的文档也不该在没人要蓝的时候自带主题蓝。
+
+这是**默认值，不是锁**。因为中和在 `styles[]` 之前跑，所以给了 `color` 的条目照样覆盖——就地 modify 打开的那道门在这里一样有效。`Heading 9` 的斜体保留；去掉斜体的只有 `Subtitle`。
+
+### 让一张表不跨页
+
+`{"type": "table", …, "keep_together": true}` 要求 Word 把整张表压在一页。Word 没有「表级 keep-together」这种属性，所以请求分两层写：**每一行**的 `w:trPr/w:cantSplit`（一行不许被分页切两半），加上除末行外每一行每一段的 `w:keepNext`（每行把下一行拽住）。默认 `false`，不写这个键时上述元素一个都不会生成。
+
+**`cantSplit` 只禁「拆行」，一整页都放不下的表仍然会跨页。** `keep_together` 是请求不是保证：它救的是那种「本来只差两行、结果被切到下一页」的 8 行表，对一页根本装不下的 60 行表无能为力。
+
+`table_caption` 紧跟一个 `table` 现在**默认联动**，不用任何键：caption 段拿到 `keep_with_next`、表首行拿到 `cantSplit`，于是单行题注不会被孤立在上一页页底。中间插任何东西——段落、分页符、另一张表——都会断掉联动，因为「紧跟」是按 block 列表量的，不是猜的。这个联动会改变在它之前写的 spec 的排版结果，这正是目的；真需要旧行为，就在 caption 与表之间放一个段落。
+
+### 按版心比例给图片定宽
+
+`image` block 用 `path` 加上 `width_mm`（绝对宽）**或** `width_frac`（当前节正文宽的比例，`0 < f ≤ 1`）之一，绝不同时给——两个都给是 exit `2`、零写盘。`width_frac` 按 `content_width_mm(section)` 折算，所以它跟着纸张与页边距走，而不是写死一个数：A4 且左右各 26 mm 时正文宽 158 mm，于是 `1.0` 是 158.0 mm、`0.5` 是 79.0 mm。越界的值连同区间一起拒收、不做钳制；`0.0` 也拒收，而不是读成「不定宽」——调用方写下的数字，永远不会被悄悄换成别的意思。
+
+### 让标题从新的一页开始
+
+任何 block 的 `page_break_before: true` 都会往它的 `<w:pPr>` 里写 `<w:pageBreakBefore/>`，这正是 Word 自己在*段落 → 换行和分页 → 段前分页*里写的元素。要用就用这个键，挂在标题上。
+
+**别拿 `{"type": "page_break"}` 去顶替它。** 分页 block 是一个只装分页 run 的空段落，它待在哪取决于 block 顺序：标题前多一个、或者连着两个，就多出一页空白或者把内容顶过一页——而正文中间凭空一页空白，正是 `docx_preview.py --lint` 会报成 `blank_pages` 的那种毛病。`page_break_before` 把分页绑在它所属的段落上，那个段落挪到哪，分页就跟到哪。
 
 ## 静态目录：真段落，不是域
 
@@ -475,6 +507,35 @@ pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]
 
 带 OMML 的文档别走 WPS。
 
+## 渲染与版面自检
+
+`docx_preview.py` 回答的是工具链其余部分答不出的那个问题：**第 4 页到底对不对？** 它把文档交给无头 LibreOffice 渲染，产出 PDF 与每页一张 PNG，再把「这一页填了多少」量成报告。不用 Word、不走 COM、不需要 Office 授权：
+
+```bash
+# 一次转换拿到三样东西
+python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json
+# 只想看图：只出每页 PNG，dpi 随便调
+python scripts/docx_preview.py in.docx --pages png/ --dpi 150
+# 只要机器可读的版面报告，不留文件
+python scripts/docx_preview.py in.docx --lint --json
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--pdf OUT.pdf` | 把转换出的 PDF 写到这儿（默认写临时文件，用完删掉） |
+| `--pages DIR` | 每页一张 `page-%03d.png` 写进 `DIR`，分辨率由 `--dpi` 定（默认 110） |
+| `--lint` | 报版面：填充率、半空页、空白页、超宽图、跨页表、孤字末行 |
+| `--min-fill RATIO` | 墨迹占比低于这个值就判「稀疏」（默认 `0.40`） |
+| `--max-orphan-chars N` | 一页最后一行不超过 N 个字符算孤字（默认 `2`） |
+| `--timeout SECONDS` | soffice 转换超时（默认 `180`） |
+| `--json` / `--text` | 打一个 JSON 对象，或打人类可读的行（默认后者） |
+
+三个能力可任意组合：全传就是一次转换全拿到；至少要给一个。`--lint` 报告点名六类问题——逐页 `fill_ratio`、`sparse_pages`、`blank_pages`、`image_over_width`（图比版心宽）、`table_split`（表跨到了下一页）、`orphan_last`（末行只剩一个字）。**`table_split` 是启发式、允许误报**：它按表格几何跨页边界比对，所以一张只是恰好在页尾结束的表也可能被点出来。把它读成「这一页值得看一眼」，不是「这里坏了」。
+
+依赖与工具链其余部分不同：`docx_preview.py` 要 `PATH` 上有 `soffice`（或在标准 LibreOffice 安装位置），PNG 与 lint 那一半还要 PyMuPDF。缺任何一个都是 exit `1` 加一行 `error:`——属于环境干不了这活，不是参数写错。`fitz` 只在函数内 import、从不放模块顶层，所以光 import 这个模块不需要 PyMuPDF。
+
+> **手工跑 `soffice` 必须加 `-Wait`。** 不用这个脚本、自己驱转换器时，`Start-Process soffice --headless --convert-to pdf …` **不加 `-Wait`** 会立刻返回：退出码是空的，PDF 还没写出来，脚本下一行就去读一个不存在的文件。加 `-Wait`，或者用 `& soffice …` 让 shell 自己等。`docx_preview.py` 没有这个问题，它走 `subprocess.run`，会一直阻塞到子进程退出。
+
 ## 库模块（只能 import）
 
 **`_bootstrap.py` 是唯一的纯库**：没有 `__main__`、没有 argparse，每个脚本都在解析参数之前先 import 它——**新脚本第一件事就是 `import _bootstrap`**，一行覆盖 `sys.path` 自举、minidom 兜底与 UTF-8 stdio。下面七个模块同样以 import 为用途——其中六个带一行 `__main__` 自述、`fix_phasor_dot` 带自检，裸跑都不干活。它们一律按裸模块名 reach，因为每个脚本都把自己所在目录塞进 `sys.path`（见[约定](#约定conventions)）。
@@ -502,19 +563,19 @@ pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]
 | 文件 | 什么时候读 |
 |---|---|
 | `references/formula-guide.md` | 写公式链生产代码、调 `_add_mixed`、排查 Word 报损坏、处理 `%`/`℃`/`～`/绝对值/复合单位等源文本坑 |
-| `references/table-geometry.md` | 表格列宽不生效、要决定 `set` 还是 `sync`、`w:zoom` 缺 `w:percent` |
-| `references/font-scheme.md` | 中英文混排字体规范、`w:rPr` 顺序与去重、`--heading-threshold` 语义 |
-| `references/merge-and-export.md` | 合并后版心/编号/图片出问题、Word COM 导出细节、PIL 多页 PDF 写法 |
+| `references/table-geometry.md` | 表格列宽不生效、要决定 `set` 还是 `sync`、`w:zoom` 缺 `w:percent`、用 `keep_together` 把表压在一页、按 `width_frac` 给图定宽 |
+| `references/font-scheme.md` | 中英文混排字体规范、`w:rPr` 顺序与去重、`--heading-threshold` 语义、标题为什么默认是黑的以及怎么有意给它上色 |
+| `references/merge-and-export.md` | 合并后版心/编号/图片出问题、Word COM 导出细节、PIL 多页 PDF 写法、手工驱 `soffice` 的 `-Wait` 与 `docx_preview.py` |
 | `references/revisions-and-comments.md` | 批注与修订的 OOXML 表示与命令行语义 |
-| `references/toc.md` | 写静态目录：两遍法（先 `page-probe` 量页码、再写条目）、制表位与点引线、全套坑表 |
+| `references/toc.md` | 写静态目录：两遍法（先 `page-probe` 量页码、再写条目）、制表位与点引线、全套坑表、五种页码页脚模板（`zh` / `custom` 占位符） |
 
 ## 目录结构
 
 ```
-scripts/     平铺，按裸模块名 import —— 26 个 .py + 1 个 .ps1（25 个 CLI，1 个纯库）
+scripts/     平铺，按裸模块名 import —— 27 个 .py + 1 个 .ps1 = 28 个文件（26 个 CLI，1 个纯库）
 references/  较长的做法笔记，按需加载 —— 6 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 47 个 .py（46 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 58 个 .py（57 个 test_*.py + _omml.py 辅助）
 ```
 
 ## 退出码
@@ -523,7 +584,7 @@ tests/       pytest 套件 —— 47 个 .py（46 个 test_*.py + _omml.py 辅�
 |---|---|
 | `0` | 成功 |
 | `1` | 预期内的失败 —— marker 没命中、未知或重名的书签、文档里没有你要的东西、运行期异常 |
-| `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包 |
+| `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传（含 `width_frac` 与 `width_mm`）、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包 |
 | `3` | **仅 `docx_mathify`**（以及把它的码透传出来的 `docx_template apply --fix-formulas`）：文档已写出，但至少一条公式没转成 |
 
 用法错误是**拒收，不是修补**：判定发生在任何读写之前，输入文件逐字节不变，消息是 stderr 上的一行 `error: …`，stdout 保持空。

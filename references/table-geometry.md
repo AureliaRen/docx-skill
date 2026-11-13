@@ -1,5 +1,51 @@
 # 表格几何技术参考
 
+> 本文覆盖 `table_width.py` 的三处宽度一致性、`docx_create.py` 的表格与版面键
+> （`keep_together` / `width_frac` / `page_break_before`），以及 `<w:zoom>` 的 schema 坑。
+> 判据都是本机实测。
+
+## `docx_create.py` 的两个版面键：`keep_together` 与 `width_frac`
+
+`table_width.py` 管的是**既有文档的列宽**；`docx_create.py` 管的是**生成时就把版面钉住**。两套键各管一件事，别混：
+
+### `keep_together`：表格不跨页（`docx_create.py:1388`，实现 `:1209-1229`）
+
+`{"type": "table", …, "keep_together": true}`。Word **没有**表级「keep together」属性，所以这个请求必须分两层写：
+
+| 层 | 落点 | 语义 | 代码 |
+|---|---|---|---|
+| 行 | `w:trPr/w:cantSplit` | 这一行不许被分页切成两半 | `_cant_split()`（`:1197-1206`），走 `docx_utils.TRPR_ORDER` 用 `insert_ordered` 落位 |
+| 段 | 单元格内每个段落 `w:pPr/w:keepNext` | 本行把下一行拽住 | `_keep_rows_together()`（`:1209-1229`），除**末行**外每行每段都写 |
+
+**红线：`keepNext` 不是 `trPr` 的子元素。** `TRPR_ORDER`（`scripts/docx_utils.py:194`）里没有它，写进 `trPr` 会被 Word **静默忽略**，而 `docx_validate` 照样返回 `{"ok": true}` —— 典型的假绿灯。所以这两层必须分开放：`cantSplit` 在 `trPr`，`keepNext` 在 `pPr`。
+
+**`cantSplit` 只禁「拆行」，不禁「表跨页」。** 一张高过一整页的表开了 `keep_together` 仍然会跨页——Word 的行为如此，不是本实现的缺口。它救的是「本来只差两行」的中等表：实测 12 行 + 表头，不开时拆成 6+6 且第 2 页丢表头，开时整表落在一页（LibreOffice 渲染实测）。
+
+**`table_caption` 与紧随的 `table` 默认联动**（`_caption_glues_to_next_table`，`:1232-1249`），无需 spec 声明：caption 段拿 `keep_with_next`、表首行拿 `cantSplit`。「紧随」是在 **block 列表**上判的（`add_block(doc, block, blocks=blocks, index=i)` 传入 `blocks` 与 `index`），中间插任何一个别的 block 就断开。这属**行为变更**：旧 spec 重跑可能得到不同的分页结果。
+
+**默认 `False`**：不写这个键时 `trPr` 根本不会生成，产物在表格 XML 层与旧版完全一致。
+
+### `width_frac`：按版心比例给图片定宽（`docx_create.py:1393-1406`）
+
+`image` block 的 `width_frac` 是**当前节正文宽的比例**，`0 < f ≤ 1`，与 `width_mm` **互斥**（同给 exit `2`、零写盘）：
+
+```json
+{"type": "image", "path": "fig.png", "width_frac": 1.0}
+```
+
+- 折算用 `content_width_mm(doc.sections[-1])`，所以跟着纸张与页边距走。**A4 + 左右各 26 mm → 158 mm 正文宽**，于是 `1.0` = 158.01 mm、`0.5` = 79.005 mm（实测）。
+- 判定必须是 `is not None` 而不是真值判断：`width_frac: 0.0` 若走 `if block.get("width_frac"):` 会静默落回原尺寸，调用方写下的数字被悄悄换掉。现在 `0.0` 与 `1.5` 一样 exit `2`，报错带合法区间，不 clamp。
+- `{"width_frac": null}` 走「没给」分支（保持原尺寸、exit 0）——这是**有意的决策**，别顺手改成崩溃。
+- 给了 `width_frac` 就不看 `width_mm`：互斥是校验层先拒绝，不是谁优先。
+
+### `page_break_before`：段前分页（`docx_create.py:949-951`）
+
+`<w:pageBreakBefore/>` 写在段落的 `<w:pPr>` 里，是 Word 自己在*段落 → 换行和分页*里写的元素。`heading` / `paragraph` 等 block 都吃这个键（`PARA_FORMAT_KEYS`，`:159`），实测 XML 顺序合法、`docx_validate` `ok:true`。
+
+**用它，别用 `{"type": "page_break"}` 空段。** 分页 block 是「空段落 + 分页 run」，位置由 block 顺序决定：多一个、或连着两个，就多出空白页或把内容顶过一页。段前分页跟着段落走，段落挪到哪分页跟到哪。
+
+⚠ **`docx_read` 没有回读通道**：`--blocks` / `--structure` 输出里都没有这个字段（源码 0 命中）。要断言它只能直接读 XML（`pPr.find(qn("w:pageBreakBefore"))`）。
+
 ## OOXML 怎么解析列宽
 
 Word/WPS 实测（2026-10-27）：
