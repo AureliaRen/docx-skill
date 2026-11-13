@@ -6,12 +6,12 @@ license: MIT
 
 # Word documents (.docx)
 
-Scripts live flat in `scripts/` — **26 `.py` + 1 `.ps1`**, no sub-package, no
-`__init__.py`. **25 are CLIs** (each carries an `if __name__ == "__main__"`
-guard); **`_bootstrap.py` is the one pure library**. Of the 25, **18 expose an
-argparse surface** with `--help` and the other 7 print a one-line self-description
-or run a self-check. Run them with any Python 3.10+ that has `python-docx` and
-`lxml` installed.
+Scripts live flat in `scripts/` — **27 `.py` + 1 `.ps1` = 28 files**, no
+sub-package, no `__init__.py`. **26 are CLIs** (each carries an
+`if __name__ == "__main__"` guard); **`_bootstrap.py` is the one pure library**.
+Of the 26, **19 expose an argparse surface** with `--help` and the other 7 print a
+one-line self-description or run a self-check. Run them with any Python 3.10+ that
+has `python-docx` and `lxml` installed.
 
 Output convention differs by script and is deliberate:
 
@@ -23,6 +23,8 @@ Output convention differs by script and is deliberate:
   `fix_zoom`, `merge_docs`, `pdf_export`, `docx_pack` (a bare run prints how to
   import it), and `docx_common --api` (a name-plus-signature listing). These
   report progress and are meant to be read.
+- **Either, on request** — `docx_preview` prints human-readable lines by default
+  and one JSON object with `--json`. It never mixes the two on one run.
 
 Exit codes are reliable: `0` on success, `1` on an expected failure, `2` on a
 usage error. See [Exit codes](#exit-codes) for the full table and for `3`, the
@@ -144,6 +146,7 @@ anything is written. The refused shapes, each one exercised by the test suite:
 | Merge two documents | `python scripts/merge_docs.py base.docx src.docx out.docx` |
 | Add the missing `w:percent` to `<w:zoom>` | `python scripts/fix_zoom.py in.docx [-o out.docx] [--percent 120]` |
 | Export to PDF with the text layer intact | `pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]` |
+| Render + lint the layout (PDF, page PNGs, page-fill report) | `python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json` |
 
 Common commands (each one checked against `--help` on this machine, exit `0`):
 
@@ -202,6 +205,29 @@ The `lowerRoman start=1` in the middle line is exactly the case `docx_toc` warns
 about: that section prints `i` on whatever physical page it starts at, so the
 displayed page number and the physical page index are two different numbers.
 
+**`pagenums --template` offers five shapes**, and `zh` is the one for Chinese
+delivery: `第 <PAGE> 页　共 <NUMPAGES> 页`. The separator between `页` and `共` is
+a full-width space (U+3000), not an ordinary space, because a half-width gap
+reads as a typo at print size. `--total sectionpages` swaps the second field for
+`SECTIONPAGES`, so "共 Y 页" counts the section rather than the document. `zh`
+ignores `--prefix` / `--suffix` — it builds its own text — and says so in the
+report (`"ignored": ["prefix"]`) instead of dropping them in silence.
+
+The total is a **field**, not literal text, and that changes how you verify it.
+`第 1 页　共 <NUMPAGES> 页` reaches `footer*.xml` with a cached total of `1`,
+because how many pages a document has is not known while the package is still
+being written; Word and LibreOffice recalculate the field when the document
+opens. On a five-page document the PDF says `共 5 页` and the XML still says `1`.
+Check a footer in the rendered page, never in the raw XML — an XML check that
+expects the real total fails on a document that is perfectly correct.
+
+`--template custom` takes `--prefix` / `--suffix` and expands **`{page}`** and
+**`{total}`** inside them into the PAGE and total fields, in the order they
+appear, so `--prefix "{page}/" --suffix " of {total}"` gives `1/ of 12`. With no
+placeholder in either string, `custom` behaves exactly as it always did. The
+same keys work in a spec: a top-level `footer_page_numbers`, or one inside a
+`section_break`, accepts `"template": "zh"` and `custom` with placeholders.
+
 **`docx_template.py apply` carries two independent formula channels, on two
 separate defaults, and they are mutually exclusive on the command line:**
 
@@ -238,8 +264,9 @@ returned: `1` and `2` unchanged, and `3` as `3`. Only `0` collapses back to `0`.
 table below is the precise statement. The last three used to raise `ValueError` the
 moment you set them; they now apply, and on a mixed-script footer `font` binds all
 four `w:rFonts` slots (`ascii` / `hAnsi` / `eastAsia` / `cs`) so a Chinese
-`第 X 页 共 Y 页` prefix does not fall back to the theme's East Asian face while the
-digits use the font you asked for.
+`第 X 页　共 Y 页` prefix does not fall back to the theme's East Asian face while the
+digits use the font you asked for. (The separator here is the same full-width
+space, U+3000, that the `zh` template uses — see the templates section above.)
 
 **`bold` styles two different kinds of run by two different rules, so `"bold":
 false` and leaving `bold` out are not the same request.** A `page_of` footer is a
@@ -277,8 +304,8 @@ bold".)
 | `caption` | `label` (default `图`), `text`, optional `bookmark` — inserts `图 N  题注` with a `SEQ` counter + bookmark |
 | `table_caption` | the same fields as `caption`, for a table |
 | `crossref` | `target` (a bookmark), optional `prefix`, `suffix`, `format` (`default`/`full`/`above-below`/`page`/`number`), `cached`, `own_paragraph` |
-| `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold` |
-| `image` | `path`, optional `width_mm` |
+| `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold`, `keep_together` |
+| `image` | `path`, and `width_mm` **or** `width_frac` (mutually exclusive) |
 | `page_break` | — |
 | `section_break` | `start_type`, optional `page`, `header` / `footer` (+ their `_align` / `_font` / `_size_pt` / `_bold`), `footer_page_numbers` (`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`, plus `font` / `size_pt` / `bold` for the page-number runs — see the `bold` table above, `false` reaches the literal runs but not the field runs), `different_first_page`, `cols`, `no_footer`, `reuse_last_paragraph`, `apply_to` |
 | `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures. **A field**: Word must update it (F9) before any entry exists |
@@ -305,6 +332,17 @@ clamped into.
 template's own `卷标题` / `ChapterTitle` is *body text* to Word no matter how it
 looks: the navigation pane is empty and `TOC \o` collects nothing.
 
+**A `styles[]` entry that names an existing style modifies it in place — it does
+not fail, and it touches only the keys you gave.** `{"name": "Heading 1",
+"size_pt": 16}` changes the size of Word's built-in `Heading 1` and leaves its
+font, its weight, its colour and its `outlineLvl` exactly as they were; a second
+apply of the same entry still leaves one `<w:style>` behind. Keys you omit are
+never reset, so nothing silently reverts. To change a colour back, say so
+explicitly with `color` — and note that `Heading 1`–`Heading 9`, `Title` and
+`Subtitle` are **black by default** in a document this toolkit builds (see
+[Headings are black by default](#headings-are-black-by-default)), so a style you
+never coloured is already `000000` rather than the theme's blue.
+
 ```json
 {"styles": [
   {"name": "卷标题", "base": "Normal", "font": "黑体", "size_pt": 16,
@@ -318,6 +356,78 @@ body text" (`val="9"`), for a style that must never be collected.
 `heading.level` is `0`–`9`, not `1`–`9`: python-docx's `add_heading` treats `0`
 as Word's **Title** style and `1`–`9` as Heading 1–9. `10` is a spec error, not
 a clamp.
+
+### Headings are black by default
+
+Every document this toolkit builds gets a pass over `Heading 1`–`Heading 9`,
+`Title` and `Subtitle` **before** any `styles[]` entry is applied: the theme
+colour binding (`w:themeColor` / `w:themeShade` / `w:themeTint`) is removed and
+`w:val="000000"` written in its place, all four character variants
+(`Heading1Char` … `TitleChar`, `SubtitleChar`) get the same treatment, `Title`'s
+paragraph bottom border switches to black (`w:color="000000"` on `w:pBdr`, with
+`w:sz` and `w:space` unchanged), and `Subtitle` loses its italic (`w:i` and
+`w:iCs`). The point is that a heading looks the same on a machine whose theme
+resolves to a different accent, and that a generated document does not arrive in
+theme blue when nobody asked for blue.
+
+This is a **default, not a lock**. A `styles[]` entry that gives `color` wins,
+because the neutralising pass runs first — the same door the in-place modify
+above opened. Heading 9 keeps its italic; only `Subtitle` was in scope for that
+change.
+
+### Making a table stay on one page
+
+`{"type": "table", …, "keep_together": true}` asks Word to hold the whole table
+together. Word has no table-level "keep together" attribute, so the request is
+written in two layers: `w:trPr/w:cantSplit` on **every** row (a row may not be
+split across a page break) and `w:keepNext` on every paragraph of every row
+except the last (each row pulls the next one with it). The default is `false`,
+and when the key is absent not one of those elements is written.
+
+**`cantSplit` only forbids splitting a row — a table taller than one page will
+still break across pages.** `keep_together` is a request, not a guarantee; it
+helps the 8-row table that would otherwise lose its last two rows, and does
+nothing for a 60-row table that cannot fit on a page in the first place.
+
+`table_caption` followed immediately by a `table` is now **linked by default**,
+with no key to set: the caption paragraph gets `keep_with_next` and the table's
+first row gets `cantSplit`, so a one-line caption stops being orphaned at the
+bottom of the previous page. Anything between them — a paragraph, a page break,
+another table — breaks the linkage, because "right after" is measured on the
+block list, not guessed. This linkage changes the layout of spec files written
+before it existed, which is the point; if you need the old behaviour, put a
+paragraph between the caption and the table.
+
+### Sizing an image relative to the text block
+
+`image` blocks take `path` plus **either** `width_mm` (an absolute width) **or**
+`width_frac` (a share of the current section's text width, `0 < f ≤ 1`), never
+both — passing both is exit `2` with nothing written. `width_frac` is resolved
+against `content_width_mm(section)`, so it follows the page size and the margins
+instead of hard-coding a number: A4 with 26 mm left and right margins gives a
+158 mm text block, so `1.0` is 158.0 mm and `0.5` is 79.0 mm. Out-of-range
+values are refused with the range rather than clamped, and `0.0` is refused
+rather than read as "no width" — a number the caller wrote is never quietly
+turned into something else.
+
+`path` resolves against the **current working directory**, not against the
+spec file's directory, and a path that does not exist is refused as an input
+error — exit `2`, the block index in the message, nothing written — instead of
+surfacing later as a `FileNotFoundError` traceback from inside the build.
+
+### Forcing a heading onto a new page
+
+Any block's `page_break_before: true` sets `<w:pageBreakBefore/>` in its
+`<w:pPr>`, which is what Word itself writes for "page break before" in
+*Paragraph → Line and Page Breaks*. Use that key on the heading.
+
+**Do not reach for a `{"type": "page_break"}` block instead.** A page break is an
+empty paragraph carrying a break run; it sits wherever the block order puts it,
+so one stray break before a heading, or two in a row, produces a blank page or
+pushes content a page too far — and a blank page in the middle of a document is
+exactly the artefact that `docx_preview.py --lint` reports as `blank_pages`.
+`page_break_before` attaches the break to the paragraph it belongs to, so moving
+that paragraph moves the break with it.
 
 ## A static table of contents
 
@@ -756,6 +866,55 @@ the shell's.
 
 Do not route a document with OMML through WPS.
 
+## Rendering and linting the layout
+
+`docx_preview.py` answers the question the rest of the toolkit cannot: **does
+page 4 look right?** It renders the document through a headless LibreOffice,
+writes a PDF and one PNG per page, and reports what it sees about the page fill.
+No Word, no COM, no Office licence:
+
+```bash
+# all three capabilities in one conversion
+python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json
+# a quick look: page images only, any DPI
+python scripts/docx_preview.py in.docx --pages png/ --dpi 150
+# machine-readable layout report, no files kept
+python scripts/docx_preview.py in.docx --lint --json
+```
+
+| Flag | Effect |
+|---|---|
+| `--pdf OUT.pdf` | write the converted PDF here (default: a temporary file, deleted afterwards) |
+| `--pages DIR` | one `page-%03d.png` per page into `DIR`, at `--dpi` (default 110) |
+| `--lint` | report the layout: fill ratio, half-empty pages, blank pages, oversized images, split tables, orphaned last lines |
+| `--min-fill RATIO` | pages below this share of ink are "sparse" (default `0.40`) |
+| `--max-orphan-chars N` | a page's last line of at most N characters is an orphan (default `2`) |
+| `--timeout SECONDS` | soffice conversion timeout (default `180`) |
+| `--json` / `--text` | one JSON object, or human-readable lines (the default) |
+
+The three capabilities compose: pass all of them and one conversion produces
+everything. At least one is required. The `--lint` report names six classes of
+problem — `fill_ratio` per page, `sparse_pages`, `blank_pages`,
+`image_over_width` (an image wider than the text block), `table_split` (a table
+that continues onto the next page) and `orphan_last` (a single character alone on
+the last line). `table_split` is a **heuristic and may over-report**: it matches
+table geometry across a page boundary, so a table that merely ends near a page
+break can be flagged. Read it as "look at this page", not "this is broken".
+
+Requirements differ from the rest of the toolkit: `docx_preview.py` needs
+`soffice` on `PATH` (or in a standard LibreOffice location) and PyMuPDF for the
+PNG and lint halves. Either one missing is exit `1` with one `error:` line — an
+environment that cannot do the job, not a bad argument. `fitz` is imported inside
+a function, never at module level, so importing the module never needs PyMuPDF.
+
+> **Manual `soffice` calls need `-Wait`.** If you drive the converter yourself
+> instead of through this script, `Start-Process soffice --headless --convert-to
+> pdf …` **without `-Wait`** returns immediately: the exit code is empty, the PDF
+> has not been written yet, and the next line of your script reads a file that
+> does not exist. Add `-Wait`, or use `& soffice …` and let the shell wait.
+> `docx_preview.py` does not have this problem because it calls `subprocess.run`,
+> which blocks until the child exits.
+
 ## Library modules
 
 **`_bootstrap.py` is the one pure library**: no `__main__`, no argparse, imported
@@ -800,19 +959,19 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 | File | Read it when |
 |---|---|
 | `references/formula-guide.md` | writing formula-chain production code, calling `_add_mixed`, debugging Word's "file may be corrupted", handling `%` / `℃` / `～` / absolute-value / compound-unit source traps |
-| `references/table-geometry.md` | column widths not taking effect, deciding between `set` and `sync`, `<w:zoom>` missing `w:percent` |
-| `references/font-scheme.md` | mixed CJK/Latin font conventions, `w:rPr` ordering and dedupe, what `--heading-threshold` means |
-| `references/merge-and-export.md` | after merging: page area / numbering / images wrong; Word COM export details; multi-page PDF via PIL |
+| `references/table-geometry.md` | column widths not taking effect, deciding between `set` and `sync`, `<w:zoom>` missing `w:percent`, keeping a table on one page (`keep_together`), sizing an image by `width_frac` |
+| `references/font-scheme.md` | mixed CJK/Latin font conventions, `w:rPr` ordering and dedupe, what `--heading-threshold` means, why Heading/Title/Subtitle come out black and how to colour one deliberately |
+| `references/merge-and-export.md` | after merging: page area / numbering / images wrong; Word COM export details; multi-page PDF via PIL; driving `soffice` by hand (`-Wait`, `docx_preview.py`) |
 | `references/revisions-and-comments.md` | OOXML representation of comments and tracked changes, and the CLI semantics |
-| `references/toc.md` | building a static TOC: the two-pass recipe (`--page-probe` first, then write entries), tab stops and dot leaders, the full trap list |
+| `references/toc.md` | building a static TOC: the two-pass recipe (`--page-probe` first, then write entries), tab stops and dot leaders, the full trap list, the five page-number footer templates (`zh` / `custom` placeholders) |
 
 ## Layout
 
 ```
-scripts/     flat, imported by bare module name — 26 .py + 1 .ps1 (25 CLIs, 1 pure library)
+scripts/     flat, imported by bare module name — 27 .py + 1 .ps1 = 28 files (26 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 6 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 47 .py (46 test_*.py + _omml.py helper)
+tests/       pytest suite — 58 .py (57 test_*.py + _omml.py helper)
 ```
 
 ## Exit codes
@@ -821,7 +980,7 @@ tests/       pytest suite — 47 .py (46 test_*.py + _omml.py helper)
 |---|---|
 | `0` | success |
 | `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception |
-| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together, an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package |
+| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package, an `image` block whose `path` points at nothing on disk or is not a string |
 | `3` | **`docx_mathify` only** (and `docx_template apply --fix-formulas`, which passes it through): the document was written, but at least one formula failed to convert |
 
 A usage error is a **refusal, not a repair**: it is decided before anything is read

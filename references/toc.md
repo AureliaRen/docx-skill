@@ -603,6 +603,55 @@ explicit section_index=1 -> 170.0        正确
 结论：**目录落在第一节以外时，显式传 `section_index`**。目录一般都在文档最前面，
 所以日常不受影响；但 `tab_pos_source` / `section_index` 两个返回值要读一下确认。
 
+## 9.5 页码页脚的五种模板（`docx_section.pagenums`）
+
+目录条目里的页码是**量出来再写死**的；而页脚里那个页码是**域**，两者互不相干。写页脚用 `docx_section.py pagenums`，`--template` 现在有 **5 项**（`PAGE_NUM_TEMPLATES`，`scripts/docx_section.py:99`）：
+
+| `--template` | 产出 |
+|---|---|
+| `page` | `1` |
+| `page_of` | `Page 1 of 12` |
+| **`zh`** | `第 1 页　共 12 页` |
+| `dash` | `- 1 -` |
+| `custom` | `--prefix` / `--suffix` 原样拼，占位符展开 |
+
+### `zh`
+
+`第 <PAGE> 页　共 <NUMPAGES> 页`。中间那个分隔符是**全角空格 U+3000**（常量 `ZH_TOTAL_SEPARATOR`，`scripts/docx_section.py:106` 写成 `"\u3000"`，源码里刻意用转义而不是字面字符——字面全角空格在某些编辑器里会被静默转成半角）。分段在 `:766-772`：
+
+```python
+elif tpl == "zh":
+    plan = [("t", "第 ", None), ("f", "PAGE", cached),
+            ("t", " 页" + ZH_TOTAL_SEPARATOR + "共 ", None),
+            ("f", total_field, "1"), ("t", " 页", None)]
+```
+
+`--total sectionpages` 时第二个域换成 `SECTIONPAGES`（数本节而不是整篇）。
+
+**`zh` 不吃 `--prefix` / `--suffix`**——它自己拼文本。但给了不会静默丢弃：返回 dict 多一个 `"ignored": ["prefix"]`（`:794-807`）。
+
+### `custom` 的 `{page}` / `{total}` 占位符
+
+`--prefix` / `--suffix` 里的 `{page}` 与 `{total}` 按**出现顺序**展开成 PAGE 与 total 域（`_PLACEHOLDER`，`scripts/docx_section.py:112`；切分 `_placeholder_plan`，`:663`；组装 `_custom_plan`，`:680`）：
+
+```bash
+python scripts/docx_section.py pagenums out.docx \
+  --template custom --prefix "{page}/" --suffix " of {total}" -o out.docx
+# → "1/ of 12"，两段各切成 [文字, 域, 文字]
+```
+
+**不带任何占位符时走旧代码路径**（`_custom_plan` 的 `:701` 分支），所以四个旧模板 + 无占位符的 `custom` 共 9 个 fixture 的 `word/footer1.xml` **逐字节一致**（聚合 SHA256 前后相同）。
+
+### 在 spec 里用
+
+同一套键在 `docx_create` 的 spec 里成立，两条通路：顶层 `footer_page_numbers`，或 `section_break` 内的 `footer_page_numbers`：
+
+```json
+{"footer_page_numbers": {"template": "zh", "fmt": "decimal", "start": 1}}
+```
+
+⚠ **改动口径**：`--template` 的 argparse `choices` 由常量单点驱动（`:1060` 的 `choices=list(PAGE_NUM_TEMPLATES)`），错误消息读同一常量——加模板只改一个地方。非法 choice 仍是 **exit 2**。
+
 ## 10. 数字格式对照（`docx_section.cached_page`）
 
 `w:pgNumType/@fmt` 决定"页码长什么样"。下表第 2 列是代码，第 3 列是本机 Word 16.0 实测

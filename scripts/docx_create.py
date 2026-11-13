@@ -75,9 +75,28 @@ the TOC field.  ``outline_level: 0`` writes Word's body-text marker ``9``
 section)`` is the text-block width, which is where a right-aligned TOC tab stop
 belongs.
 
+``table`` takes ``keep_together`` (bool, default false).  Word has no
+table-level "keep with next", so it is written in two layers: ``w:cantSplit``
+inside every row's ``w:trPr`` (a row never breaks across pages) and
+``keep_with_next`` on every paragraph of every cell except the last row (the
+table holds itself together).  ``keep_together`` is a request to Word, not a
+guarantee: a table longer than a page still spans pages, because ``cantSplit``
+only forbids splitting *a row*.
+
+A ``table_caption`` block followed **immediately** by a ``table`` block is
+linked automatically, with no key to write: the caption paragraph gets
+``keep_with_next`` and the table's first row gets ``w:cantSplit``.  Anything
+between them (even an empty ``paragraph``) breaks the link, because a caption
+two blocks away from its table is not what caused the split.
+
 ``crossref`` passes ``superscript`` (bool), ``vert_align``
 (``normal``/``superscript``/``subscript``) and ``hyperlink`` (bool, default
 true) through to ``docx_crossref.cmd_ref``.
+
+``image`` takes either ``width_mm`` (absolute) or ``width_frac`` (a share of
+the **current section's** text width, ``0 < f <= 1``; A4 with 26 mm side
+margins is 158 mm, so ``width_frac: 1.0`` is a full-width figure).  Giving both
+is an error rather than a silent winner.
 
 ``section_break`` closes the running section and starts a new one; keys are
 ``start_type``, ``page``, ``header``, ``header_align``, ``footer``,
@@ -90,8 +109,11 @@ section of a document is followed by no break, so it can only be described
 from the break above it.  Each section's page number format and restart point
 live in its own ``<w:pgNumType>``, so cover / ``i, ii`` / restart-at-``1`` is
 expressible; see ``docx_section.py``.  ``footer_page_numbers`` accepts ``fmt``,
-``start``, ``template`` (``page``/``page_of``/``dash``/``custom``), ``total``,
-``align``, ``prefix``, ``suffix``.
+``start``, ``template`` (``page``/``page_of``/``zh``/``dash``/``custom``), ``total``,
+``align``, ``prefix``, ``suffix``.  ``zh`` writes ``第 X 页　共 Y 页`` with a
+full-width space (U+3000) between ``页`` and ``共``; ``custom`` interpolates
+``{page}`` and ``{total}`` inside ``prefix``/``suffix``, so a non-English layout
+does not need a template of its own.
 
 Extras: `"footer_page_numbers": true` at the top level adds a
 "Page X of Y" footer built from PAGE/NUMPAGES fields to the first section,
@@ -240,6 +262,17 @@ def _set_style_fonts(style, latin: str, east_asia: str | None) -> None:
             "w:szCs", "w:highlight", "w:u", "w:effect", "w:bdr", "w:shd",
             "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em", "w:lang",
             "w:eastAsianLayout", "w:specVanish", "w:oMath")
+    # A built-in style (``Heading 1`` and friends) binds its fonts through the
+    # *theme* attributes -- ``w:asciiTheme="majorHAnsi"`` etc.  In ``CT_Fonts``
+    # a theme attribute takes precedence over its explicit twin, so writing
+    # ``w:ascii="黑体"`` next to a surviving ``w:asciiTheme`` leaves Word
+    # rendering the theme face: the XML would show the font the spec asked for
+    # while the page shows another one.  Naming a face therefore means taking
+    # the theme binding out of the way, which is part of honouring ``font``
+    # rather than something done to the keys the spec did not mention.
+    for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+        if rf.get(qn("w:" + attr)) is not None:
+            del rf.attrib[qn("w:" + attr)]
     for attr, value in (("ascii", latin), ("hAnsi", latin),
                         ("eastAsia", east_asia or latin),
                         ("cs", latin)):
@@ -307,9 +340,39 @@ def _apply_style_outline_level(style, outline_level) -> str:
     return val
 
 
+def _get_or_add_style(doc, name):
+    """The style called *name*, adding a paragraph style only when it is absent.
+
+    ``Styles.add_style`` raises ``ValueError`` on a name that already exists,
+    which made ``styles[]`` unable to reach any built-in style at all: asking
+    for ``{"name": "Heading 1", "size_pt": 16}`` was an error rather than an
+    edit, so the only way to restyle a heading was a copy under a new name.
+    Returns ``(style, created)``.
+    """
+    try:
+        return doc.styles[name], False
+    except KeyError:
+        return doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH), True
+
+
 def add_styles(doc, styles: list) -> None:
+    """Apply ``styles[]`` entries; an existing style is modified *in place*.
+
+    Only the keys a spec actually gives are written.  Everything else on the
+    style is left exactly as it was — not reset, not cleared, not re-based.
+    That is what makes the two features compose: the heading styles are
+    neutralised to black at build time (see
+    :func:`_neutralise_heading_styles`), and a spec that only says
+    ``{"name": "Heading 1", "size_pt": 16}`` then changes the size while the
+    colour stays black.  A "reset then apply" implementation would send it back
+    to the theme's blue, which is the defect this ordering exists to avoid.
+    """
     for s in styles:
-        style = doc.styles.add_style(s["name"], WD_STYLE_TYPE.PARAGRAPH)
+        style, _created = _get_or_add_style(doc, s["name"])
+        # ``base`` is the one key that *is* an error when it points nowhere:
+        # silently inventing a base style would make the document look almost
+        # right, and python-docx's own ``KeyError`` already carries a message
+        # ``_describe`` can reword.
         if s.get("base"):
             style.base_style = doc.styles[s["base"]]
         font = style.font
@@ -326,6 +389,9 @@ def add_styles(doc, styles: list) -> None:
         if s.get("italic") is not None:
             font.italic = s["italic"]
         if s.get("color"):
+            # ``ColorFormat.rgb``'s setter drops ``w:themeColor`` first, so the
+            # explicit value is the one Word renders.  Assigning the element's
+            # ``w:val`` directly would leave the theme attribute winning.
             font.color.rgb = RGBColor.from_string(s["color"])
         # ``0`` is meaningful (explicit body level), so this is ``is not None``
         # rather than a truthiness test.
@@ -497,6 +563,202 @@ def _neutralise_caption_style(doc) -> bool:
                 sz.set(qn("w:val"), str(CAPTION_HALF_POINTS))
                 touched = True
     return touched
+
+
+# ``Heading 1``..``Heading 9`` / ``Title`` / ``Subtitle`` ship in Word's own
+# template as **theme-coloured**: Heading 1 is ``w:val="365F91"
+# w:themeColor="accent1" w:themeShade="BF"``, Title is ``text2``, Subtitle is
+# ``accent1`` and italic.  That is a design choice for a screen document and the
+# wrong one for a printed Chinese assignment: every heading comes out blue, and
+# the theme attribute wins over the RGB twin at render time, so an author cannot
+# correct it by editing the visible hex value.  The paper format wants black
+# headings, so the built-ins are neutralised once at build time — before
+# ``add_styles``, which is what makes a spec able to ask for blue back.
+HEADING_COLOUR = "000000"
+# English UI names, the names a Chinese Word template carries, and the two
+# one-off styles.  Both spellings matter: a template localised to Chinese names
+# its headings ``标题 1`` while the styleId may still be ``Heading1``, and the
+# reverse also occurs, so neither spelling alone covers both.
+HEADING_STYLE_NAMES = tuple(
+    ["Heading %d" % n for n in range(1, 10)]
+    + ["标题 %d" % n for n in range(1, 10)]
+    + ["Title", "标题", "Subtitle", "副标题"])
+# Matched as styleIds too, for styles whose *name* was localised away from the
+# English one while the id kept Word's spelling.
+HEADING_STYLE_IDS = tuple(
+    ["Heading%d" % n for n in range(1, 10)] + ["Title", "Subtitle"])
+# Every built-in paragraph style is ``w:link``-ed to a character twin, and on a
+# Chinese template the link target's *name* is ``标题 1 字符``.  Leaving those
+# alone is not "not touching what the spec did not ask for": Word lists them in
+# the style gallery in blue, and selecting a few words inside a heading and
+# applying the character style turns them blue again.  The paragraph style being
+# black is not enough when the linked style it points at is not.
+HEADING_CHAR_STYLE_NAMES = tuple(
+    ["Heading %d Char" % n for n in range(1, 10)]
+    + ["标题 %d 字符" % n for n in range(1, 10)]
+    + ["Title Char", "标题 字符", "Subtitle Char", "副标题 字符"])
+HEADING_CHAR_STYLE_IDS = tuple(
+    ["Heading%dChar" % n for n in range(1, 10)] + ["TitleChar", "SubtitleChar"])
+# ``Subtitle`` is additionally italic, which a Chinese assignment does not want
+# for a subtitle line (P9).
+_SUBTITLE_KEYS = ("subtitle", "副标题", "subtitle char", "副标题 字符")
+_HEADING_NEUTRALISE_ATTRS = ("w:themeColor", "w:themeShade", "w:themeTint")
+# The six sides ``CT_PBdr`` allows.  ``Title`` carries a ``w:bottom`` rule in the
+# theme accent colour, so a black title still sits on a blue underline — the
+# exact symptom the original report described.
+BORDER_SIDES = ("w:top", "w:left", "w:bottom", "w:right", "w:between", "w:bar")
+
+
+def _has_theme_colour(colour) -> bool:
+    """True when ``w:color`` resolves through the theme rather than an RGB value."""
+    if any(colour.get(qn(attr)) is not None
+           for attr in _HEADING_NEUTRALISE_ATTRS):
+        return True
+    val = colour.get(qn("w:val"))
+    return val is None or val.lower() == "auto"
+
+
+def _blacken_run_colour(rpr, report: dict, label: str) -> bool:
+    """Force ``rpr/w:color`` to explicit black.  Shared by both style kinds.
+
+    The element is replaced, not patched: ``themeColor`` (with ``themeShade`` /
+    ``themeTint``) is what Word renders, so leaving it beside a new ``@w:val``
+    would change the XML and not the page.  A style that is *already* an explicit
+    colour is left byte-identical — blackening is a default, not a sweep.
+    """
+    colour = rpr.find(qn("w:color"))
+    if colour is None:
+        report["no_colour"].append(label)
+        return False
+    if not _has_theme_colour(colour):
+        report["explicit"].append(label)
+        return False
+    rpr.remove(colour)
+    new = OxmlElement("w:color")
+    new.set(qn("w:val"), HEADING_COLOUR)
+    insert_ordered(rpr, new, _rpr_order())
+    return True
+
+
+def _strip_italic(rpr) -> bool:
+    """Remove ``w:i``/``w:iCs``; True when either was there."""
+    removed = False
+    for tag in ("w:i", "w:iCs"):
+        el = rpr.find(qn(tag))
+        if el is not None:
+            rpr.remove(el)
+            removed = True
+    return removed
+
+
+def _blacken_borders(pPr) -> bool:
+    """Recolour every ``w:pBdr`` side to black, leaving thickness/spacing alone.
+
+    ``Title`` ships ``<w:bottom w:val="single" w:sz="8" w:space="4"
+    w:color="4F81BD" w:themeColor="accent1"/>``.  Only the colour attributes are
+    touched: ``w:sz`` (8 = 1 pt) and ``w:space`` are the design, not the symptom,
+    and a "make the title black" change that also thickened the rule would be
+    fixing something nobody reported.  ``w:color`` is normalised too, because the
+    hex sitting next to a theme colour is a guess Word ignores — and
+    ``w:val="auto"`` (or a border with no ``w:val``) would render in the
+    document's automatic colour, a second route back to the theme blue.
+    """
+    changed = False
+    pBdr = pPr.find(qn("w:pBdr"))
+    if pBdr is None:
+        return False
+    for side in BORDER_SIDES:
+        edge = pBdr.find(qn(side))
+        if edge is None:
+            continue
+        for attr in _HEADING_NEUTRALISE_ATTRS:
+            if edge.get(qn(attr)) is not None:
+                del edge.attrib[qn(attr)]
+                changed = True
+        if edge.get(qn("w:color")) != HEADING_COLOUR:
+            edge.set(qn("w:color"), HEADING_COLOUR)
+            changed = True
+    return changed
+
+
+def _neutralise_style_colour(style, report: dict, label: str,
+                             drop_italic: bool = False,
+                             borders: bool = False) -> bool:
+    """Neutralise one style: run colour, optional italic strip, optional borders.
+
+    Both the paragraph styles and their ``*Char`` twins go through this one
+    function — the two kinds differ only in *where* their ``w:rPr`` lives and in
+    whether a ``w:pPr`` exists at all, and duplicating the logic per kind is how
+    the character variants ended up blue in the first place.
+    """
+    changed = False
+    rpr = style.element.find(qn("w:rPr"))
+    if rpr is None:
+        # No run properties at all: nothing is coloured here, and adding a
+        # colour would *install* an opinion the style did not have.
+        report["missing"].append(label)
+    else:
+        changed |= _blacken_run_colour(rpr, report, label)
+        if drop_italic and _strip_italic(rpr):
+            changed = True
+    if borders:
+        pPr = style.element.find(qn("w:pPr"))
+        if pPr is not None and _blacken_borders(pPr):
+            report["borders"].append(label)
+            changed = True
+    return changed
+
+
+def _neutralise_heading_styles(doc) -> dict:
+    """Make the built-in heading / title / subtitle styles print black.
+
+    Same shape as :func:`_neutralise_caption_style`, widened in three ways that
+    each plug a hole the first version left open:
+
+    * the **character** twins (``Heading 1 Char`` …) are included, because Word
+      links each paragraph style to one (``w:link``) and a heading whose linked
+      character style is still blue turns blue the moment a few words inside it
+      are given that style;
+    * ``Title``'s ``w:pBdr`` rule is recoloured, since a black title over a blue
+      underline still reads as "the title is blue";
+    * ``Subtitle`` loses its italic (P9) — and so does ``Subtitle Char``.
+
+    Returns a report dict (``styles`` / ``touched`` / ``explicit`` /
+    ``no_colour`` / ``missing`` / ``borders``) rather than the caption function's
+    bare ``True``: the caption case had exactly one question ("was anything
+    touched?"), while here the caller needs to know *which* styles were found and
+    which of those already carried an explicit colour — a Chinese template
+    supplies only the localised spellings, and that silence has to be reportable
+    rather than invisible.
+
+    Runs **before** ``add_styles``, so a spec's explicit ``color`` still wins:
+    that is the opt-out channel, not a competing default.
+    """
+    report = {"styles": [], "touched": [], "explicit": [], "no_colour": [],
+              "missing": [], "borders": []}
+    wanted_names = {n.casefold()
+                    for n in HEADING_STYLE_NAMES + HEADING_CHAR_STYLE_NAMES}
+    wanted_ids = {i.casefold()
+                  for i in HEADING_STYLE_IDS + HEADING_CHAR_STYLE_IDS}
+    seen = set()
+    for style in doc.styles:
+        name = str(style.name or "")
+        style_id = str(style.style_id or "")
+        if name.casefold() not in wanted_names \
+                and style_id.casefold() not in wanted_ids:
+            continue
+        label = name or style_id
+        if label in seen:
+            continue
+        seen.add(label)
+        report["styles"].append(label)
+        is_subtitle = name.casefold() in _SUBTITLE_KEYS or \
+            style_id.casefold() in ("subtitle", "subtitlechar")
+        if _neutralise_style_colour(style, report, label,
+                                    drop_italic=is_subtitle,
+                                    borders=True):
+            report["touched"].append(label)
+    return report
 
 
 _VERT_ALIASES = {
@@ -922,12 +1184,86 @@ def _break_target(doc, new_section, block: dict):
                      % (block["apply_to"],))
 
 
-def add_block(doc, block: dict) -> list:
+def _row_paragraphs(row) -> list:
+    """Every paragraph of every cell in *row*, in cell order.
+
+    A row has no ``keepNext`` of its own — ``keepNext`` is a *paragraph*
+    property, so "this row must not end the page" can only be said on all of
+    the row's paragraphs at once.
+    """
+    out = []
+    for cell in row.cells:
+        out.extend(cell.paragraphs)
+    return out
+
+
+def _cant_split(row) -> None:
+    """``<w:trPr><w:cantSplit/></w:trPr>``: the row never breaks across pages.
+
+    ``w:cantSplit`` is the only table-row property Word honours here; there is
+    no table-level equivalent.  ``trPr`` is an ``xsd:sequence``, so the element
+    goes in through :func:`docx_utils.insert_ordered` — appending it after a
+    ``trHeight`` would make Word drop it while the XML still looked fine.
+    """
+    trPr = row._tr.get_or_add_trPr()
+    insert_ordered(trPr, OxmlElement("w:cantSplit"))
+
+
+def _keep_rows_together(rows) -> None:
+    """Make a block of rows hold together: no row splits, no row is left alone.
+
+    Two separate channels, because Word spells them in two places:
+
+    * every row gets ``w:cantSplit`` (the row's content stays on one page);
+    * every row *but the last* gets ``keep_with_next`` on each of its cell
+      paragraphs (Word keeps that paragraph on the same page as the next one,
+      which is what glues row *n* to row *n+1*).
+
+    Writing ``w:keepNext`` into ``w:trPr`` instead would be silently ignored by
+    Word — ``keepNext`` is not among ``trPr``'s children — while every XML
+    checker still reported the document valid.
+    """
+    if not rows:
+        return
+    for row in rows:
+        _cant_split(row)
+    for row in rows[:-1]:
+        for para in _row_paragraphs(row):
+            para.paragraph_format.keep_with_next = True
+
+
+def _caption_glues_to_next_table(blocks: list, index: int) -> bool:
+    """True when ``blocks[index]`` is a ``table_caption`` directly before a table.
+
+    "Directly before" means **no block in between**: a caption that has to
+    share a page with its table is useless if an empty paragraph sits between
+    them, and a caption two blocks away is not what caused the split.  Kept as
+    a function (rather than an inline index comparison at the call site) so the
+    adjacency rule is stated once and can be tested on its own.
+    """
+    if not isinstance(blocks, list) or not 0 <= index < len(blocks):
+        return False
+    block = blocks[index]
+    if not isinstance(block, dict) or block.get("type") != "table_caption":
+        return False
+    if index + 1 >= len(blocks):
+        return False
+    nxt = blocks[index + 1]
+    return isinstance(nxt, dict) and nxt.get("type") == "table"
+
+
+def add_block(doc, block: dict, blocks: list | None = None,
+              index: int | None = None) -> list:
     """Add one block; return the body paragraphs it created or attached to.
 
     Every paragraph-producing block then runs through
     :func:`_apply_para_format`, so the format vocabulary is uniform instead of
     being re-implemented per block type.
+
+    *blocks* / *index* are optional and used only by ``table_caption``, which
+    has to look at what comes *next* in the spec to know whether it belongs to
+    a table.  A caller that builds blocks one at a time (as the tests do) may
+    omit them and simply gets no automatic caption-to-table link.
     """
     btype = block["type"]
     made: list = []
@@ -994,6 +1330,10 @@ def add_block(doc, block: dict) -> list:
             _with_caption_defaults(block, doc), default_label="表"))
         made = [doc.paragraphs[-1]]
         own_bookmark = True
+        # A caption that starts a page alone above its table is the defect this
+        # adjacency check removes.  The *table* side (first row ``cantSplit``)
+        # is handled by the ``table`` branch, which knows it is the table this
+        # caption belongs to.
     elif btype == "crossref":
         # Appends a REF field to the previous paragraph, or to a new one.
         from docx_crossref import cmd_ref
@@ -1008,6 +1348,16 @@ def add_block(doc, block: dict) -> list:
         header = block.get("header", [])
         rows = block.get("rows", [])
         ncols = len(header) if header else (len(rows[0]) if rows else 1)
+        # A ``table_caption`` block immediately above this one belongs to this
+        # table, and the link is *automatic* (D-029): the caption paragraph is
+        # asked to stay with the next paragraph, and the table's first row is
+        # told not to split.  The paragraph is read here, before anything is
+        # appended, because that is the last moment ``doc.paragraphs[-1]`` is
+        # still the caption rather than the table's own content.
+        caption_para = None
+        if blocks is not None and index is not None \
+                and _caption_glues_to_next_table(blocks, index - 1):
+            caption_para = doc.paragraphs[-1] if doc.paragraphs else None
         # A table caption conventionally sits *above* the table, and Word's
         # "Insert Table of Figures" only picks up a caption that is its own
         # paragraph — so it is emitted before the table, not inside it.
@@ -1034,8 +1384,32 @@ def add_block(doc, block: dict) -> list:
             cells = table.add_row().cells
             for i, text in enumerate(row):
                 cells[i].text = str(text)
+        if caption_para is not None:
+            caption_para.paragraph_format.keep_with_next = True
+            if table.rows:
+                _cant_split(table.rows[0])
+        if block.get("keep_together"):
+            # The ``header`` row participates: it is part of the table, so it
+            # must not be the row that splits.
+            _keep_rows_together(table.rows)
+        made = []
     elif btype == "image":
-        width = Mm(block["width_mm"]) if block.get("width_mm") else None
+        # ``is not None``, not truthiness: ``width_frac: 0.0`` is a *number the
+        # spec wrote*, and a truthiness test would treat it as "no width given"
+        # and silently fall back to the picture's intrinsic size.  Same reason
+        # ``add_styles`` reads ``outline_level`` this way.
+        width_mm = block.get("width_mm")
+        width_frac = block.get("width_frac")
+        if width_frac is not None:
+            # A fraction is a share of *this section's* text width, so the
+            # figure follows the page geometry instead of a hard-coded 158 mm.
+            # Content widths differ per volume (170 mm vs 160 mm in this
+            # project), which is exactly why the fraction is resolved here.
+            width = Mm(content_width_mm(doc.sections[-1]) * float(width_frac))
+        elif width_mm is not None:
+            width = Mm(width_mm)
+        else:
+            width = None
         doc.add_picture(block["path"], width=width)
         made = [doc.paragraphs[-1]]
     elif btype == "page_break":
@@ -1112,6 +1486,13 @@ PAGE_NUMBER_KEYS = ("align", "bold", "fmt", "font", "page_type", "prefix",
 # ``PARA_FORMAT_KEYS``; a spec sets them on the same blocks all the same.
 CHAR_WIDTH_KEYS = ("char_width_pt", "first_line_indent_font_pt")
 
+# The one shape a spec author most often gets wrong, spelled out so it can be
+# quoted verbatim in an error message.  ``margins_mm`` is an *object* with four
+# required and three optional members; writing it as a list of numbers in the
+# obvious visual order (top, right, bottom, left) is a natural mistake, and
+# "must be a JSON object" alone does not say which names to use instead.
+MARGINS_SHAPE_EXAMPLE = ('{"top": 25, "bottom": 25, "left": 20, "right": 20}')
+
 
 def _with_para_format(*keys) -> set:
     """A block's own keys plus the shared paragraph-format vocabulary."""
@@ -1137,8 +1518,8 @@ BLOCK_KEYS = {
     # ``table`` produces no paragraph of its own, and its ``style`` is the
     # *table* style, so the paragraph vocabulary does not apply to it.
     "table": {"header", "rows", "style", "header_bold", "caption",
-              "caption_label", "caption_bookmark"},
-    "image": _with_para_format("path", "width_mm"),
+              "caption_label", "caption_bookmark", "keep_together"},
+    "image": _with_para_format("path", "width_mm", "width_frac"),
     "page_break": _with_para_format(),
     "toc": _with_para_format("instr"),
     # ``section_break`` has its own ``header``/``footer`` keys, so a paragraph
@@ -1159,15 +1540,50 @@ def _suggestions(key, allowed) -> list:
                                      cutoff=0.5)
 
 
+def _shape_hint(where: str) -> str:
+    """A concrete example object for the place that expected one.
+
+    "must be a JSON object, got list" says what is wrong but not what would be
+    right, so an author handed it still has to go and read the source.  The
+    examples below are the *smallest* objects that work at each nesting level,
+    which is what makes the message actionable rather than merely accurate.
+
+    ``margins_mm`` is the case this exists for: a spec author who wrote
+    ``"margins_mm": [25, 25, 20, 20]`` has the right numbers in the right
+    order, and "must be an object" alone leaves them to guess four key names.
+    """
+    if "margins_mm" in where:
+        return (MARGINS_SHAPE_EXAMPLE
+                + " (header / footer / gutter are optional)")
+    if where == "spec" or where.startswith("spec."):
+        return '{"blocks": [...], "page": {...}}'
+    if "runs[" in where:
+        return '{"text": "bold bit", "bold": true}'
+    if "tab_stops[" in where:
+        return '{"pos_mm": 155, "align": "right", "leader": "dot"}'
+    if "bottom_border" in where:
+        return '{"style": "single", "size": 8, "space": 1, "color": "000000"}'
+    if where.startswith("styles[") or where == "styles":
+        return '{"name": "Heading 1", "size_pt": 16}'
+    if "items[" in where:
+        return '{"text": "first item"}'
+    return '{"type": "paragraph", "text": "..."}'
+
+
 def _check_keys(where: str, obj, allowed, problems: list) -> bool:
     """Flag every key of *obj* that is not in *allowed*; True for a dict.
 
     One problem line per object rather than per key: a spec with two typos in
     one block reads better as one sentence than as two.
+
+    The "got list" branch names the shape that would have worked.  A spec author
+    who wrote ``"margins_mm": [25, 25, 20, 20]`` has the right numbers in the
+    right order — telling them "must be an object" alone leaves them to guess
+    the key names, and ``margins_mm`` has six of them.
     """
     if not isinstance(obj, dict):
-        problems.append("%s must be a JSON object, got %s"
-                        % (where, type(obj).__name__))
+        problems.append("%s must be a JSON object, got %s; expected e.g. %s"
+                        % (where, type(obj).__name__, _shape_hint(where)))
         return False
     unknown = [k for k in obj if k not in allowed]
     if unknown:
@@ -1176,8 +1592,15 @@ def _check_keys(where: str, obj, allowed, problems: list) -> bool:
             near = _suggestions(key, allowed)
             named.append('"%s"%s' % (key, ' (did you mean "%s"?)' % near[0]
                                      if near else ""))
-        problems.append("%s: unknown key %s; valid keys here: %s"
-                        % (where, ", ".join(named), ", ".join(sorted(allowed))))
+        message = ("%s: unknown key %s; valid keys here: %s"
+                   % (where, ", ".join(named), ", ".join(sorted(allowed))))
+        # ``valid keys here`` names the members but not how they nest, which is
+        # the part a list-shaped ``margins_mm`` got wrong in the first place.
+        # The sentence above is kept verbatim; the shape is appended, so the
+        # existing wording and its tests still hold.
+        if "margins_mm" in where:
+            message += "; expected shape: %s" % _shape_hint(where)
+        problems.append(message)
     return True
 
 
@@ -1262,11 +1685,76 @@ def _check_table(where: str, block: dict, problems: list) -> None:
                                ' (from "header")' if header else ""))
 
 
+def _check_keep_together(where: str, block: dict, problems: list) -> None:
+    """``table``'s ``keep_together`` is a bool; a truthy string is a typo.
+
+    ``"keep_together": "yes"`` would work by accident (any non-empty string is
+    truthy) and then break the day someone writes ``"false"`` — which is also
+    truthy.  Accepting only a real bool keeps the key honest, and ``bool`` is
+    excluded from the number branch for the same reason ``_check_level`` does.
+    """
+    if "keep_together" not in block:
+        return
+    value = block["keep_together"]
+    if not isinstance(value, bool):
+        problems.append('%s: "keep_together" must be true or false, got %r'
+                        % (where, value))
+
+
+def _check_width_frac(where: str, block: dict, problems: list) -> None:
+    """``width_frac`` is a share of the text width: ``0 < f <= 1``, not clamped.
+
+    Two separate errors on purpose.  Giving both keys is a *contradiction* the
+    builder cannot resolve without silently picking one, so it is reported as
+    such rather than as a range problem.  A fraction outside ``(0, 1]`` is
+    reported with the range it would have been clamped into — the repository
+    does not clamp, because a figure silently half the requested size is worse
+    than a rejected spec.
+    """
+    frac = block.get("width_frac")
+    if frac is None:
+        return
+    if block.get("width_mm") is not None:
+        problems.append('%s: "width_frac" and "width_mm" are mutually '
+                        "exclusive; give one or the other (width_frac is a "
+                        "share of the text width, width_mm is absolute)"
+                        % where)
+        return
+    if isinstance(frac, bool) or not isinstance(frac, (int, float)):
+        problems.append('%s: "width_frac" must be a number 0 < f <= 1, got %r'
+                        % (where, frac))
+        return
+    if not 0 < frac <= 1:
+        problems.append('%s: "width_frac" out of range: %r (allowed 0 < f <= 1: '
+                        "1.0 is the full text width, 0.5 is half of it); the "
+                        "value is not clamped" % (where, frac))
+
+
+def _check_image(where: str, block: dict, problems: list) -> None:
+    path = block.get("path")
+    if not path:
+        problems.append('%s: image blocks need "path"' % where)
+    elif not isinstance(path, str):
+        problems.append('%s: image "path" must be a string, got %s'
+                        % (where, type(path).__name__))
+    elif not Path(path).is_file():
+        # Checked here rather than left to ``add_picture``: python-docx raises
+        # ``FileNotFoundError`` from inside the build, which reaches the user as
+        # a traceback with a non-zero exit that says nothing about which block
+        # was wrong. A path the author got wrong is an input error, so it
+        # belongs in the same list as every other input error -- one line, exit
+        # 2, no traceback, and the block named.
+        problems.append('%s: image "path" does not exist: %r; relative paths '
+                        "resolve against the current working directory, not "
+                        "the spec file's directory" % (where, path))
+    _check_width_frac(where, block, problems)
+
+
 def _check_block(index: int, block, problems: list) -> None:
     where = "blocks[%d]" % index
     if not isinstance(block, dict):
-        problems.append("%s must be a JSON object, got %s"
-                        % (where, type(block).__name__))
+        problems.append("%s must be a JSON object, got %s; expected e.g. %s"
+                        % (where, type(block).__name__, _shape_hint(where)))
         return
     btype = block.get("type")
     if btype is None:
@@ -1289,9 +1777,9 @@ def _check_block(index: int, block, problems: list) -> None:
         _check_level(where, block, problems)
     elif btype == "table":
         _check_table(where, block, problems)
+        _check_keep_together(where, block, problems)
     elif btype == "image":
-        if not block.get("path"):
-            problems.append('%s: image blocks need "path"' % where)
+        _check_image(where, block, problems)
     elif btype == "crossref":
         if not block.get("target"):
             problems.append('%s: crossref blocks need "target" (a bookmark '
@@ -1378,14 +1866,22 @@ _BUILD_ERRORS = (KeyError, IndexError, TypeError, ValueError, SystemExit)
 
 
 def _input_error(message: str) -> int:
-    """Reject the spec: JSON on stdout, one readable line on stderr, exit 2.
+    """Reject the spec: JSON on stdout, one ``error:`` line on stderr, exit 2.
 
     Exit 2 promises that *nothing was written*, so a caller can retry after
     fixing the spec without wondering whether half a document exists.
+
+    The stderr line carries the repository-wide ``error:`` prefix (D-024) rather
+    than the script name, so a caller can tell a refusal from a warning by the
+    first token alone, exactly as the other CLIs allow.  The JSON on stdout is
+    **kept**: ``docx_create`` is one of the scripts SKILL.md lists as
+    "JSON on stdout", and its refusal payload is the machine-readable half of
+    the same answer (``ok: false`` plus the reason).  Emptying stdout here would
+    make the two channels disagree about whether the run produced a result.
     """
     print(json.dumps({"ok": False, "output": None, "error": message},
                      ensure_ascii=False))
-    print("docx_create: %s" % message, file=sys.stderr)
+    print("error: %s" % message, file=sys.stderr)
     return 2
 
 
@@ -1433,14 +1929,24 @@ def main() -> int:
         # template default), and a caption is what "Insert Table of Figures"
         # formats, so it would turn every caption in a printed paper blue.
         caption_neutralised = _neutralise_caption_style(doc)
+        # Same reason, one family up: the built-in heading/title styles are
+        # theme-coloured (blue, and Subtitle also italic), which a printed
+        # Chinese assignment does not want.  Before ``add_styles``, so a spec
+        # that names a colour still gets it — that is the opt-out.
+        headings_neutralised = _neutralise_heading_styles(doc)
         if spec.get("styles"):
             add_styles(doc, spec["styles"])
         if spec.get("header"):
             set_hdrftr_text(doc.sections[0], spec["header"], kind="header")
         if spec.get("footer"):
             set_hdrftr_text(doc.sections[0], spec["footer"], kind="footer")
-        for block in spec.get("blocks", []):
-            add_block(doc, block)
+        blocks = spec.get("blocks", [])
+        for i, block in enumerate(blocks):
+            # The index is passed so a ``table_caption`` can see whether the
+            # very next block is its table — that adjacency is what decides the
+            # automatic keep-with-table link, and it cannot be recovered once
+            # the blocks have been built.
+            add_block(doc, block, blocks=blocks, index=i)
         if spec.get("footer_page_numbers"):
             fpn = spec["footer_page_numbers"]
             add_page_number_field(

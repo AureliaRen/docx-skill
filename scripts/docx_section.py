@@ -49,6 +49,9 @@ Examples:
   docx_section.py break in.docx --start-type new_page -o out.docx
   docx_section.py pagenum out.docx --section 1 --fmt lowerRoman --start 1
   docx_section.py pagenums out.docx --section 2 --template page_of --align center
+  docx_section.py pagenums out.docx --template zh
+  docx_section.py pagenums out.docx --template custom --prefix "{page}/" \\
+      --suffix " of {total}"
 
 Exit codes: 0 success, 1 expected failure (bad section index / format),
 2 usage error.
@@ -58,6 +61,7 @@ import _bootstrap  # noqa: F401
 
 import argparse
 import json
+import re
 import sys
 
 from docx.enum.section import (
@@ -88,6 +92,24 @@ PAGE_NUM_FMT = {
     "upperLetter", "chineseCounting", "chineseLegalSimplified",
     "ideographDigital",
 }
+
+# Every ``template`` value ``add_page_number_field`` understands.  The CLI's
+# ``choices`` and the error message both read this, so a new template cannot
+# be added to the function and forgotten by one of the two.
+PAGE_NUM_TEMPLATES = ("page", "page_of", "zh", "dash", "custom")
+
+# The ``zh`` layout, spelled out rather than assembled at run time: the
+# separator between ``页`` and ``共`` is a full-width space (U+3000), and a
+# plain " " here would look identical in most editors while typesetting as a
+# narrow gap.  ``\\u3000`` is written as an escape on purpose -- a literal in the
+# source survives review, but this comment names what it is.
+ZH_TOTAL_SEPARATOR = "\u3000"
+
+# ``{page}`` / ``{total}`` in ``custom``'s prefix/suffix.  Only the two exact
+# tokens are recognised: a stray ``{foo}`` stays as written rather than
+# disappearing, and ``{{page}}`` is not an escape (there is nothing to escape
+# from -- the text is a footer label, not a format string).
+_PLACEHOLDER = re.compile(r"\{(page|total)\}")
 
 START_TYPES = {
     "continuous": WD_SECTION_START.CONTINUOUS,
@@ -638,15 +660,81 @@ def _pt(value):
     return Pt(value)
 
 
+def _placeholder_plan(text: str, cached: str, total_field: str) -> list:
+    """Segments for *text* with ``{page}`` / ``{total}`` expanded in place."""
+    out = []
+    pos = 0
+    for m in _PLACEHOLDER.finditer(text):
+        if m.start() > pos:
+            out.append(("t", text[pos:m.start()], None))
+        if m.group(1) == "page":
+            out.append(("f", "PAGE", cached))
+        else:
+            out.append(("f", total_field, "1"))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("t", text[pos:], None))
+    return out
+
+
+def _custom_plan(prefix, suffix, cached: str, total_field: str) -> list:
+    """The segment list for ``template="custom"``.
+
+    Two behaviours, selected by whether either half names a placeholder:
+
+    * **no** ``{page}``/``{total}`` anywhere — the pre-placeholder layout,
+      ``prefix`` + ``PAGE`` + ``suffix``, reproduced segment for segment so
+      that every existing spec keeps producing byte-identical XML (the split
+      would otherwise change the number of ``w:r`` elements in footers that
+      never asked for a placeholder);
+    * **at least one** placeholder — the placeholders decide where the fields
+      go, prefix halves then suffix halves, in order.  The implicit ``PAGE``
+      between the halves is *not* added: with ``prefix="{page}/"`` it would
+      give two PAGE fields and a duplicated number.  A ``custom`` that wants
+      the counter without naming it keeps using the no-placeholder form.
+
+    Text outside a placeholder is copied verbatim, braces included; only the
+    two exact tokens are recognised.
+    """
+    prefix = prefix or ""
+    suffix = suffix or ""
+    if not (_PLACEHOLDER.search(prefix) or _PLACEHOLDER.search(suffix)):
+        return [("t", prefix, None), ("f", "PAGE", cached),
+                ("t", suffix, None)]
+    return (_placeholder_plan(prefix, cached, total_field)
+            + _placeholder_plan(suffix, cached, total_field))
+
+
 def add_page_number_field(section, template="page_of", fmt=None, start=None,
                           align="center", total=None, prefix=None,
                           suffix=None, font=None, size_pt=None, bold=None,
                           page_type: str = "default") -> dict:
     """Put a PAGE field in *section*'s **own** footer.
 
-    ``template``: ``page`` (just the counter), ``page_of`` (``Page X of Y``),
-    ``dash`` (``- X -``), or ``custom`` (use ``prefix``/``suffix`` verbatim).
-    ``total``: ``numpages`` (whole document, the default) or ``sectionpages``.
+    ``template``:
+
+    * ``page`` — just the counter;
+    * ``page_of`` — ``Page X of Y``, with ``prefix``/``suffix`` replacing
+      ``Page `` and `` of ``;
+    * ``zh`` — ``第 X 页　共 Y 页``, the Chinese layout.  The separator is a
+      **full-width space (U+3000)**, not an ASCII space: that is what makes the
+      two halves read as one line in Chinese typesetting, and it is written
+      literally so no editor setting can quietly turn it into ``U+0020``.
+      ``zh`` is a *fixed* template, so **``prefix`` and ``suffix`` are
+      ignored** for it — pass ``custom`` with ``{page}``/``{total}`` to vary
+      the wording.  The keywords are not silently swallowed: the returned dict
+      carries an ``"ignored"`` list naming whichever of the two was supplied;
+    * ``dash`` — ``- X -``;
+    * ``custom`` — ``prefix`` + PAGE + ``suffix`` verbatim, except that
+      ``{page}`` and ``{total}`` are replaced by the page and total fields
+      wherever they appear (``prefix="{page}/"``, ``suffix=" of {total}"`` →
+      ``X/ of Y``).  Naming a placeholder moves the fields to where it sits and
+      drops the implicit mid-PAGE, so ``"{page} / {total}"`` in ``prefix``
+      alone is legal too.
+
+    ``total``: ``numpages`` (whole document, the default) or ``sectionpages``
+    (the current section's page count) — honoured by every template that shows
+    a total, ``zh`` included.
 
     The counter's *format* and *restart point* come from this section's
     ``w:pgNumType``, not from the field, so ``fmt``/``start`` are applied to
@@ -674,16 +762,21 @@ def add_page_number_field(section, template="page_of", fmt=None, start=None,
     elif tpl == "dash":
         plan = [("t", "- ", None), ("f", "PAGE", cached), ("t", " -", None)]
     elif tpl == "custom":
-        plan = [("t", prefix or "", None), ("f", "PAGE", cached),
-                ("t", suffix or "", None)]
+        plan = _custom_plan(prefix, suffix, cached, total_field)
+    elif tpl == "zh":
+        plan = [("t", "第 ", None),
+                ("f", "PAGE", cached),
+                ("t", " 页" + ZH_TOTAL_SEPARATOR + "共 ", None),
+                ("f", total_field, "1"),
+                ("t", " 页", None)]
     elif tpl == "page_of":
         plan = [("t", prefix if prefix is not None else "Page ", None),
                 ("f", "PAGE", cached),
                 ("t", suffix if suffix is not None else " of ", None),
                 ("f", total_field, "1")]
     else:
-        raise SystemExit("unknown template %r; choose page, page_of, dash, "
-                         "custom" % (template,))
+        raise SystemExit("unknown template %r; choose %s"
+                         % (template, ", ".join(PAGE_NUM_TEMPLATES)))
 
     for kind, value, cached_val in plan:
         if kind == "t":
@@ -700,9 +793,20 @@ def add_page_number_field(section, template="page_of", fmt=None, start=None,
             for el in _field_runs(value, cached_val, rpr):
                 para._p.append(el)
 
-    return {"page_numbers": True, "template": tpl, "fmt": eff_fmt,
-            "start": eff_start, "cached": cached, "total_field": total_field,
-            "page_type": page_type}
+    out = {"page_numbers": True, "template": tpl, "fmt": eff_fmt,
+           "start": eff_start, "cached": cached, "total_field": total_field,
+           "page_type": page_type}
+    # ``zh`` is a fixed Chinese layout, so a prefix/suffix has nowhere to go.
+    # Recording it beats dropping it in silence: the caller who passed one and
+    # sees the Chinese wording instead needs a place to discover why.  The key
+    # only appears when something *was* ignored, so every other template's
+    # returned dict -- and therefore the CLI's JSON -- stays exactly as before.
+    if tpl == "zh":
+        ignored = [k for k, v in (("prefix", prefix), ("suffix", suffix))
+                   if v is not None]
+        if ignored:
+            out["ignored"] = ignored
+    return out
 
 
 # ---- breaks -----------------------------------------------------------------
@@ -953,7 +1057,7 @@ def main() -> int:
     common(p)
     pick(p)
     p.add_argument("--template", default="page_of",
-                   choices=["page", "page_of", "dash", "custom"])
+                   choices=list(PAGE_NUM_TEMPLATES))
     p.add_argument("--fmt", choices=sorted(PAGE_NUM_FMT))
     p.add_argument("--start", type=int)
     p.add_argument("--align", default="center",
