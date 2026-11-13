@@ -212,7 +212,7 @@ jobs:
         #      breaks the identity. With nothing failing and no xfail in the
         #      suite this reduces to the plain `passed + skipped == collected`.
         #
-        #   3. FLOOR: passed >= MIN_PASSED (1654, measured on a clean clone with no
+        #   3. FLOOR: passed >= MIN_PASSED (1836, measured on a clean clone with no
         #      Office; see the arithmetic below). Monotone: it only ever moves
         #      up, so tests that really execute can never quietly stop
         #      executing. This is also what catches a single pass -> skip flip,
@@ -223,7 +223,7 @@ jobs:
         #      A ratio, not a count: adding a new test that skips on CI (no
         #      Office on the runner) can no longer force a false red, while a
         #      whole category of tests degrading into skips still trips it.
-        #      Today 377/2031 = 18.6%, i.e. about 130 slots of slack.
+        #      Today 383/2219 = 17.3%, i.e. about 171 slots of slack.
         #
         # What replaced what, and why (P5-AUDIT-QUALITY 4.1-4.3 and 10 item 8):
         #   MIN_PASSED was 1356 when this gate was written (P5). It was never the
@@ -243,7 +243,16 @@ jobs:
         #     sits on that floor: the floor is a measurement, not slack.
         #
         # The numbers are the hosted-runner reality, not this workstation.
-        # P10 measurement (2026-11-12, four legs of run 43255226564, all identical):
+        # P12 measurement (2026-11-13, four legs of run 43454711769, all identical):
+        # 1836 passed / 383 skipped / collected 2219. A hosted reading, not a
+        # simulation -- ubuntu and windows, py3.10 and py3.12 all reported the same
+        # three numbers. The run before this one was red on all four legs for a
+        # reason worth keeping next to the number: docx_preview checked PyMuPDF
+        # before LibreOffice, so a runner with neither was told to install PyMuPDF.
+        # That test was green on the workstation (which has both) and red on every
+        # runner, which is the whole argument for measuring the floor here.
+        #
+        # P10 measurement (historical, do not use as the floor):
         # 1654 passed / 377 skipped / collected 2031. This is a hosted reading, not
         # a simulation -- ubuntu and windows, py3.10 and py3.12 all reported the
         # same three numbers, so the floor is a measurement rather than a guess.
@@ -297,6 +306,16 @@ jobs:
         #   + P10 batch  tests/test_fix_zoom.py 11 tests      +11 /   0
         #        fix_docx return-code passthrough; touches no OMML
         #   =                                                1654 / 377  (P10)
+        #   + P12 batch (six layout units, +186 collected: +180 that run here,
+        #        +6 that skip). New files: test_styles_modify, test_docx_preview,
+        #        test_section_pagenum_zh, test_table_keep_together,
+        #        test_image_width_frac, test_spec_hints; two existing files grew.
+        #        The +6 skips are the end-to-end preview cases, which need both
+        #        LibreOffice and PyMuPDF on the runner and get neither.
+        #   + P12 follow-up (acceptance findings: an image path that does not exist
+#        raised a traceback instead of exit 2, and docx_preview named PyMuPDF
+#        before LibreOffice)                              +2 /   0
+#   =                                                1836 / 383  (P12)
         #
         # Adding tests from now on (details in docs/reports/P6-FIX-C4.md):
         #   new test that RUNS on the runner  -> raise MIN_PASSED to the freshly
@@ -330,14 +349,14 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1654                        # monotone floor, measured on a clean clone
+          MIN_PASSED = 1836                        # monotone floor, measured on a clean clone
           SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
           run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
           collect_log = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
 
           # The summary is the last line carrying a duration, e.g.
-          #   "1654 passed, 377 skipped, 5 warnings in 61.23s"
+          #   "1836 passed, 383 skipped, 5 warnings in 61.23s"
           summary = None
           for line in run_log.splitlines():
               if re.search(r"\bin\s+\d+(?:\.\d+)?s", line) and re.search(r"\d+ (?:passed|failed|error)", line):

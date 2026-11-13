@@ -139,7 +139,7 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 
 ## 典型用法
 
-18 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——逐文件清单见下一节「脚本清单」的末列：
+19 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——逐文件清单见下一节「脚本清单」的末列：
 
 ```bash
 python scripts/docx_create.py --help
@@ -233,18 +233,18 @@ python scripts/docx_create.py spec.json report.docx
 
 用法错误只往 stderr 写一行、stdout 留空、什么都不碰——输入文件逐字节不变。这条在 `docx_read` 上最要紧：它每一种成功模式都出 JSON，所以缺文件、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，一律 exit `2` 且 stdout **一个字节都没有**，而不是回一份会被每个 `json.loads(stdout)` 调用方读成成功的失败 JSON。
 
-## 脚本清单（`scripts/`，27 个文件）
+## 脚本清单（`scripts/`，28 个文件）
 
-`scripts/` 下 **26 个 `.py` + 1 个 `.ps1`，共 27 个文件**，全部平铺、无子包、无 `__init__.py`。分类只用一条判据，且 `ci.yml` 是机械推导的、不靠这段文字自觉——两条规则取并集（`_*` 前缀 **或** 没有 `if __name__ == "__main__"` 守卫）即判为**纯库**：
+`scripts/` 下 **27 个 `.py` + 1 个 `.ps1`，共 28 个文件**，全部平铺、无子包、无 `__init__.py`。分类只用一条判据，且 `ci.yml` 是机械推导的、不靠这段文字自觉——两条规则取并集（`_*` 前缀 **或** 没有 `if __name__ == "__main__"` 守卫）即判为**纯库**：
 
 | 桶 | 数量 | 判据 |
 |---|---|---|
-| **CLI** | **25** | 带 `__main__` 守卫，能直接从命令行跑 |
+| **CLI** | **26** | 带 `__main__` 守卫，能直接从命令行跑 |
 | **纯库** | **1** | `_bootstrap.py` —— 私有模块，在解析参数之前就被 import，永远不单独运行 |
 
-这 25 个 CLI 里，**18 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。每个命令的完整参数见 [SKILL.zh-CN.md](SKILL.zh-CN.md)。
+这 26 个 CLI 里，**19 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。每个命令的完整参数见 [SKILL.zh-CN.md](SKILL.zh-CN.md)。
 
-**CLI 工具（18 个带 argparse 的 `.py`）**
+**CLI 工具（19 个带 argparse 的 `.py`）**
 
 | 文件 | 作用 |
 |---|---|
@@ -266,8 +266,9 @@ python scripts/docx_create.py spec.json report.docx
 | `fix_fonts.py` | 字体统一：样式层 + run 层 + 手动放大标题（`--heading-threshold`） |
 | `fix_zoom.py` | 给 `<w:zoom>` 补 schema 强制的 `w:percent`（`--percent`） |
 | `merge_docs.py` | 合并两份 docx（样式/编号/图片关系/sectPr，`base src out`） |
+| `docx_preview.py` | 渲染并自检版面：`--pdf` / `--pages DIR`（每页 PNG，`--dpi`）/ `--lint`（填充率、半空页与空白页、超宽图、跨页表、孤字末行）/ `--json` |
 
-第 27 个文件不是 `.py`：`pdf_export.ps1` 是 PowerShell 导出通道——Word COM、`ExportAsFixedFormat(17)`、以 `ReadOnly` 打开（`-DocxPath` / `-PdfPath`）。详见 [导出 PDF](SKILL.zh-CN.md#pdf-导出附加能力)。
+第 28 个文件不是 `.py`：`pdf_export.ps1` 是 PowerShell 导出通道——Word COM、`ExportAsFixedFormat(17)`、以 `ReadOnly` 打开（`-DocxPath` / `-PdfPath`）。详见 [导出 PDF](SKILL.zh-CN.md#pdf-导出附加能力)。
 
 **库与自述模块（7 个）**——按裸模块名 import；前六个带一行 `__main__` 自述，`fix_phasor_dot` 跑的是自检。`_bootstrap.py` 是唯一的纯库，单独列在最后。
 
@@ -290,7 +291,7 @@ python scripts/docx_create.py spec.json report.docx
 ## 仓内目录与 import 纪律（Layout）
 
 ```
-scripts/    所有 CLI，平铺，按裸模块名 import —— 27 个文件（25 个 CLI + 1 个纯库 + 1 个 .ps1）
+scripts/    所有 CLI，平铺，按裸模块名 import —— 28 个文件（26 个 CLI + 1 个纯库 + 1 个 .ps1）
 tools/      word_accept.py 等验收工具；**`--page-probe` 只在这里**
 references/ 长文档笔记，按需阅读，不进 import 路径
 tests/      pytest 套件

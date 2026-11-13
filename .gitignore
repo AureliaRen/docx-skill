@@ -46,3 +46,12 @@ desktop.ini
 /spec.json
 /out.docx
 /out.json
+
+# Local scratch directory (P12).  The build project keeps per-round working
+# material here -- probe scripts, rendered PNGs/PDFs, generated sample
+# documents, ad-hoc spec files, and pre-change backups of tracked files.  None
+# of it is a product artifact, and some of it carries machine-local paths and
+# real document content, so it must never reach the published tree.  Anchored
+# with a leading slash so a future `docs/work/` (if one is ever wanted) is not
+# swallowed by accident.
+/work/
