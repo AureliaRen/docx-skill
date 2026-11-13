@@ -172,6 +172,18 @@ re-running an old spec.
 
 ### Fixed
 
+- **An `image` block with a bad `path` is an input error, not a traceback.** The
+  path went straight into `add_picture`, so a typo reached the user as a
+  `FileNotFoundError` raised from inside the build: a traceback, no JSON error
+  object, and no block index anywhere in the message. It is now checked with the
+  other input errors — exit `2`, one `error:` line naming `blocks[N]`, nothing
+  written — and the message says the path resolves against the current working
+  directory rather than the spec file's directory, which is where the first
+  report of this lost ten minutes.
+- **`docx_preview.py` names the first blocker, not the second.** PyMuPDF was
+  checked before LibreOffice even though conversion runs first, so a machine with
+  neither — every GitHub runner — was told to install PyMuPDF and then hit the
+  same wall one step later. The checks now run in execution order.
 - **`docx_create.py` writes `error:` on stderr where it used to write
   `docx_create:`.** Every other CLI already used the `error:` prefix that D-024
   makes the single shape of a refusal line, so a caller branching on the first

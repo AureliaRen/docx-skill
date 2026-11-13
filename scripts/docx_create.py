@@ -1731,8 +1731,22 @@ def _check_width_frac(where: str, block: dict, problems: list) -> None:
 
 
 def _check_image(where: str, block: dict, problems: list) -> None:
-    if not block.get("path"):
+    path = block.get("path")
+    if not path:
         problems.append('%s: image blocks need "path"' % where)
+    elif not isinstance(path, str):
+        problems.append('%s: image "path" must be a string, got %s'
+                        % (where, type(path).__name__))
+    elif not Path(path).is_file():
+        # Checked here rather than left to ``add_picture``: python-docx raises
+        # ``FileNotFoundError`` from inside the build, which reaches the user as
+        # a traceback with a non-zero exit that says nothing about which block
+        # was wrong. A path the author got wrong is an input error, so it
+        # belongs in the same list as every other input error -- one line, exit
+        # 2, no traceback, and the block named.
+        problems.append('%s: image "path" does not exist: %r; relative paths '
+                        "resolve against the current working directory, not "
+                        "the spec file's directory" % (where, path))
     _check_width_frac(where, block, problems)
 
 
