@@ -263,3 +263,36 @@ def test_both_keys_is_reported_once_not_twice():
                          problems)
     assert len(problems) == 1, problems
     assert "mutually exclusive" in problems[0]
+
+
+# ---- 3. a wrong path is an input error, not a traceback ----------------------
+
+def test_missing_image_path_is_exit_2_not_a_traceback(tmp_path):
+    """A path the author got wrong belongs with the other input errors.
+
+    Before this check the path went straight into ``add_picture``, so
+    python-docx raised ``FileNotFoundError`` from inside the build: a
+    traceback, no JSON error object, and no block index anywhere in sight.
+    Exit 2 is the contract for "the input is wrong" and the message has to
+    name the block, so the check lives in ``_check_image`` with the rest of
+    them rather than at the call site.
+    """
+    code, payload, err, out = run_create(
+        tmp_path, {"blocks": [{"type": "image", "path": "does-not-exist.png",
+                              "width_frac": 1.0}]})
+    assert code == 2, err
+    assert payload and payload["ok"] is False
+    assert "does not exist" in payload["error"]
+    assert "blocks[0]" in payload["error"]
+    assert "Traceback" not in err
+    assert not out.exists(), "a refused spec must write nothing"
+
+
+def test_a_non_string_path_is_refused_with_its_type(tmp_path):
+    """``"path": 123`` is refused as a bad type, not passed to python-docx."""
+    code, payload, err, out = run_create(
+        tmp_path, {"blocks": [{"type": "image", "path": 123}]})
+    assert code == 2, err
+    assert payload and "must be a string" in payload["error"]
+    assert "int" in payload["error"]
+    assert not out.exists()

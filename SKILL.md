@@ -213,6 +213,14 @@ reads as a typo at print size. `--total sectionpages` swaps the second field for
 ignores `--prefix` / `--suffix` — it builds its own text — and says so in the
 report (`"ignored": ["prefix"]`) instead of dropping them in silence.
 
+The total is a **field**, not literal text, and that changes how you verify it.
+`第 1 页　共 <NUMPAGES> 页` reaches `footer*.xml` with a cached total of `1`,
+because how many pages a document has is not known while the package is still
+being written; Word and LibreOffice recalculate the field when the document
+opens. On a five-page document the PDF says `共 5 页` and the XML still says `1`.
+Check a footer in the rendered page, never in the raw XML — an XML check that
+expects the real total fails on a document that is perfectly correct.
+
 `--template custom` takes `--prefix` / `--suffix` and expands **`{page}`** and
 **`{total}`** inside them into the PAGE and total fields, in the order they
 appear, so `--prefix "{page}/" --suffix " of {total}"` gives `1/ of 12`. With no
@@ -401,6 +409,11 @@ instead of hard-coding a number: A4 with 26 mm left and right margins gives a
 values are refused with the range rather than clamped, and `0.0` is refused
 rather than read as "no width" — a number the caller wrote is never quietly
 turned into something else.
+
+`path` resolves against the **current working directory**, not against the
+spec file's directory, and a path that does not exist is refused as an input
+error — exit `2`, the block index in the message, nothing written — instead of
+surfacing later as a `FileNotFoundError` traceback from inside the build.
 
 ### Forcing a heading onto a new page
 
@@ -967,7 +980,7 @@ tests/       pytest suite — 58 .py (57 test_*.py + _omml.py helper)
 |---|---|
 | `0` | success |
 | `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception |
-| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package |
+| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package, an `image` block whose `path` points at nothing on disk or is not a string |
 | `3` | **`docx_mathify` only** (and `docx_template apply --fix-formulas`, which passes it through): the document was written, but at least one formula failed to convert |
 
 A usage error is a **refusal, not a repair**: it is decided before anything is read

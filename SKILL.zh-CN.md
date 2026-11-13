@@ -153,6 +153,8 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 
 **`pagenums --template` 有五种形态**，中文交付用 `zh`：`第 <PAGE> 页　共 <NUMPAGES> 页`。`页` 与 `共` 之间那个分隔符是**全角空格 U+3000**，不是普通空格——半角那道缝在印刷尺寸上读起来像排版事故。加 `--total sectionpages` 就把第二个域换成 `SECTIONPAGES`，于是「共 Y 页」数的是本节而不是整篇。`zh` 会忽略 `--prefix` / `--suffix`（它自己拼文本），但**不会静默吞掉**：返回的报告里多一条 `"ignored": ["prefix"]` 自报。
 
+总页数是**域，不是字面文字**，这决定了怎么验它。`第 1 页　共 <NUMPAGES> 页` 落到 `footer*.xml` 里时，总数那一段的缓存值是 `1`——因为包还在写的时候，文档一共几页根本不知道；Word 与 LibreOffice 打开文档时才重算这个域。于是五页的文档，PDF 上写 `共 5 页`，XML 里仍是 `1`。**验页脚要看渲染结果，不要看原始 XML**：拿「XML 里应该是 5 页」去查，会在一个完全正确的文档上报错。
+
 `--template custom` 拿 `--prefix` / `--suffix`，并把里面的 **`{page}`** 与 **`{total}`** 按出现顺序展开成 PAGE 与 total 域，所以 `--prefix "{page}/" --suffix " of {total}"` 得到 `1/ of 12`。两个串里都没有占位符时，`custom` 的行为与从前逐字节一致。同一套键在 spec 里同样成立：顶层 `footer_page_numbers`，或者 `section_break` 里的那一个，都接受 `"template": "zh"`，也接受带占位符的 `custom`。
 
 **`docx_template.py apply` 带两条独立的公式通道、两套各自的默认值，命令行上互斥：**
@@ -238,6 +240,8 @@ exit `2` 的承诺是**什么都没写**，所以改完 spec 直接重试，不�
 ### 按版心比例给图片定宽
 
 `image` block 用 `path` 加上 `width_mm`（绝对宽）**或** `width_frac`（当前节正文宽的比例，`0 < f ≤ 1`）之一，绝不同时给——两个都给是 exit `2`、零写盘。`width_frac` 按 `content_width_mm(section)` 折算，所以它跟着纸张与页边距走，而不是写死一个数：A4 且左右各 26 mm 时正文宽 158 mm，于是 `1.0` 是 158.0 mm、`0.5` 是 79.0 mm。越界的值连同区间一起拒收、不做钳制；`0.0` 也拒收，而不是读成「不定宽」——调用方写下的数字，永远不会被悄悄换成别的意思。
+
+`path` 按**当前工作目录**解析，**不是**按 spec 文件所在目录；路径不存在会被当成输入错误当场拒收——exit `2`、消息里带 block 序号、零写盘，而不是留到写文档的过程中炸出一个 `FileNotFoundError` traceback。
 
 ### 让标题从新的一页开始
 
@@ -584,7 +588,7 @@ tests/       pytest 套件 —— 58 个 .py（57 个 test_*.py + _omml.py 辅�
 |---|---|
 | `0` | 成功 |
 | `1` | 预期内的失败 —— marker 没命中、未知或重名的书签、文档里没有你要的东西、运行期异常 |
-| `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传（含 `width_frac` 与 `width_mm`）、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包 |
+| `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传（含 `width_frac` 与 `width_mm`）、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包、`image` 块的 `path` 指向的文件不存在或不是字符串 |
 | `3` | **仅 `docx_mathify`**（以及把它的码透传出来的 `docx_template apply --fix-formulas`）：文档已写出，但至少一条公式没转成 |
 
 用法错误是**拒收，不是修补**：判定发生在任何读写之前，输入文件逐字节不变，消息是 stderr 上的一行 `error: …`，stdout 保持空。
