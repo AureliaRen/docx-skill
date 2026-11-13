@@ -280,6 +280,23 @@ def test_missing_soffice_is_exit_1(docx_file):
     assert "SOFFICE_PATH" in line
 
 
+def test_both_preconditions_missing_names_soffice_first(docx_file):
+    """With neither precondition met, the message names the first blocker.
+
+    LibreOffice runs first -- conversion precedes reading the result back --
+    so its absence is what the user has to fix first and therefore what the
+    single ``error:`` line has to say. Asking for PyMuPDF first named the
+    second blocker instead: on a runner with neither installed the tool
+    answered "no fitz", and the obvious response was to install PyMuPDF and
+    then hit the same wall one step later.
+    """
+    proc = run_cli([str(docx_file), "--lint"],
+                   env={"SOFFICE_PATH": str(docx_file.parent / "nope" / "soffice.exe")})
+    line = assert_refused(proc, 1)
+    assert "SOFFICE_PATH" in line
+    assert "fitz" not in line
+
+
 def test_soffice_override_disables_the_fallback(monkeypatch, tmp_path):
     """With ``SOFFICE_PATH`` set, an unusable value is an error, not a hint."""
     monkeypatch.setenv("SOFFICE_PATH", str(tmp_path / "nope.exe"))

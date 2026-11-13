@@ -780,14 +780,19 @@ def main(argv=None) -> int:
     except InputError as exc:
         return _usage_error(str(exc))
 
-    # ---- preconditions: PyMuPDF first, because every mode needs it (the PDF is
-    # verified through it even when only --pdf was asked for).
-    reason = py_mupdf_reason()
-    if reason:
-        return _cannot_process(reason)
+    # ---- preconditions, in the order the work happens: convert first, then
+    # read the PDF back. The order is load-bearing, not cosmetic. Asking for
+    # PyMuPDF first reported the *second* blocker on a machine that had
+    # neither, so the one line the user got named the wrong thing to install
+    # (a GitHub runner has no LibreOffice and no PyMuPDF; it said "no fitz").
+    # Whichever comes first is the one they must fix first, so it has to be
+    # the one the message names.
     soffice, why = find_soffice()
     if soffice is None:
         return _cannot_process(why or "no LibreOffice found")
+    reason = py_mupdf_reason()
+    if reason:
+        return _cannot_process(reason)
 
     work = Path(tempfile.mkdtemp(prefix="docx-preview-"))
     try:
