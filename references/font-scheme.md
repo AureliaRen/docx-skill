@@ -79,6 +79,54 @@ def set_fonts(rpr, ea):
 它自身不会造成重复，但**调用前仍要 dedupe**——文档可能带多个 `rFonts`，`findall` 只删这一种。
 顺序固定：`dedupe_rpr` → `set_fonts`。
 
+## `styles[]` 命中已存在样式：就地 modify，只改给出的键
+
+`add_styles()`（`scripts/docx_create.py:355`，取样式入口 `_get_or_add_style()` 在 `:340`）现在的语义是**命中即就地改**：
+
+```python
+style, created = _get_or_add_style(doc, s["name"])   # try doc.styles[name] / except KeyError: add_style
+```
+
+| 情况 | 行为 |
+|---|---|
+| 名字命中已存在样式（含内置 `Normal` / `Heading 1`） | 拿到**同一个** `w:style` 元素就地改，`after.element is before.element` |
+| 名字不存在 | `add_style` 新建，行为与从前一致 |
+| 同名条目二次 apply | `styles.xml` 里该 `w:style` 恒 1 个，不累积 |
+
+**「只改给出的键」是硬要求。** `size_pt` 单独给时，`font` / `bold` / `italic` / `base` / `outlineLvl` / 主题字体绑定**逐字保留**——否则 `{"name": "Heading 1", "size_pt": 16}` 会把上文中和出来的黑色冲回主题蓝，那正是 P12 之前反复踩的坑。四个方向都有测试钉住：不给 `bold` / 不给 `base` / 不给 `outline_level` / 不给 `italic`。
+
+**想反悔颜色就显式写 `color`。** 中和层（下一节）跑在 `add_styles` **之前**，所以 spec 的 `color` 仍然赢；`ColorFormat.rgb` 的 setter 内部先 `_remove_color()`，`themeColor` 一并消失——若直接改 `@w:val`，主题属性会继续赢。
+
+**一条 exit 2 路径因此消失**：早先「同名样式已存在」会抛 `ValueError`（在 `_BUILD_ERRORS` 里），现在变成功。这是预期的行为变更，不是缺陷；`ensure_toc_styles` 是 `try/except KeyError` 自兜，从不依赖那次崩溃。
+
+## 内置标题默认是黑的（`docx_create.py` 的中和层）
+
+生成路径上还有一层与字体同源、但更靠前的处理：**`Heading 1`–`Heading 9` / `Title` / `Subtitle`
+在套用任何 `styles[]` 之前先被中和成黑色**（`_neutralise_heading_styles()`，`scripts/docx_create.py:709`，
+在 `main()` 的 `:1919` 调用，位置在 `add_styles` **之前**）。
+
+它做的事，逐项：
+
+| 目标 | 动作 |
+|---|---|
+| `w:color` | 整元素替换成 `w:val="000000"` —— `themeColor` / `themeShade` / `themeTint` 一并消失，不是「再加一个 `w:val`」 |
+| 字符变体 | `Heading1Char` … `Heading9Char`、`TitleChar`、`SubtitleChar` 同样处理 |
+| `Title` 的段落下边框 | `w:pBdr` 上写 `w:color="000000"`；`w:sz`=8、`w:space`=4 **不变** |
+| `Subtitle` | 删 `w:i` 与 `w:iCs`（去斜体）；`Heading 9` 的斜体**保留** |
+| 已显式着色的样式 | 不动，只在报告里记一笔（`explicit`） |
+| 无 `w:rPr` 的样式 | 不凭空造颜色，记 `no_colour` |
+| 中文模板名 | `标题 N` / `标题` / `副标题` 一并匹配；styleId 也匹配，所以本地化拼写不会让中和静默失效 |
+
+**为什么必须先中和 `w:color` 而不是只写 `w:val`**：`CT_Color` 里 `themeColor` 优先级高于 `w:val`，
+留着 `themeColor="accent1"` 再写 `w:val="000000"`，Word 渲染出来仍是主题蓝——XML 层看着改了，
+屏幕上没变，是最典型的假绿灯。
+
+**这不违反「`styles[]` 只改给出的键」**：中和是**默认值**，跑在前面；spec 里给了 `color` 的条目
+照样覆盖（`add_styles` 的 `ColorFormat.rgb` setter 内部会 `_remove_color()`，主题属性一起清掉）。
+所以「想反悔颜色就显式写 `color`」这条通道是真的通的，不是纸面承诺。
+
+**同源的另一个坑：命名一个字面字体时必须摘掉主题字体绑定。** `_set_style_fonts()`（`scripts/docx_create.py:241`）写显式字体前会删 `w:asciiTheme` / `w:hAnsiTheme` / `w:eastAsiaTheme` / `w:cstheme`（`:270` 的循环）——因为 `CT_Fonts` 里主题属性优先于显式同名属性，只写 `w:ascii="黑体"` 会得到「XML 是黑体、Word 渲染主题字体」。这属于 honour `font` 的实现细节，不是改了 spec 没提的键：**没给 `font` 时一行都不动**。
+
 ## 中文排版默认值
 
 `docx_utils` 三组常量，`ascii`/`hAnsi`/`cs` 恒为 TNR，只有 `eastAsia` 不同：`FONT_TNR` →

@@ -215,7 +215,7 @@ features need it — every other script runs on a machine with no Office at all.
 
 ## Use
 
-Every script runs from a shell on its own, and **18 of the 25 CLIs expose an
+Every script runs from a shell on its own, and **19 of the 26 CLIs expose an
 argparse surface** — start with `--help`:
 
 ```bash
@@ -322,24 +322,24 @@ success.
 
 ## Scripts
 
-`scripts/` holds **26 `.py` + 1 `.ps1` = 27 files**, all flat, no sub-package and
+`scripts/` holds **27 `.py` + 1 `.ps1` = 28 files**, all flat, no sub-package and
 no `__init__.py`. The split below follows one definition, and `ci.yml` derives it
 mechanically rather than trusting this prose — two unioned rules,
 `_*`-prefixed **or** no `if __name__ == "__main__"` guard, mean *pure library*:
 
 | Bucket | Count | Test |
 |---|---|---|
-| **CLI** | **25** | carries a `__main__` guard, so it can be run from a shell |
+| **CLI** | **26** | carries a `__main__` guard, so it can be run from a shell |
 | **pure library** | **1** | `_bootstrap.py` — private, imported before argument parsing, never run on its own |
 
-Of those 25 CLIs, **18 expose an argparse surface** (`--help` prints `usage: …`)
+Of those 26 CLIs, **19 expose an argparse surface** (`--help` prints `usage: …`)
 and are tabulated first. The other 7 have a `__main__` but no argparse: six print
 a one-line `… is a library module, import it:` self-description (`docx_pack`,
 `docx_utils`, `encoding`, `linear_to_latex`, `math_omml`, `minidom_compat`) and
 `fix_phasor_dot` runs its self-check. They are imported by bare name, exactly
 like `_bootstrap`. Full flags per command are in [SKILL.md](SKILL.md).
 
-**CLI tools (18 `.py` with argparse)**
+**CLI tools (19 `.py` with argparse)**
 
 | File | What it does |
 |---|---|
@@ -361,8 +361,9 @@ like `_bootstrap`. Full flags per command are in [SKILL.md](SKILL.md).
 | `fix_fonts.py` | Font normalisation across style layer, run layer, and over-sized headings (`--heading-threshold`) |
 | `fix_zoom.py` | Adds the `w:percent` that `<w:zoom>` needs to pass a strict XSD (`--percent`) |
 | `merge_docs.py` | Appends one document to another, keeping styles / numbering / media (`base src out`) |
+| `docx_preview.py` | Renders and lints the layout: `--pdf` / `--pages DIR` (per-page PNG, `--dpi`) / `--lint` (fill ratio, half-empty and blank pages, oversized images, split tables, orphan last lines) / `--json` |
 
-The 27th file is not a `.py`: `pdf_export.ps1` is the PowerShell export path —
+The 28th file is not a `.py`: `pdf_export.ps1` is the PowerShell export path —
 Word COM, `ExportAsFixedFormat(17)`, opened `ReadOnly` (`-DocxPath` /
 `-PdfPath`). See [Exporting to PDF](SKILL.md#exporting-to-pdf-additional-capability).
 
@@ -411,7 +412,7 @@ input.
 ## Layout
 
 ```
-scripts/     flat CLI modules, imported by bare name — 27 files (26 .py + 1 .ps1)
+scripts/     flat CLI modules, imported by bare name — 28 files (27 .py + 1 .ps1)
 tools/       Word COM acceptance helper — word_accept.py, which owns --page-probe
 references/  longer notes loaded on demand
 tests/       pytest suite

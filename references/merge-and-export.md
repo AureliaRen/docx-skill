@@ -103,6 +103,37 @@ $doc.ExportAsFixedFormat($pdfFull, 17)
 的 `$false` = 不保存；**路径必须绝对**。`finally` 里 `Close`/`Quit` 后还要
 `ReleaseComObject($doc)`（`$word` 同理），不释放偶尔留半死 WINWORD。
 
+## 不用 Word 的渲染：`docx_preview.py`
+
+`pdf_export.ps1` 要 Office；只要**看版面**、不需要文本层，就走 `scripts/docx_preview.py`——它调无头 LibreOffice，产出 PDF + 每页 PNG + 版面 lint，一条命令：
+
+```bash
+python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json
+python scripts/docx_preview.py in.docx --pages png/ --dpi 150       # 只看图
+python scripts/docx_preview.py in.docx --lint                        # 只要报告
+```
+
+参数逐字（`--help` 实测）：`--pdf OUT.pdf` / `--pages DIR` / `--dpi DPI`（默认 110）/ `--lint` / `--min-fill RATIO`（默认 0.40）/ `--max-orphan-chars N`（默认 2）/ `--timeout SECONDS`（默认 180）/ `--json` / `--text`（默认）。三者可组合，至少给一个。
+
+lint 的六个字段：`fill_ratio`（逐页墨迹占比）、`sparse_pages`（低于 `--min-fill`）、`blank_pages`（几乎无墨）、`image_over_width`（图宽超版心，A4+26 mm 时阈值 158 mm）、`table_split`（表跨页，**启发式、允许误报**）、`orphan_last`（末行孤字）。
+
+依赖与其余脚本不同：**要 `soffice`**（`PATH` 或标准 LibreOffice 安装位置），PNG 与 lint 还要 **PyMuPDF**。缺任一个是 **exit 1 + 一行 `error:`**（环境干不了，不是参数错）。`fitz` 只在函数内 import，从不在模块顶层——`tests/test_word_accept_xml.py` 有顶层 import 架构断言钉着。
+
+## `soffice` 手工调用必须加 `-Wait`
+
+不用 `docx_preview.py`、自己在 PowerShell 里驱转换器时：
+
+```powershell
+# ✗ 立刻返回：退出码为空，PDF 还没写出来
+Start-Process soffice --headless --convert-to pdf $docx
+# ✓ 等子进程退出
+Start-Process soffice --headless --convert-to pdf $docx -Wait
+# ✓ 或者让 shell 自己等
+& soffice --headless --convert-to pdf $docx
+```
+
+**不加 `-Wait` 的失败形态最恶心**：没有异常、没有非零退出码（`$LASTEXITCODE` 是空的），脚本「成功」跑完，下一行去读一个还不存在的 PDF。`docx_preview.py` 内部走 `subprocess.run`，同步阻塞到子进程退出，所以没有这个问题——这也正是该脚本模块 docstring 里写明这条的原因。
+
 ## PIL 多页 PDF 的正确写法
 
 **不能每页 `save(append=True)` 反复开合**——每次 append 都重写整个文件尾，页数一多就慢，且
