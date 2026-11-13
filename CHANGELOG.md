@@ -33,7 +33,10 @@ re-running an old spec.
   can be flagged. Needs `soffice` on the path, and PyMuPDF for the PNG and lint
   halves; either one missing is exit `1` with a single `error:` line, never a
   traceback, and `fitz` is imported inside a function so importing the module does
-  not require it. This is the file that makes **`scripts/` 27 -> 28** (27 `.py` +
+  not require it. The two checks run in the order the work does - convert, then
+  read the PDF back - so a machine without both is told about `soffice` first;
+  naming PyMuPDF first sent you to install the wrong thing and to hit the same
+  wall one step later. This is the file that makes **`scripts/` 27 -> 28** (27 `.py` +
   1 `.ps1`, 26 CLIs of which 19 carry an argparse surface) - every count in
   `SKILL.md`, `SKILL.zh-CN.md`, `README.md` and `README.zh-CN.md` moves with it.
 - **`table.keep_together`** - ask Word to hold a whole table on one page. Word has
