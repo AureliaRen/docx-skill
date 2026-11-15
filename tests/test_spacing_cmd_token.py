@@ -41,8 +41,10 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import linear_to_latex as L  # noqa: E402
+from _omml import needs_omml  # noqa: E402  (single-source OMML gate)
 
 
 def conv(s: str) -> str:
@@ -99,10 +101,19 @@ def test_fraction_before_a_unit_string_stays_well_formed(
     assert out.count("{") == out.count("}"), out
 
 
+@needs_omml
 @pytest.mark.parametrize("src,_expected,den_value", FRACTION_THEN_UNIT)
 def test_fraction_before_a_unit_string_renders_two_operands(
         src: str, _expected: str, den_value: str) -> None:
-    """The OMML denominator must be the bare number, not ``2},``."""
+    """The OMML denominator must be the bare number, not ``2},``.
+
+    Marked ``needs_omml``: this is the only case in the file that converts all
+    the way to OMML, and the second hop needs ``MML2OMML.XSL`` from a local
+    Office install. Without the mark it passed on the author's machine and
+    failed on all four CI legs -- the "it works here" trap. The *LaTeX* half of
+    the fix is pinned by the unmarked test above, so CI still guards the bug
+    even where this one skips.
+    """
     from math_omml import latex_to_omml_lxml
 
     M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
