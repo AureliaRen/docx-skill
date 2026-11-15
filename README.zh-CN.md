@@ -304,7 +304,7 @@ examples/   示例 spec（basic.json / formulas.json）
 
 ### 长文档笔记（Reference notes）
 
-六篇长文档笔记按需查（都在 `references/`）：
+七篇长文档笔记按需查（都在 `references/`）：
 
 | 笔记 | 什么时候读 |
 |---|---|
@@ -314,6 +314,7 @@ examples/   示例 spec（basic.json / formulas.json）
 | [references/revisions-and-comments.md](references/revisions-and-comments.md) | 批注锚点与修订接受/拒绝的边界 |
 | [references/font-scheme.md](references/font-scheme.md) | 样式层 + run 层字体统一、标题放大阈值的判定 |
 | [references/merge-and-export.md](references/merge-and-export.md) | 两份 docx 合并与 PDF 导出的注意事项 |
+| [references/editing-traps.md](references/editing-traps.md) | 改动跑绿了但文档悄悄错了：`cell.text =` 压平多 run 单元格、野 `vertAlign` 让整行变下标、`inline_shapes` 索引漂移、空 `<w:drawing/>` 让 Word 拒开、WPS/Word 占用报 `PermissionError`、cp936 乱码 |
 
 ## 测试
 

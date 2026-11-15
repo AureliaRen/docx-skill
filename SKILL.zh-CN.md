@@ -72,8 +72,10 @@ pack("unpacked/", "out.docx", original="in.docx")
 | 读正文 / 大纲 / 样式 | `python scripts/docx_read.py in.docx --text` |
 | 抽图片 | `python scripts/docx_read.py in.docx --images DIR` |
 | 看修订 | `python scripts/docx_read.py in.docx --revisions` |
+| 看 run 级格式（写单元格**之前**先读这个） | `python scripts/docx_read.py in.docx --runs` |
 | 查找替换 | `python scripts/docx_edit.py replace in.docx --find A --replace B -o out.docx` |
 | 改表格单元格 | `python scripts/docx_edit.py set-cell in.docx --table 0 --row 1 --col 2 --text X -o out.docx` |
+| 改单元格并**丢弃**其全部格式 | `python scripts/docx_edit.py set-cell in.docx --table 0 --row 1 --col 2 --text X --replace-cell -o out.docx` |
 | 插段落 | `python scripts/docx_edit.py insert in.docx --index 3 --text "..." -o out.docx` |
 | 删段落 | `python scripts/docx_edit.py delete in.docx --index 3 -o out.docx` |
 | 套段落样式 | `python scripts/docx_edit.py style in.docx --index 0 --style "Heading 1" -o out.docx` |
@@ -344,6 +346,29 @@ marker 一个都没命中时 exit `1`，报错里给出实际可搜范围 ——
 
 `linear_to_latex.py` 决定**什么算公式**。它刻意保守，好让正常行文活下来：`[0, 1]`、`f(x, y)`、中文小标题一律不动；`U=IR`、`ΣI=0` 才转。但「认出是一个式子」不等于「需要一个公式对象」——见下面的三阶分流。
 
+### 什么能作为证据（以及分数符号）
+
+一个 span 要自己挣进入场资格。默认要有关系符（`=`、`≈`、`≤`、`±`）或强算子（`√`、`∑`、`∫`、`∂`、`∇`）。有两样豁免，因为它们是**作者自己声明的**，不是我们猜的：
+
+- 显式角标组 —— `S_{甲}`、`m^{2}`；
+- **vulgar fraction 分数符号** —— `½ ¼ ⅓ ⅕ ⅛ ⅐ ↉` 及其余 11 个。
+
+第二条值得单独说，因为这个字符是**隐患**而不是错误。U+00BD 是单个码位，字体把它渲染成小号 `1` + 斜杠 + 下沉 `2`：在一种字体里**看着差不多**、换一种字体就明显不对，于是没有任何一处会报错，问题一直活到打印。19 个 Unicode 分数码位现在全部翻成 `\frac{n}{d}`，而且**单独一个就足以开一个 span** —— `½+1` 没有 `=` 也照样转，`第½章` 里那个孤立的 `½` 也转，两侧的汉字留作文本。
+
+分数符号同时是单位文法的**数值锚点**，这正是两种含义的分界：
+
+```
+½ m/s     → \frac{1}{2}\,\text{m/s}     测量值：「每秒半米」
+0.5 m/s   → 0.5\,\text{m/s}             同一个量，同一种排版
+v=m/s     → v=\frac{m}{s}               公式：m 除以 s
+m/s       → \,\text{m/s}                裸的单位串
+```
+
+这一列背后的判据**不是**「两边都像单位」—— `m/s` 与 `v=m/s` 在这条测试上完全一样。判据是锚点：左边有数值（`0.5`、`10⁻⁷`、`½`、右括号或幂次）时，单位串是**测量值**。所以 `½ m/s` 与 `0.5 m/s` 走单位路径，`v=m/s` 不走、仍作分式。
+
+看中间产物时有一条要知道：间距命令（`\,` `\;` `\:` `\!` `\ `）是**一个 token**，不是「反斜杠 + 标点」。必须是 —— 否则分式的操作数扫描会把那个反斜杠并进分母，花括号提前收口：`1/2 m/s` 会出成 `\frac{1}{2\},\text{m/s}`，分母渲染成字面的 `2},`。这是本轮之前一直存在的 bug；触发形态是「分式后紧跟单位串」，而那正是物理讲义的大半篇幅。
+
+
 公式链是三步，缺一步就是半个公式：
 
 ```
@@ -430,6 +455,46 @@ def _add_mixed(p, text):
 ```
 
 自检：`python scripts/fix_phasor_dot.py`。
+
+## 改表格单元格而不毁掉它的格式
+
+`set-cell` 塞进单元格的是**一段平字符串**。模板里的格很少是平的：一个格里常有
+好几个 run，而要命的那点格式往往只在其中一个 run 上。像这样一行
+
+```
+v₀ = 12.5 m/s      ← 三个 run："v" 常规、"0" 下标、"= 12.5 m/s" 加粗
+```
+
+绝不能用 `cell.text = ...` 覆盖。那个 setter 的文档原话是「Any existing content
+or revisions are replaced」：它清空格子、加一个段落、加一个 run，然后**把所有
+run 级属性全丢掉**——段落对齐、字号、字体、`vertAlign`，一概不留。更糟的是它
+干得悄无声息：`exit 0`、零警告，等你用 Word 打开才发现整行变成了下标。
+
+所以 `set-cell` 默认走 `mode: "preserve"`，并且**如实报告它动了什么**：
+
+| 情形 | 行为 | `mode` |
+|---|---|---|
+| 格里只有 1 个可写 run | 替换该 run 的文字，`rPr` 原样不动 | `preserve` |
+| 格里有多个 run | 文字写进**第一个**可写 run，其余 run 被移除；该 run 若带 `vertAlign` 会被剥掉，免得新文字继承一个野下标 | `preserve` + `warnings` |
+| 传 `--replace-cell` | 旧行为，一模一样：清空、一个段落、一个 run、零格式 | `replace-cell` |
+
+**不可写的 run** 指域（`w:fldChar` / `w:instrText`）、`drawing`、图片——这些一律
+保留而不覆盖，因为换掉产生域结果的那个 run，域就废了。
+
+写之前先把格子读清楚：
+
+```bash
+python scripts/docx_read.py in.docx --runs
+```
+
+它会按段落打印 `mixed_format` 标志，以及每个 run 的 `text` / `vert_align` /
+`bold` / `italic` / `size_pt` / `font` / `is_field` / `is_drawing`，并带一个形如
+`table[0].r0.c0` 的 `path` 供你定位。`mixed_format: true` 的意思是「一段平字符串
+表达不了这个格子」——要么明知后果地传 `--replace-cell`，要么用 `python-docx`
+深拷贝要保留的那个 run 再重写（姿势见 `references/editing-traps.md`）。
+
+凡这次没能保住的，都会在 stderr 打一行 `warning:`，同时进 JSON 的 `warnings`
+数组。**`exit 0` 不等于格子出来跟原来一样。**
 
 ## 表格几何
 
@@ -571,16 +636,55 @@ python scripts/docx_preview.py in.docx --lint --json
 | `references/font-scheme.md` | 中英文混排字体规范、`w:rPr` 顺序与去重、`--heading-threshold` 语义、标题为什么默认是黑的以及怎么有意给它上色 |
 | `references/merge-and-export.md` | 合并后版心/编号/图片出问题、Word COM 导出细节、PIL 多页 PDF 写法、手工驱 `soffice` 的 `-Wait` 与 `docx_preview.py` |
 | `references/revisions-and-comments.md` | 批注与修订的 OOXML 表示与命令行语义 |
+| `references/editing-traps.md` | 改既有文档结果悄悄错了：`cell.text =` 把多 run 单元格压平、野 `vertAlign` 让整行变下标、`inline_shapes` 索引漂移、空 `drawing` 让 Word 拒开、WPS/Word 占用报 `PermissionError`、控制台 cp936 乱码 |
 | `references/toc.md` | 写静态目录：两遍法（先 `page-probe` 量页码、再写条目）、制表位与点引线、全套坑表、五种页码页脚模板（`zh` / `custom` 占位符） |
 
 ## 目录结构
 
 ```
 scripts/     平铺，按裸模块名 import —— 27 个 .py + 1 个 .ps1 = 28 个文件（26 个 CLI，1 个纯库）
-references/  较长的做法笔记，按需加载 —— 6 篇
+references/  较长的做法笔记，按需加载 —— 7 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 58 个 .py（57 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 64 个 .py（63 个 test_*.py + _omml.py 辅助）
 ```
+
+## 写到哪儿去，以及有什么保护
+
+不同脚本的落点不一样，而这件事直接决定「写错一次」会不会把原件搭进去。
+
+**`-o` 默认覆盖输入。** 所有编辑类 CLI 都收 `-o` / `--output`，不给就等于
+「写回你给我的那个文件」：`docx_edit`（八个子命令全收）、`docx_section`、
+`docx_crossref`、`docx_toc`、`docx_comments`、`docx_revisions`。help 文本自己写
+着 `output path (default: overwrite input)` 或 `(default: overwrite)`。这也正是
+「人可能在 Word / WPS 里开着这个文件」时必须显式传 `-o` 的原因——文件被占用会
+报 `PermissionError`（见 [`references/editing-traps.md`](references/editing-traps.md)）。
+
+有两个写盘脚本的输出来自**位置参数**、不带默认值——`docx_create`
+（`spec.json out.docx`）与 `merge_docs`（`out.docx`）。理由很直接：一个「漏写参数就
+覆盖掉别的东西」的写文件命令，永远不是你想要的。两者都直接序列化到那个路径，
+都不保留被覆盖内容的副本。
+
+**「原子重写」和「留了备份」不是同一个保证。**
+
+| 脚本 | 机制 | 留 `.bak` 吗 |
+|---|---|---|
+| `docx_edit`、`docx_section`、`docx_crossref`、`docx_toc`、`docx_comments`、`docx_revisions` | 直接 `doc.save(out)`，python-docx 序列化到目标 | 不留 |
+| `docx_template apply --to`、`fix_fonts`、`fix_zoom` | 临时文件 → `shutil.move` / `Path.replace`，中断时原件逐字节不动 | `apply --to` 会写 `<file>.bak`；`fix_fonts` / `fix_zoom` **不写** |
+| `docx_mathify --inplace` | `doc.save()` 之后原件被改名成 `<名>.bak.docx` | 会，`.bak.docx` |
+| `merge_docs` | 合并结果在内存里拼好，直接写到位置参数 `out` | 不留 |
+
+`fix_zoom` 是原子写那一组里的例外：它**收 `-o`**（默认「就地打补丁」），所以能把
+结果写到别处——但换文件依旧走临时文件 + 替换，且照样不留输入副本。`fix_fonts`
+**完全没收输出参数**：你给它哪几个文件，它就改哪几个。两者都**崩溃安全**（换文件
+是原子的）但**不误操作安全**——参数写错照样得到一个被改写、且没有第二份的文件，
+所以文档里那句「原件要紧就自己先复制一份」不是客套。
+
+`apply --to` 与 `--inplace` 的 `.bak` 只有一层——跑两次不会多出 `.bak.1`，而是把
+上一次的备份盖掉。
+
+**解包目录是另一种目标。** `table_width.py` 与 `insert_formula.py` 收的是解出来
+的**目录**而不是 `.docx`，直接在 XML 分片上改，改完自己打回包。把 `.docx` 递给
+它们是用法错误，不会被悄悄当成转换。见[在解包目录上工作](#在解包目录上工作)。
 
 ## 退出码
 
@@ -613,3 +717,5 @@ tests/       pytest 套件 —— 58 个 .py（57 个 test_*.py + _omml.py 辅�
 - 所有脚本都能 `python -X utf8` 直接跑；Windows 上 stdout 由 `_bootstrap` 切 UTF-8，不要再手写 reconfigure。
 - 就地改写前先备份。`docx_mathify --inplace` 会写 `<名>.bak.docx`，`docx_template.py apply --to` 不带 `-o` 时写 `<文件>.bak`；`fix_fonts.py`、`fix_zoom.py`、`merge_docs.py` 不留副本，原件重要就自己先复制。
 - 需要 node 的只有 `docx_template.py apply -o`（docx-js 骨架）；断链时用 `apply --to`。
+- **绝不要用 `cell.text =` 往模板单元格里写。** 它会清空单元格并丢掉全部 run 级属性。用 `docx_edit.py set-cell`（默认 `preserve`）；格子可能不止一个 run 时，先读 `docx_read.py --runs`。
+- **`exit 0` 不等于文档是对的。** 输出要读回来——填完模板读 `docx_read.py --runs`，交付前跑 `docx_validate.py`——并且至少用真渲染器打开一次。P13 有四种静默损坏是从全绿的一跑里溜过去的，见 `references/editing-traps.md`。

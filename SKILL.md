@@ -107,8 +107,10 @@ anything is written. The refused shapes, each one exercised by the test suite:
 | Read text / outline / styles | `python scripts/docx_read.py in.docx --text` |
 | Extract images | `python scripts/docx_read.py in.docx --images DIR` |
 | Inspect tracked changes | `python scripts/docx_read.py in.docx --revisions` |
+| Inspect run formatting (before writing into a cell) | `python scripts/docx_read.py in.docx --runs` |
 | Replace text | `python scripts/docx_edit.py replace in.docx --find A --replace B -o out.docx` |
 | Set a table cell | `python scripts/docx_edit.py set-cell in.docx --table 0 --row 1 --col 2 --text X -o out.docx` |
+| Set a cell, dropping all its formatting | `python scripts/docx_edit.py set-cell in.docx --table 0 --row 1 --col 2 --text X --replace-cell -o out.docx` |
 | Insert a paragraph | `python scripts/docx_edit.py insert in.docx --index 3 --text "..." -o out.docx` |
 | Delete a paragraph | `python scripts/docx_edit.py delete in.docx --index 3 -o out.docx` |
 | Apply a paragraph style | `python scripts/docx_edit.py style in.docx --index 0 --style "Heading 1" -o out.docx` |
@@ -583,6 +585,48 @@ conservative so ordinary prose survives: `[0, 1]`, `f(x, y)`, and CJK headings
 are left alone; `U=IR` and `ΣI=0` become equations. Recognising a span is not
 the same as needing an equation *object* — see the tiers below.
 
+### What counts as evidence (and the fraction characters)
+
+A span has to earn its way in. The default demand is a relation operator
+(`=`, `≈`, `≤`, `±`) or a strong operator (`√`, `∑`, `∫`, `∂`, `∇`). Two things
+are exempt because they are the author's own declaration rather than our guess:
+
+- an explicit sub/superscript group — `S_{甲}`, `m^{2}`;
+- **a vulgar fraction character** — `½ ¼ ⅓ ⅕ ⅛ ⅐ ↉` and the other eleven.
+
+The second one is worth spelling out, because the character is a hazard rather
+than an error. U+00BD is a single code point that fonts render as a small `1`,
+a slash and a lowered `2`: it looks *nearly* right in one font and wrong in
+every other, so nothing gets reported and the problem surfaces at print. All
+nineteen Unicode fraction code points translate to `\frac{n}{d}`, and one of
+them alone is enough to open a span — `½+1` converts even though it contains no
+`=`, and so does a lone `½` between Chinese characters (`第½章`, with the
+framing left as text).
+
+A fraction character is also a **value anchor** for the unit grammar, which is
+what keeps the two meanings apart:
+
+```
+½ m/s     → \frac{1}{2}\,\text{m/s}     measurement: "half a metre per second"
+0.5 m/s   → 0.5\,\text{m/s}             the same quantity, same layout
+v=m/s     → v=\frac{m}{s}               a formula: m divided by s
+m/s       → \,\text{m/s}                a bare unit string
+```
+
+The rule behind that column is not "both sides look like units" — `m/s` and
+`v=m/s` are identical on that test. It is an anchor check: a unit string is a
+*measurement* when a number (`0.5`, `10⁻⁷`, `½`, a closing paren or a power)
+sits to its left. So `½ m/s` and `0.5 m/s` take the unit path, while `v=m/s`
+does not and stays a fraction.
+
+One consequence worth knowing when you read the intermediate output: a spacing
+command (`\,` `\;` `\:` `\!` `\ `) is **one token**, not a backslash plus
+punctuation. It has to be, or the operand scan of a fraction pulls the backslash
+into the denominator and the brace closes early — `1/2 m/s` would come out as
+`\frac{1}{2\},\text{m/s}`, whose denominator renders as the literal `2},`. That
+was a live bug until this round; the shape that triggers it is "a fraction
+followed by a unit string", which is most of a physics hand-out.
+
 The chain has three steps, and skipping one leaves half a formula:
 
 ```
@@ -710,6 +754,53 @@ Measured baselines:
 ```
 
 Self-check: `python scripts/fix_phasor_dot.py`.
+
+## Editing a table cell without destroying its formatting
+
+`set-cell` writes a *flat string* into a cell. Templates are rarely flat: one
+cell often holds several runs, and only one of them carries the formatting that
+makes the line readable. A template row like
+
+```
+v₀ = 12.5 m/s      ← three runs: "v" plain, "0" subscript, "= 12.5 m/s" bold
+```
+
+must not be overwritten with `cell.text = ...`. That setter is documented as
+"Any existing content or revisions are replaced": it clears the cell, adds one
+paragraph, adds one run, and drops every run-level property — paragraph
+alignment, size, font, `vertAlign`, everything. Worse, it does so silently,
+with `exit 0` and no warning, and the loss only shows up when a human opens the
+file.
+
+So `set-cell` defaults to `mode: "preserve"` and reports what it had to do:
+
+| Situation | What happens | `mode` |
+|---|---|---|
+| Cell holds exactly one writable run | The run's text is replaced; its `rPr` is untouched | `preserve` |
+| Cell holds several runs | The first writable run receives the text; the rest are **removed**; `vertAlign` is stripped from that run when it carries one, so the new text does not inherit a stray subscript | `preserve` + `warnings` |
+| `--replace-cell` | Old behaviour, exactly: clear, one paragraph, one run, no formatting | `replace-cell` |
+
+A run is *not writable* when it is a field (`w:fldChar` / `w:instrText`), a
+drawing, or a picture — those are left alone rather than clobbered, because
+replacing a field run breaks the field result it produced.
+
+Read the cell before you write into it:
+
+```bash
+python scripts/docx_read.py in.docx --runs
+```
+
+which prints, per paragraph, a `mixed_format` flag and one row per run with
+`text` / `vert_align` / `bold` / `italic` / `size_pt` / `font` / `is_field` /
+`is_drawing`, plus a `path` such as `table[0].r0.c0` so you can find the cell in
+the output. `mixed_format: true` means "a flat string cannot express this cell"
+— either pass `--replace-cell` on purpose, or rewrite the cell contents through
+`python-docx` with a deep copy of the run you want to keep (see
+`references/editing-traps.md`).
+
+Anything the call could not keep is reported on stderr as a `warning:` line and
+in the JSON `warnings` array; `exit 0` alone does not mean the cell came out
+identical.
 
 ## Table geometry
 
@@ -963,16 +1054,61 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 | `references/font-scheme.md` | mixed CJK/Latin font conventions, `w:rPr` ordering and dedupe, what `--heading-threshold` means, why Heading/Title/Subtitle come out black and how to colour one deliberately |
 | `references/merge-and-export.md` | after merging: page area / numbering / images wrong; Word COM export details; multi-page PDF via PIL; driving `soffice` by hand (`-Wait`, `docx_preview.py`) |
 | `references/revisions-and-comments.md` | OOXML representation of comments and tracked changes, and the CLI semantics |
+| `references/editing-traps.md` | editing an existing document and the result came out silently wrong: `cell.text =` flattening a multi-run cell, a stray `vertAlign` subscripts a whole line, `inline_shapes` index drift, `empty-drawing` that Word refuses to open, `PermissionError` from an open WPS/Word file, cp936 mojibake in console output |
 | `references/toc.md` | building a static TOC: the two-pass recipe (`--page-probe` first, then write entries), tab stops and dot leaders, the full trap list, the five page-number footer templates (`zh` / `custom` placeholders) |
 
 ## Layout
 
 ```
 scripts/     flat, imported by bare module name — 27 .py + 1 .ps1 = 28 files (26 CLIs, 1 pure library)
-references/  longer how-to notes, loaded on demand — 6 files
+references/  longer how-to notes, loaded on demand — 7 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 58 .py (57 test_*.py + _omml.py helper)
+tests/       pytest suite — 64 .py (63 test_*.py + _omml.py helper)
 ```
+
+## Where a write lands, and what protects it
+
+Three different things are true of different scripts, and the difference matters
+because it decides whether a mistake costs you the original.
+
+**`-o` defaults to overwriting the input.** Every editing CLI takes `-o` /
+`--output`, and leaving it off means "write back over the file you gave me":
+`docx_edit` (all eight subcommands), `docx_section`, `docx_crossref`,
+`docx_toc`, `docx_comments`, `docx_revisions`. The help text says so — `output
+path (default: overwrite input)` or `(default: overwrite)` — and it is the
+reason to pass `-o` explicitly whenever a human may have the file open in Word
+or WPS (see [`references/editing-traps.md`](references/editing-traps.md)).
+
+Two writers take the output as a **positional** argument with no default —
+`docx_create` (`spec.json out.docx`) and `merge_docs` (`out.docx`) — because a
+document that overwrites something by omission is never what you wanted. Both
+serialise straight to that path; neither keeps a copy of anything it replaced.
+
+**Rewriting is atomic or backed up — and the two are not the same guarantee.**
+
+| Script | Mechanism | Leaves a `.bak`? |
+|---|---|---|
+| `docx_edit`, `docx_section`, `docx_crossref`, `docx_toc`, `docx_comments`, `docx_revisions` | `doc.save(out)` directly — python-docx serialises over the target | no |
+| `docx_template apply --to`, `fix_fonts`, `fix_zoom` | temp file → `shutil.move` / `Path.replace`, so an interrupted run leaves the original byte-intact | `apply --to` writes `<file>.bak`; `fix_fonts` / `fix_zoom` **do not** |
+| `docx_mathify --inplace` | `doc.save()` then the original is renamed to `<name>.bak.docx` | yes, `.bak.docx` |
+| `merge_docs` | builds the merged package in memory and writes it straight to the positional `out` | no |
+
+`fix_zoom` is the odd one among the atomic writers: it takes `-o` (default
+"patch in place"), so you can send the result somewhere else — but the swap is
+still temp-file-then-replace, and it still keeps no copy of the input.
+`fix_fonts` takes **no** output argument at all: it rewrites each file you name.
+Both are crash-safe (the swap is atomic) but not mistake-safe — a wrong flag
+still ends with a rewritten file and no second copy, which is why the docs say
+to copy the file yourself when the original matters.
+
+The `.bak` from `apply --to` and `--inplace` is a one-deep backup — running
+twice does not produce `.bak.1`, it overwrites the earlier backup.
+
+**An unpacked directory is a different target.** `table_width.py` and
+`insert_formula.py` take an extracted directory, not a `.docx`, and edit the XML
+parts in place; you repack afterwards. Passing one of them a `.docx` is a usage
+error, not a silent conversion. See [Working on an unpacked
+document](#working-on-an-unpacked-document).
 
 ## Exit codes
 
@@ -1032,3 +1168,12 @@ has a problem" is `docx_validate`'s job and exits `1` instead.
   so copy the file yourself when the original matters.
 - Only `docx_template.py apply -o` needs node (docx-js skeleton). When the chain
   is broken, use `apply --to` instead.
+- **Never write into a template cell through `cell.text =`.** It clears the cell
+  and drops every run-level property. Use `docx_edit.py set-cell` (default
+  `preserve`), and read `docx_read.py --runs` first when the cell may hold more
+  than one run.
+- **`exit 0` is not evidence the document is right.** Read the output back —
+  `docx_read.py --runs` for a filled template, `docx_validate.py` before
+  handing anything over — and open it in a real renderer at least once. Four
+  separate silent-damage modes got through a green run in P13; see
+  `references/editing-traps.md`.

@@ -54,9 +54,32 @@ SYMBOL = {
     "\u0394": r"\Delta", "\u03a9": r"\Omega",
     "\u2032": "'", "\u2033": "''", "\u2034": "'''", "\u02dc": r"\sim",
     "\u2225": r"\|", "\u2016": r"\|", "\u00b0": r"^{\circ}",
-    "\u00bd": r"\frac{1}{2}", "\u00bc": r"\frac{1}{4}", "\u00be": r"\frac{3}{4}",
-    "\u2153": r"\frac{1}{3}", "\u2154": r"\frac{2}{3}",
     "\u2009": r"\,", "\u2005": r"\,", "\u00a0": "~",
+}
+
+# Vulgar fraction（U+00BC–U+00BE、U+2150–U+215E 与 U+2189）→ `\frac{n}{d}`。
+#
+# 为什么不并进 SYMBOL：SYMBOL 的值是「一个符号替一个命令」，而分数符展开成
+# **结构性** `\frac{}{}`。这个区别有两个实际后果，都不该由 SYMBOL 承担：
+#   1. `_escape_unicode` 给 SYMBOL 里的字母命令补 SP 哨兵（`\cdot ` 那样），
+#      但 `\frac{1}{2}` 后面补哨兵会在分子分母都闭合之后多出一个空格；分数符
+#      必须按「命令已自带花括号、不需要哨兵」处理。
+#   2. `find_math_spans` 要能问「这段里有没有分数符」——分数符自身就是数学
+#      记号的充分证据（与 `√`/`∑` 同级），不该靠关系符论证。独立成表后这条
+#      判定直接查表，不必反查 SYMBOL 的键再猜哪些是分数。
+#
+# 表里 19 项都是 Unicode 正式命名的 VULGAR FRACTION，值就是一目了然的 n/d。
+# 其中 U+2189（↉）是 `VULGAR FRACTION ZERO THIRDS`，值 0/3 —— 看着怪，但
+# `\frac{0}{3}` 就是它的忠实写法，不能省：漏掉它，这个字符就会像 U+2150–215E
+# 那样被静默漏成正文里的野生字符。
+VULGAR_FRAC = {
+    "\u00bc": (1, 4), "\u00bd": (1, 2), "\u00be": (3, 4),
+    "\u2150": (1, 7), "\u2151": (1, 9), "\u2152": (1, 10),
+    "\u2153": (1, 3), "\u2154": (2, 3),
+    "\u2155": (1, 5), "\u2156": (2, 5), "\u2157": (3, 5), "\u2158": (4, 5),
+    "\u2159": (1, 6), "\u215a": (5, 6),
+    "\u215b": (1, 8), "\u215c": (3, 8), "\u215d": (5, 8), "\u215e": (7, 8),
+    "\u2189": (0, 3),
 }
 COMBINING = {"\u0307": "dot", "\u0308": "ddot", "\u0304": "bar",
              "\u0305": "bar", "\u20d7": "vec", "\u0302": "hat"}
@@ -90,8 +113,8 @@ MATH_EXTRA = (set("+-−–×÷·⋅/|()[]{}^_ .,*'!;")
               | OP_CHARS | STRONG
               | {"\\", "&"}                       # LaTeX 环境写法：\begin{...}、& 对齐符
               | set(_SUPER) | set(_SUB)
-              | {"\u00b0", "\u00b7", "\u22c5", "\u2032", "\u2033", "\u2034",
-                 "\u00bd", "\u00bc", "\u00be", "\u2153", "\u2154"})
+              | set(VULGAR_FRAC)                  # 全部 19 个分数符，不再只收 5 个
+              | {"\u00b0", "\u00b7", "\u22c5", "\u2032", "\u2033", "\u2034"})
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 CJK_PUNCT = set("，。；：、！？（）【】「」『』《》〈〉…—～")
@@ -391,6 +414,14 @@ def find_math_spans(atoms: list[dict]) -> list[tuple[int, int]]:
         has_op = any(c in OP_CHARS for c in text)
         has_strong = any(c in STRONG for c in text)
         alnum = sum(1 for c in text if c.isalnum() or c in GREEK)
+        # 分数符（½ ⅓ ⅕ …）本身就是数学记号的**充分**证据，与 √/∑/∫ 同级，
+        # 不该再靠关系符来论证：
+        #   · 它是作者显式打出的数学字形，不是我们把正文猜成公式；
+        #   · 原字形在很多字体里就是「1/2」连写体（U+00BD 的字形），
+        #     留在正文里既不像 ½ 也不像竖排分式，是最差的一种呈现；
+        #   · 与 explicit_script 同一个道理 —— 作者的主动标注优先于我们的推断。
+        # 因此它同时替代 gate1（has_op/has_strong）与 gate2（_BOTH_SIDES）。
+        has_vulgar = any(c in VULGAR_FRAC for c in text)
         # 显式角标标注（`S_{甲}` / `m^{2}`）本身就是「这是公式」的充分信号：
         # 它是作者的主动声明，不是我们的猜测 —— 所以它不必再靠关系符论证。
         # 这是「手动编辑等价物」路线能落地的一环，也是自动猜路线永远做不到的。
@@ -404,11 +435,13 @@ def find_math_spans(atoms: list[dict]) -> list[tuple[int, int]]:
         #   合法的 `S_{甲}` 组已闭合，`_open_script_group_len` 返回 -1，不受影响。
         script_group_balanced = _open_script_group_len(text) == -1
         ok = (
-            len(text) >= 2
+            # 单个 `½` 也是合法分式（正是最容易被当成字形连字的那种），
+            # 所以分数符不受「至少两字符」这条下限约束。
+            (len(text) >= 2 or has_vulgar)
             and not _looks_like_date(text)
             and alnum >= 1
-            and (has_op or has_strong or explicit_script)
-            and (bool(_BOTH_SIDES.search(text)) or explicit_script)
+            and (has_op or has_strong or explicit_script or has_vulgar)
+            and (bool(_BOTH_SIDES.search(text)) or explicit_script or has_vulgar)
             and script_group_balanced
             # 纯数字 + 单位（如 6V、2Ω）不转
             and not re.fullmatch(r"[\d.]+\s*[A-Za-zΩμ]+", text)
@@ -488,6 +521,11 @@ def _escape_unicode(s: str) -> str:
             out.append("_{" + _SUB[ch] + "}")       # 字面下标 ₁ → _{1}
         elif ch in GREEK:
             out.append(GREEK[ch] + SP)
+        elif ch in VULGAR_FRAC:
+            # 结构性输出：`\frac{n}{d}` 的花括号自带边界，不能再补 SP 哨兵
+            # （补了会在分母闭合后多出一个空格，落进下一个 token）。
+            num, den = VULGAR_FRAC[ch]
+            out.append(r"\frac{" + str(num) + "}{" + str(den) + "}")
         elif ch in SYMBOL:
             rep = SYMBOL[ch]
             out.append(rep + (SP if _LETTER_CMD.match(rep) else ""))
@@ -598,6 +636,9 @@ _CHEM_FORMULA_RE = re.compile(
 # 所以这两个命令名也必须在分词时被当成 op，否则修不到实际代码路径。
 _OP_SPLIT = set("+=<>±∓,;|/÷×·⋅*")
 _OP_CMD_NAMES = {"\\times", "\\cdot", "\\ast", "\\div"}   # 乘除法的命令形态
+# 双字符间距命令的第二字符：`\,` `\;` `\:` `\!` `\ `。它们不携带字母，
+# `_CMD_RE` 认不出，必须在 `_split_atoms` 里单独收成一个 space token。
+_SPACING_TAILS = set(",;:! ")
 
 
 def _split_atoms(s: str) -> list[tuple[str, str]]:
@@ -622,6 +663,18 @@ def _split_atoms(s: str) -> list[tuple[str, str]]:
         if ch == "\\":
             m = _CMD_RE.match(s, i)
             if not m:
+                # 间距命令（`\,` `\;` `\:` `\!` `\ `）是**两个字符**，而 _CMD_RE
+                # 只认 `\[A-Za-z]+`，匹配不到 —— 曾经这里落进「反斜杠当一个
+                # atom」的分支，于是 `\,` 被拆成 atom `\` + op `,`：
+                #   `1/2 m/s` → unitify 产出 `1/2\,\text{m/s}`
+                #   `_fracify` 把 `\` 当邻接因子并进分母 → `\frac{1}{2\},\text{m/s}`
+                # 分母里那个 `\` 让花括号提前收口，OMML 出来的分母是字面的
+                # `2},` —— 公式看着像分式，内容是错的。间距命令必须整体成一个
+                # atom，且不能被当成邻接因子的一部分。
+                if i + 1 < n and s[i + 1] in _SPACING_TAILS:
+                    out.append(("space", s[i:i + 2]))
+                    i += 2
+                    continue
                 out.append(("atom", ch))
                 i += 1
                 continue
@@ -907,8 +960,13 @@ def _parse_unit_group(s: str, i: int, sep: str = _UNIT_SEP) -> tuple[int, str, b
 # 第 1 组捕获「数字与量纲串之间的空白」——这段空白要一起吃掉，
 # 否则 `8.31 J/(mol·K)` 会留下一个旧实现没有的空格（既有用例锁的是无空格形态）。
 # `_SUPER_DIGITS` 已在文件上方（`POW_UNIT_RE` 旁）从 `_SUPER` 派生，两处共用一份。
+# 分数符（½ ⅓ …）同样是**数值锚点**：`½ m/s` 与 `0.5 m/s` 是同一类测量值，
+# 左边那半个分数就是它的数值。不收这一项的话 `½ m/s` 会因为没有锚点而退化成
+# 分式（`\frac{1}{2} \frac{m}{s}`），与 `0.5 m/s` 的 `0.5\,\text{m/s}` 走成
+# 两种排版 —— 同一份手册里相邻两页不一致，比两种都错更难查。
 _ANCHOR_RE = re.compile(
-    r"(?:\)|\^\{\s*[-\u2212+]?\d+\s*\}|[" + re.escape(_SUPER_DIGITS) + r"]+|\d)(\s*)$")
+    r"(?:\)|\^\{\s*[-\u2212+]?\d+\s*\}|[" + re.escape(_SUPER_DIGITS) + r"]+"
+    r"|[" + "".join(VULGAR_FRAC) + r"]|\d)(\s*)$")
 # 量纲串尾部不能紧跟这些字符（否则只是更长 token 的一段）
 _TAIL_BLOCK_RE = re.compile(r"[_^{A-Za-z0-9]")
 # 无数字锚点时，左边界不许是这些字符（`E = V/m` 的 `=`、`p=F/A` 的 `=` 都在内）
