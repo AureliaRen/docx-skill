@@ -798,19 +798,54 @@ def build_static_toc(doc, *, levels=DEFAULT_LEVELS, pages=None, title=None,
 # also a shell-sized task and deserves a shell-sized entry point: without one,
 # the only way in is a one-liner that has to import the module by hand.
 
-def _levels_arg(text):
-    """"1,2,3" -> (1, 2, 3); also accepts "1-3"."""
+def _levels_arg(text, *, what="--levels", minimum=1, maximum=None):
+    """"1,2,3" -> (1, 2, 3); also accepts "1-3".
+
+    Shared by ``--levels`` and ``--indent-chars`` (``0,2,4`` and ``0-4`` have to
+    keep working), so the accepted *range* is a parameter: ``0`` is a legal
+    indent and not a legal outline level.
+
+    Every rejection raises ``ValueError`` with the offending token quoted, and
+    ``main`` turns that into one ``error:`` line and exit 2 — **never a
+    traceback**.  Two shapes are rejected that used to pass silently or crash:
+
+    * a non-numeric value (``--indent-chars a,b,c``) — ``int('a')`` used to
+      travel all the way out of ``main`` as a raw ``ValueError``;
+    * a value below ``minimum`` (``--levels 0``) — that selected no heading and
+      still exited 0 with an empty TOC, i.e. a "successful" empty document.
+
+    Clamping is deliberately not used anywhere here: silently writing a TOC
+    nobody asked for is exactly the failure this function exists to prevent.
+    """
     out = []
     for part in str(text).replace(" ", "").split(","):
         if not part:
             continue
-        if "-" in part:
-            lo, _, hi = part.partition("-")
-            out.extend(range(int(lo), int(hi) + 1))
-        else:
-            out.append(int(part))
+        try:
+            if "-" in part:
+                lo, _, hi = part.partition("-")
+                out.extend(range(int(lo), int(hi) + 1))
+            else:
+                out.append(int(part))
+        except ValueError:
+            raise ValueError(
+                "%s %r: %r is not a whole number (expected something like "
+                "1,2,3 or 1-3)" % (what, text, part)) from None
     if not out:
-        raise ValueError("no levels given")
+        raise ValueError("%s %r: no values given" % (what, text))
+    below = [v for v in out if v < minimum]
+    if below:
+        raise ValueError(
+            "%s %r: %d is below the minimum of %d (%s)"
+            % (what, text, below[0], minimum,
+               "outline levels start at 1" if what == "--levels"
+               else "an indent cannot be negative"))
+    if maximum is not None:
+        above = [v for v in out if v > maximum]
+        if above:
+            raise ValueError(
+                "%s %r: %d is out of range; outline levels are %d-%d"
+                % (what, text, above[0], minimum, maximum))
     return tuple(out)
 
 
@@ -859,7 +894,25 @@ def main(argv=None) -> int:
                     help="report what would be written, save nothing")
     args = ap.parse_args(argv)
 
-    levels = _levels_arg(args.levels)
+    # Argument values are judged before anything is opened, the same way
+    # ``argparse`` judges a bad ``--insert-at``: a usage error must not depend on
+    # the input file being readable, and it must not leave a half-written output
+    # behind.  ``_levels_arg`` raises ``ValueError`` with the offending token
+    # quoted; turning it into the standard one-line ``error:`` + exit 2 here is
+    # what keeps a typo from surfacing as a Python traceback.
+    #
+    # ``--levels`` is bounded to 1-9 (Word has nine outline levels, and ``0``
+    # selects no heading at all — that used to exit 0 and write an empty TOC).
+    # ``--indent-chars`` shares the parser but not the floor: ``0`` is a legal
+    # indent, so ``0,2,4`` keeps working.
+    try:
+        levels = _levels_arg(args.levels, what="--levels",
+                             minimum=1, maximum=9)
+        indent_chars = _levels_arg(args.indent_chars, what="--indent-chars",
+                                   minimum=0)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     pages = _pages_arg(args.pages) if args.pages else None
 
     # The path is judged before the package is opened, and long before
@@ -904,7 +957,7 @@ def main(argv=None) -> int:
             pages=pages,
             title=args.title,
             insert_at=args.insert_at,
-            indent_chars=_levels_arg(args.indent_chars),
+            indent_chars=indent_chars,
             section_index=args.section_index,
             adopt_unmarked=args.adopt_unmarked,
         )

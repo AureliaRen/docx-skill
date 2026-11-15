@@ -5,6 +5,9 @@
 Usage:
   docx_read.py file.docx --text        # full text incl. tables + headers/footers
   docx_read.py file.docx --structure   # JSON outline (headings, tables, counts)
+  docx_read.py file.docx --blocks      # ordered body stream (paragraphs+tables)
+  docx_read.py file.docx --runs        # per-run inventory: sub/superscript, bold,
+                                       # italic, size, font + mixed_format flag
   docx_read.py file.docx --styles      # JSON list of styles actually used
   docx_read.py file.docx --images DIR  # extract embedded images into DIR
   docx_read.py file.docx --revisions   # JSON: tracked changes / comments present?
@@ -196,6 +199,188 @@ def extract_blocks(doc) -> list:
     return blocks
 
 
+# ---------------------------------------------------------------- run-level
+# `--blocks` stops at the paragraph: it reports the style and the image
+# relationship ids, and nothing about the runs inside. That is deliberate -- it
+# is the contract the markdown round trip consumes -- so the run-level view
+# lives in its own mode instead of growing `--blocks`. A caller that is about to
+# *write* into a paragraph needs to see the run split first: a cell whose first
+# run carries `w:vertAlign="subscript"` looks like an ordinary "FS" from every
+# existing mode, and a flat `set-cell` would then format the whole string as
+# subscript (measured on the owner's own homework template).
+_RPR = qn("w:rPr")
+
+
+def _rpr_flag(rpr, tag: str):
+    """Direct-formatting boolean as a **tri-state**.
+
+    ``None``  = the element is absent (nothing stated at this level);
+    ``True``  = present with no ``w:val`` or an affirmative one;
+    ``False`` = present with ``w:val`` of ``0`` / ``false`` / ``off``.
+
+    The tri-state matters: ``w:b`` present-but-false and ``w:b`` absent mean
+    different things to a caller that is about to copy this run's formatting
+    onto new text. A plain ``bool(get(...))`` reads both as "not bold" and
+    throws that difference away.
+    """
+    if rpr is None:
+        return None
+    el = rpr.find(qn(f"w:{tag}"))
+    if el is None:
+        return None
+    val = el.get(qn("w:val"))
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "off")
+
+
+def _rpr_vert_align(rpr):
+    """``w:vertAlign/@w:val`` -- ``subscript`` / ``superscript`` / ``baseline``.
+
+    Returns ``None`` when the run states nothing. ``baseline`` is the value Word
+    writes to *cancel* an inherited sub/superscript, so it is reported as the
+    string rather than folded into ``None``: they are not interchangeable.
+    """
+    if rpr is None:
+        return None
+    el = rpr.find(qn("w:vertAlign"))
+    if el is None:
+        return None
+    return el.get(qn("w:val"))
+
+
+def _rpr_size_pt(rpr):
+    """``w:sz/@w:val`` is half-points; report points. ``None`` when absent."""
+    if rpr is None:
+        return None
+    el = rpr.find(qn("w:sz"))
+    if el is None:
+        return None
+    raw = el.get(qn("w:val"))
+    try:
+        return int(raw) / 2
+    except (TypeError, ValueError):
+        return None
+
+
+def _rpr_font(rpr):
+    """The ``ascii`` font of ``w:rFonts`` (``None`` when absent)."""
+    if rpr is None:
+        return None
+    el = rpr.find(qn("w:rFonts"))
+    if el is None:
+        return None
+    return el.get(qn("w:ascii"))
+
+
+def describe_run(run) -> dict:
+    """One run as JSON-able fields: text, character formatting, field/drawing."""
+    r_el = run._r
+    rpr = r_el.find(_RPR)
+    return {
+        "text": run.text,
+        "vert_align": _rpr_vert_align(rpr),
+        "bold": _rpr_flag(rpr, "b"),
+        "italic": _rpr_flag(rpr, "i"),
+        "size_pt": _rpr_size_pt(rpr),
+        "font": _rpr_font(rpr),
+        # A field run carries the field's control characters, not content the
+        # caller can overwrite with text; a drawing run carries a picture.
+        # Both are called out so `--runs` never presents them as writable text.
+        "is_field": (r_el.find(qn("w:fldChar")) is not None
+                     or r_el.find(qn("w:instrText")) is not None),
+        "is_drawing": (r_el.find(qn("w:drawing")) is not None
+                       or r_el.find(qn("w:pict")) is not None),
+    }
+
+
+def _format_fingerprint(run_info: dict) -> tuple:
+    """Everything that would be lost by overwriting a run with flat text."""
+    return (run_info["vert_align"], run_info["bold"], run_info["italic"],
+            run_info["size_pt"], run_info["font"])
+
+
+def is_mixed_format(runs: list) -> bool:
+    """True when a paragraph's plain-text runs disagree on formatting.
+
+    "Plain-text run" = carries text and is neither a field nor a drawing: those
+    two cannot be given new text in the first place, so counting them would flag
+    paragraphs that are perfectly safe to overwrite.
+
+    The whole point of the flag is the owner's second trap: a paragraph reading
+    ``FS`` where ``F`` is a subscript run and ``S`` is not is *mixed*, and a
+    flat-string write cannot express that split. One run, or several runs that
+    agree, is not mixed -- flagging those would make the flag noise, and noise
+    is what the caller will learn to ignore.
+    """
+    plain = [r for r in runs
+             if r["text"] and not r["is_field"] and not r["is_drawing"]]
+    if len(plain) < 2:
+        return False
+    return len({_format_fingerprint(r) for r in plain}) > 1
+
+
+def _table_path_label(table_path) -> str:
+    """``table[0].r1.c2`` chain, or ``body`` for a top-level paragraph."""
+    if not table_path:
+        return "body"
+    return " > ".join(f"table[{t}].r{r}.c{c}" for t, r, c in table_path)
+
+
+def _iter_paragraphs_annotated(container, table_path=(), seen_cells=None):
+    """Yield ``(paragraph, label, table_path)`` in document order.
+
+    Descends into table cells and nested tables, carrying the chain of
+    ``(table, row, col)`` indices that leads to each cell, so the caller can go
+    straight from "this cell is the trap" to the ``set-cell --table/--row/--col``
+    that would touch it.
+
+    Merged cells are visited once: ``row.cells`` repeats the same ``w:tc`` for
+    every grid column it spans, and emitting it twice would double every run in
+    it. Identity of the ``w:tc`` element is the dedupe key -- that is the same
+    object ``table.cell(r, c)`` returns, so a caller that acts on the reported
+    indices still lands on the cell that was described.
+    """
+    if seen_cells is None:
+        seen_cells = set()
+    for para in container.paragraphs:
+        yield para, _table_path_label(table_path), table_path
+    for t_index, table in enumerate(container.tables):
+        for r_index, row in enumerate(table.rows):
+            for c_index, cell in enumerate(row.cells):
+                marker = id(cell._tc)
+                if marker in seen_cells:
+                    continue
+                seen_cells.add(marker)
+                yield from _iter_paragraphs_annotated(
+                    cell, table_path + ((t_index, r_index, c_index),),
+                    seen_cells)
+
+
+def extract_runs(doc) -> dict:
+    """Per-paragraph run inventory: the view a writer needs *before* writing.
+
+    Scope: body paragraphs plus every table cell, nested tables included.
+    Header/footer parts are **not** walked -- `--blocks` does not cover them
+    either, and `set-cell` cannot reach them, so listing them here would report
+    traps that no edit command can act on. Use `--text` for their text.
+    """
+    paragraphs = []
+    for index, (para, label, table_path) in enumerate(
+            _iter_paragraphs_annotated(doc)):
+        runs = [describe_run(run) for run in para.runs]
+        paragraphs.append({
+            "index": index,
+            "path": label,
+            "table_path": [list(step) for step in table_path],
+            "style": para.style.name if para.style else "",
+            "text": para.text,
+            "mixed_format": is_mixed_format(runs),
+            "runs": runs,
+        })
+    return {"paragraphs": paragraphs}
+
+
 def detect_revisions(path: str) -> dict:
     """Detect tracked changes and comments by scanning the raw XML parts."""
     markers = {"insertions": b"<w:ins ", "deletions": b"<w:del ",
@@ -333,6 +518,10 @@ def main() -> int:
                    help="detect tracked changes / comments")
     g.add_argument("--blocks", action="store_true",
                    help="ordered body stream (paragraphs + tables interleaved)")
+    g.add_argument("--runs", action="store_true",
+                   help="per-paragraph run inventory: text, sub/superscript, "
+                        "bold, italic, size, font, field/drawing, and "
+                        "mixed_format (read this before writing into a cell)")
     g.add_argument("--md", metavar="FILE",
                    help="write a Markdown plain-text rendition to FILE")
     ap.add_argument("--image-dir", metavar="DIR",
@@ -392,6 +581,8 @@ def _run(args) -> int:
         return 0
     if args.blocks:
         out = {"blocks": extract_blocks(doc)}
+    elif args.runs:
+        out = extract_runs(doc)
     elif args.text:
         out = extract_text(doc)
     elif args.structure:
