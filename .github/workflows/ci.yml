@@ -243,14 +243,29 @@ jobs:
         #     sits on that floor: the floor is a measurement, not slack.
         #
         # The numbers are the hosted-runner reality, not this workstation.
-        # P12 measurement (2026-11-13, four legs of run 43454711769, all identical):
-        # 1836 passed / 383 skipped / collected 2219. A hosted reading, not a
-        # simulation -- ubuntu and windows, py3.10 and py3.12 all reported the same
-        # three numbers. The run before this one was red on all four legs for a
-        # reason worth keeping next to the number: docx_preview checked PyMuPDF
-        # before LibreOffice, so a runner with neither was told to install PyMuPDF.
-        # That test was green on the workstation (which has both) and red on every
-        # runner, which is the whole argument for measuring the floor here.
+        # P13+P15 measurement (2026-11-15, four legs of run 43722968493, all
+        # identical): 1974 passed / 392 skipped / collected 2366. A hosted
+        # reading, not a simulation. Two things about this batch are worth
+        # keeping next to the number:
+        #
+        #   * The first three runs of this branch were red on all four legs with
+        #     an *empty* log. The gate was correct and the tests were fine; the
+        #     gate itself was exiting before it could report, because GitHub runs
+        #     a bash step as `bash -e` and a non-zero pytest aborting the script
+        #     skipped over `status=$?` and every line after it. Fixed with
+        #     `|| status=$?`. A gate that cannot name its failure is not a gate.
+        #   * The actual test failure, once visible, was mine: one new case
+        #     converted all the way to OMML and needed MML2OMML.XSL from a local
+        #     Office install. It passed on this workstation and failed 24 cases
+        #     on every runner -- the exact trap this floor exists to catch. The
+        #     repo already had tests/_omml.py's `needs_omml` for it.
+        #
+        # P12 measurement (historical): 1836 passed / 383 skipped / collected
+        # 2219 (run 43454711769, four legs identical). The run before that one
+        # was red on all four legs for a reason worth remembering: docx_preview
+        # checked PyMuPDF before LibreOffice, so a runner with neither was told
+        # to install PyMuPDF. Green on the workstation, red everywhere else --
+        # the whole argument for measuring the floor here.
         #
         # P10 measurement (historical, do not use as the floor):
         # 1654 passed / 377 skipped / collected 2031. This is a hosted reading, not
@@ -377,7 +392,7 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 1836                        # monotone floor, measured on a clean clone
+          MIN_PASSED = 1974                        # monotone floor, measured on a clean clone
           SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
           run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
