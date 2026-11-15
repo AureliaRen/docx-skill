@@ -329,20 +329,27 @@ jobs:
           set -uo pipefail
           log=$(mktemp)          # not ./pytest.log: keep the checkout clean
           collect_log=$(mktemp)
-          # `python -u`: pytest writes progress dots to stdout, and stdout is a
-          # file here. Without -u those dots sit in a 8 KB block buffer, so a run
-          # that dies (OOM, segfault, runner kill) loses every line and leaves an
-          # empty file -- which is exactly the "exit 1, no output" seen on the
-          # p13-p15 branch. Unbuffered, whatever completed is on disk.
-          python -u -m pytest tests/ --tb=short -rf -q > "$log" 2>&1
-          status=$?
+          # GitHub runs this step with `bash -e` under the hood (visible in the
+          # log as `bash --noprofile --norc -e -o pipefail`). Under -e a command
+          # whose exit status is non-zero aborts the whole script *immediately*,
+          # so every line after the pytest call -- including `status=$?`, the
+          # `print_log` that cats the captured output, and the `::error::pytest
+          # exited N` annotation -- never ran. That is why three runs in a row
+          # reported "exit 1" with an entirely empty log: the gate was exiting
+          # before it could explain itself. `|| status=$?` keeps -e satisfied
+          # while still capturing the real status.
+          #
+          # `python -u`: stdout is a file here, so without it the progress dots
+          # sit in an 8 KB block buffer and die with a killed process.
+          status=0
+          python -u -m pytest tests/ --tb=short -rf -q > "$log" 2>&1 || status=$?
           print_log() {
             if [ -s "$log" ]; then
               echo "::group::pytest output ($(wc -l < "$log") lines)"
               cat "$log"
               echo "::endgroup::"
             else
-              echo "::error::pytest wrote nothing before exiting $1 -- it was killed, not failed"
+              echo "::error::pytest wrote nothing before exiting $1"
             fi
           }
           print_log "$status"
@@ -353,11 +360,18 @@ jobs:
           fi
           # The identity needs an independent denominator, so ask pytest's own
           # collector -- in a separate process -- how many tests exist at all.
-          python -m pytest tests/ --collect-only -q > "$collect_log" 2>&1
-          cstatus=$?
+          # Same -e hazard as above: a non-zero exit would abort before the
+          # status is read, hiding the collector's own error message.
+          cstatus=0
+          python -m pytest tests/ --collect-only -q > "$collect_log" 2>&1 || cstatus=$?
           if [ "$cstatus" -ne 0 ]; then
-            rm -f "$log" "$collect_log"
             echo "::error::--collect-only exited $cstatus; cannot establish the identity denominator"
+            if [ -s "$collect_log" ]; then
+              echo "::group::--collect-only output"
+              cat "$collect_log"
+              echo "::endgroup::"
+            fi
+            rm -f "$log" "$collect_log"
             exit 1
           fi
           python - "$log" "$collect_log" <<'PY'
