@@ -7,6 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A patch round that is almost entirely about *silent* damage: four ways an edit
+could finish with `exit 0`, an empty stderr and `{"ok": true}`, and still leave
+the document wrong. `set-cell` was the worst of them - filling a template cell
+flattened its runs and dropped sub/superscript and alignment without a word.
+Reading and writing now agree on what a run is, `--replace-cell` keeps the old
+clearing behaviour for callers who want it, and the validator finally looks
+inside `<w:drawing>`.
+
+The same round closes a fifth silent path on the formula side: a vulgar
+fraction character (`½`, `⅓`, `⅕`…) could survive a conversion as a raw glyph.
+Fourteen of the nineteen fraction code points were not even recognised as math,
+and the five that were still had to justify themselves with an `=` somewhere in
+the same run. `x=½` converted, `½+1` did not - same character, two outcomes.
+
+Chasing that one turned up a sixth, older and nastier: a spacing command was two
+tokens, so `1/2 m/s` came out with a denominator reading `2},`. Word opens it,
+it looks like a fraction from across the desk, and nothing anywhere reports it.
+
+### Changed
+
+- **`docx_edit.py set-cell` keeps cell formatting by default** (was: clear and
+  rewrite). Filling a template cell used to go through `_Cell.text`, whose
+  setter is documented as "Any existing content or revisions are replaced": it
+  clears the cell, adds one paragraph and one run, and drops paragraph
+  alignment, run font, run size, bold/italic and `vertAlign`. Measured on a
+  1x1 table with 2 paragraphs and 3 runs (second run `subscript`, first
+  paragraph `CENTER`, Times New Roman 14 pt), writing `"d0=5"` left **1
+  paragraph, 1 run, `CENTER` -> `None`, 14 pt / TNR -> `None`** - and reported
+  `{"ok": true}`, exit `0`, empty stderr. The new default is `mode: "preserve"`:
+
+  | Situation | Behaviour | `mode` |
+  |---|---|---|
+  | One writable run | Replace its text, leave `rPr` alone | `preserve` |
+  | Several runs | Write into the first writable run, drop the rest, strip a stray `vertAlign` from that run, **warn** | `preserve` + `warnings` |
+  | `--replace-cell` | Exactly the old clearing behaviour | `replace-cell` |
+
+  A run is not writable when it is a field (`w:fldChar` / `w:instrText`), a
+  drawing, or a picture - those are kept rather than clobbered, because
+  replacing a field run breaks the result it produced. Whatever could not be
+  kept is reported on stderr as a `warning:` line and in the JSON `warnings`
+  array: `exit 0` no longer implies the cell came out identical.
+- **`references/` is 7 files, not 6** - `editing-traps.md` joins it: the six
+  silent-failure traps (`cell.text =` flattening, stray `vertAlign`,
+  `inline_shapes` index drift, empty `drawing`, `PermissionError` from an open
+  WPS/Word file, cp936 mojibake), each with the measured before/after table and
+  the correct code shape (`copy.deepcopy` on the `w:r` element, matching images
+  by `rId` rather than position).
+- **All nineteen vulgar fraction characters convert to `\frac{n}{d}`** (was:
+  five of nineteen, and only when the run also contained a relation operator).
+  `½ ¼ ¾ ⅓ ⅔` were in the symbol table; `⅐ ⅑ ⅒ ⅕ ⅖ ⅗ ⅘ ⅙ ⅚ ⅛ ⅜ ⅝ ⅞ ↉` were not
+  even math characters, so they stayed in body text as glyphs forever. The
+  glyph is a hazard rather than an error: U+00BD renders as a tiny raised `1`,
+  a slash and a lowered `2`, which looks *nearly* right in one font and wrong
+  in every other - nobody notices until print. Measured before: `½` -> `½`
+  (unchanged), `½+1` -> `½+1`, `x=½` -> `x=\frac{1}{2}`; the third converted
+  and the first two did not, from the same character.
+
+  A fraction character is now its own justification for opening a math span, on
+  the same footing as `√`/`∑`/`∫` and as an explicit `_{...}` group: it is a
+  math glyph the author typed deliberately, not a paragraph we guessed at. It
+  also lifted the `len >= 2` floor for that one case, so a lone `½` between
+  Chinese characters converts while all framing stays text.
+- **A fraction character is a value anchor for unit strings**, so `½ m/s` reads
+  as a measurement (`\frac{1}{2}\,\text{m/s}`) exactly like `0.5 m/s` does
+  (`0.5\,\text{m/s}`) - same quantity, same layout. Without the anchor it went
+  through the fraction rewriter instead and came out as
+  `\frac{1}{2} \frac{m}{s}`, i.e. "half divided by metres per second". Two
+  adjacent lines of one hand-out disagreeing is harder to spot than either
+  being wrong. The unit grammar itself is untouched: `kg/m³`, `J/(mol·K)`,
+  `N·m` and `8.31 J/(mol·K)` are byte-identical before and after.
+- **A spacing command is one token, so a fraction no longer swallows the unit
+  after it** (was: `1/2 m/s` produced malformed LaTeX). `\,` is two characters
+  and contains no letter, so `_CMD_RE` (`\[A-Za-z]+`) could not match it, and
+  `_split_atoms` fell through to its "backslash is a single atom" branch — the
+  comma became an *operator* and the bare backslash became an *adjacent factor*.
+  With a fraction and a unit string in the same span, which is what a hand-out
+  writes constantly:
+
+  ```
+  1/2 m/s  → 1/2\,\text{m/s} → \frac{1}{2\},\text{m/s}   ← denominator is 2\}
+  ```
+
+  The escaped brace closed the group early: OMML came out with numerator `1`,
+  denominator `2},`, then `m/s`. Word draws a stacked fraction whose denominator
+  reads `2},`. It opens fine and looks like a fraction from across the desk, so
+  nobody reported it. The five two-character spacing commands (`\,` `\;` `\:`
+  `\!` `\ `) are now collected as a single `space` token before any operand
+  scanning runs. Measured after: `1/2 m/s` → `\frac{1}{2}\,\text{m/s}` (denominator
+  `2`), `3/4 m/s`, `1/2 rad/s`, `1/2 J/(mol·K)`, `1/2 kg/m³` all well-formed and
+  brace-balanced. `1/2×1/2` still refuses to nest and `v=m/s` is still a
+  fraction, not a unit string.
+
+### Added
+
+- **`docx_read.py --runs`** - per-paragraph run inventory: for each run its
+  `text`, `vert_align`, `bold`, `italic`, `size_pt`, `font`, `is_field` and
+  `is_drawing`, plus a paragraph-level `mixed_format` flag and a `path` such as
+  `table[0].r0.c0`. `mixed_format: true` is the signal that a flat string
+  cannot express the cell. Read this **before** writing into a template cell.
+  `--blocks` is unchanged - its fields are consumed by the Markdown round-trip
+  path, so the run detail went into a new switch rather than a new field.
+- **`docx_validate.py` rejects an empty `<w:drawing>`** - code `empty-drawing`,
+  severity `error`, exit `1`. A drawing must contain exactly one `wp:inline` or
+  `wp:anchor`; Word does not repair one that contains neither, it refuses to
+  open the file. Measured before the check existed: `{"ok": true, "issues":
+  []}`, exit `0` - and `Documents.Open()` raised `com_error (-2147352567,
+  '发生意外。', ..., 'Word 在试图打开文件时遇到错误。...', 'wdmain11.chm', 24601,
+  ...)`. The five earlier checks (package structure, rels, referenced ids,
+  media magic, style existence) all pass an empty drawing, because it
+  references nothing. Verified against five real documents (`in.docx`,
+  `out.docx`, `out_tnr.docx`, `final_test.docx`, `fixture.docx`) - all five
+  still `{"ok": true, "issues": []}`.
+- **`docx_validate.py` rejects a block element nested directly inside a run** -
+  code `invalid-nesting`, severity `error`, exit `1`. A `<w:p>` or `<w:tbl>`
+  inside `<w:r>` is not valid run content: Word either silently repairs it or
+  refuses the file, while python-docx opens it happily, so no other check here
+  would notice. Only those two tags are flagged - narrowing to the two shapes
+  is deliberate, because a wider net starts reporting legal `mc:AlternateContent`
+  fallbacks.
+- **Malformed XML in `docx_validate.py` is a JSON verdict, not a traceback** -
+  a document whose XML does not parse now produces `ok: false` with the parse
+  error as an issue (`bad-document-xml` for the body, `bad-styles-xml` for the
+  style part), instead of dumping a stack trace and losing the exit code
+  contract.
+- **`docx_validate.py` no longer reports phantom unresolved references** (a
+  pre-existing bug, and the worst kind: it depended on `PYTHONHASHSEED`).
+  Every `.rels` file used to be keyed by its *parent directory*, so
+  `word/_rels/document.xml.rels`, `header1.xml.rels`, `footer1.xml.rels`,
+  `comments.xml.rels` and friends all collapsed into one `"word"` slot and the
+  last one read won. Since the file list is a `set`, which one won varied per
+  process. Measured on `source-snapshot/test_unpack/full_test_input.docx`
+  against the previous commit: seeds `0,3,4,5,7` reported two
+  `unresolved-reference` errors while `1,2,6` reported `{"ok": true, "issues":
+  []}` - same file, same code, different answer. The key is now the owning part
+  (`word/document.xml`), resolved by file stem rather than by directory, and the
+  `.rels` files are iterated in sorted order so the result cannot depend on
+  hash order. All eight seeds now agree.
+- **`docx_toc.py --levels 0` is refused** (was: exit `0` with an empty TOC of
+  zero entries). An outline of nothing is a mistake, not an answer; the refusal
+  names the accepted forms (`1,2` / `1-3`). Non-numeric `--indent-chars` now
+  fails as a single `error:` line instead of a bare traceback.
+
 ## [1.1.0] - 2026-11-13
 
 Two halves. The first is P8-P10: an ambiguous invocation is refused instead of

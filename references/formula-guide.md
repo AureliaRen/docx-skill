@@ -427,6 +427,64 @@ literal spelling diverged. Both spellings now give the same result, which is the
 point — two spellings of one fact producing two different outputs was the bug.
 The same test already existed for `kg/m3` versus `kg/m³`.
 
+### A vulgar fraction is a value, and a fraction character is evidence
+
+`½` is one code point that fonts draw as a small `1`, a slash and a lowered `2`.
+Left alone it survives a conversion as a raw glyph: it looks *nearly* right in
+the font it was written in and wrong in every other, so nothing reports it and
+the problem shows up at print. All nineteen Unicode fraction code points
+(U+00BC–U+00BE, U+2150–U+215E and U+2189) now translate to `\frac{n}{d}`, and
+the full table lives in `linear_to_latex.VULGAR_FRAC`.
+
+A fraction character also **opens a span by itself**, on the same footing as
+`√` / `∑` / `∫` and as an explicit `_{...}` group. Two reasons it gets that
+standing rather than being made to earn it with an `=` somewhere: it is a math
+glyph the author typed on purpose, and its untouched form is the worst possible
+rendering. Before this, `x=½` converted while `½+1` stayed as text — the same
+character with two outcomes depending on whether a relation operator happened to
+be nearby. It is also exempt from the `len >= 2` floor, so a lone `½` between
+Chinese characters converts while the framing stays text.
+
+And it is a **value anchor** for the unit grammar, which is what keeps the two
+meanings apart:
+
+```
+½ m/s     → \frac{1}{2}\,\text{m/s}     measurement: half a metre per second
+0.5 m/s   → 0.5\,\text{m/s}             the same quantity, same layout
+v=m/s     → v=\frac{m}{s}               a formula: m divided by s
+m/s       → \,\text{m/s}                a bare unit string
+```
+
+The rule behind that column is an anchor check, not "both sides look like
+units" — `m/s` and `v=m/s` are identical on that test. Without the fraction
+character in the anchor regex, `½ m/s` fell through to the fraction builder and
+came out as `\frac{1}{2} \frac{m}{s}`, i.e. "half divided by metres per second",
+while `0.5 m/s` on the next line took the unit path. Two adjacent lines of one
+hand-out disagreeing is harder to spot than either being wrong.
+
+### A spacing command is one token, not a backslash plus punctuation
+
+`linear_to_latex` splits its input into atoms before any rewriting. `_CMD_RE`
+matches `\[A-Za-z]+`, so `\,` — two characters, no letter — never matched, and
+`_split_atoms` fell through to its "backslash is a single atom" branch. The comma
+then became an *operator* and the bare backslash an *adjacent factor*:
+
+```
+1/2 m/s  → 1/2\,\text{m/s} → \frac{1}{2\},\text{m/s}   ← denominator is 2\}
+```
+
+The escaped brace closed the group early: OMML came out with numerator `1`,
+denominator `2},`, then `m/s`. Word draws a stacked fraction whose denominator
+reads `2},`. It opens fine and looks like a fraction from across the desk, so
+nobody reported it — the shape that triggers it is "a fraction followed by a
+unit string", which is most of a physics hand-out. All five two-character
+spacing commands (`\,` `\;` `\:` `\!` `\ `) are now collected as a single
+`space` token before any operand scanning runs.
+
+This is separate from `keep_spacing()` above: that one is about what survives
+the trip through MathML and the XSLT, this one is about tokenising the LaTeX
+source before the fraction builder ever sees it.
+
 ## Escaping traps in source text
 
 `docx_mathify.py` reads whatever linear notation is in the document. A few

@@ -48,6 +48,12 @@ from docx_common import iter_all_paragraphs, replace_in_paragraph
 # `docx_create._bookmark_para` the same way. Both halves are in `scripts/`,
 # which `_bootstrap` already put on `sys.path`.
 from docx_read import InputError, _check_input, _open_document
+# Run-level inspection is **also** taken from `docx_read`, not reimplemented:
+# `--runs` has to report the same `vert_align` / `bold` / `italic` / `size_pt` /
+# `font` that this file then decides to keep or drop. Two copies of that reader
+# would drift, and the drift would show up as `--runs` promising "single run,
+# safe to edit" for a cell `set-cell` then treats as mixed.
+from docx_read import describe_run, is_mixed_format
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -87,6 +93,135 @@ def _check_range(what: str, value: int, n: int) -> None:
             f"legal range is [0, {n - 1}], current N={n}")
 
 
+def _writable_run(run) -> bool:
+    """True for a run a flat string can be written into.
+
+    A field run (``w:fldChar`` / ``w:instrText``) and a drawing run are not
+    plain text carriers: overwriting one deletes a field or a picture, which the
+    caller never asked for. ``docx_read --runs`` reports the same two flags, so
+    the two CLIs agree on what counts as writable text.
+    """
+    r_el = run._r
+    for tag in ("fldChar", "instrText", "drawing", "pict"):
+        if r_el.find(_q(tag)) is not None:
+            return False
+    return True
+
+
+def _strip_vert_align(run):
+    """Drop ``w:rPr/w:vertAlign`` from one run; return its previous value.
+
+    ``None`` when the run stated nothing. Only called on the *mixed* path: with
+    one surviving run over several disagreeing ones there is no way to know
+    which characters were meant to be subscript, and carrying the first run's
+    ``vertAlign`` onto the whole new string is exactly the bug this rewrite
+    exists to stop (a first run of ``F`` with ``vertAlign=subscript`` turned a
+    whole ``FS`` into subscript).
+    """
+    rpr = run._r.find(_q("rPr"))
+    if rpr is None:
+        return None
+    el = rpr.find(_q("vertAlign"))
+    if el is None:
+        return None
+    val = el.get(_q("val"))
+    rpr.remove(el)
+    return val
+
+
+def _fill_cell_text(cell, text: str, where: str) -> list[str]:
+    """Overwrite one cell's text, keeping every format a flat string allows.
+
+    Layered on purpose, because the caller hands over a **flat string** and a
+    flat string does not say which character is a subscript. Guessing would be
+    making the caller's decision for them, badly:
+
+    1. **Paragraph level is always kept.** Alignment, spacing and the paragraph
+       style live in ``w:pPr`` and are not touched at all. This is the layer
+       that can be preserved losslessly in every case.
+    2. **One text run is lossless.** Reassigning ``run.text`` goes through
+       ``CT_R.clear_content()``, which removes the run's content but *keeps*
+       ``w:rPr`` -- bold, size, font and even ``vertAlign`` survive untouched.
+    3. **Several text runs cannot be mapped from a flat string.** The first
+       writable run is kept as the formatting carrier, its ``vertAlign`` is
+       stripped when the runs disagree (see :func:`_strip_vert_align`), the
+       others are removed, and ``warnings`` says so out loud.
+    4. **Nothing is silent.** Every lossy outcome appends one ``warning: ...``
+       line; a one-run cell appends nothing, so the warning stays a signal.
+
+    Returns the warning lines (already prefixed); ``cmd_set_cell`` prints them
+    to stderr so stderr and the JSON agree.
+    """
+    notes: list[str] = []
+    paragraphs = list(cell.paragraphs)
+    if not paragraphs:
+        # A `w:tc` with no `w:p` at all is malformed but openable; give it the
+        # paragraph the caller's text needs rather than IndexError.
+        paragraphs = [cell.add_paragraph()]
+    target, extras = paragraphs[0], paragraphs[1:]
+
+    writable = [r for r in target.runs if _writable_run(r)]
+    text_runs = [r for r in writable if r.text]
+
+    if len(text_runs) <= 1:
+        # Lossless path. Reuse the run that already carries text, else the
+        # first empty formatting carrier, else create one.
+        run = text_runs[0] if text_runs else (writable[0] if writable else None)
+        if run is None:
+            kept = len(target.runs)
+            target.add_run(text)
+            if kept:
+                # The cell's only runs are fields or drawings. Appending keeps
+                # them (destroying a field or a picture to satisfy a text write
+                # is not a trade this command should make silently), but the
+                # cell's resulting text is old+new, which the caller must know.
+                notes.append(
+                    f"warning: {where}: the paragraph held {kept} run(s) that "
+                    f"are fields or drawings; they were kept and the new text "
+                    f"was appended after them, so the cell now reads "
+                    f"{target.text!r}. Use --replace-cell to drop them.")
+        else:
+            run.text = text
+    else:
+        first = text_runs[0]
+        info = [describe_run(r) for r in text_runs]
+        if is_mixed_format(info):
+            dropped = _strip_vert_align(first)
+            tail = (f" Its vertAlign={dropped!r} was dropped: a flat string "
+                    f"cannot say which characters were subscript/superscript."
+                    if dropped else "")
+            notes.append(
+                f"warning: {where}: cell held {len(text_runs)} text runs with "
+                f"different run formatting, so the whole new string now uses "
+                f"the first run's formatting; paragraph formatting "
+                f"(alignment/spacing/style) was kept, the other "
+                f"{len(text_runs) - 1} run(s) were removed.{tail} "
+                f"Edit the runs one by one, or pass --replace-cell to rewrite "
+                f"the cell.")
+        first.text = text
+        for run in text_runs[1:]:
+            run._r.getparent().remove(run._r)
+
+    if extras:
+        # Only the first paragraph can hold a single flat string. Collapsing the
+        # rest is the one structural loss this path makes, so it is announced.
+        nested = bool(cell.tables)
+        for para in extras:
+            if nested:
+                # Deleting paragraphs around a nested table would re-order the
+                # cell's blocks; empty their text and leave the `w:p` in place.
+                for run in [r for r in para.runs if _writable_run(r)]:
+                    run._r.getparent().remove(run._r)
+            else:
+                para._p.getparent().remove(para._p)
+        notes.append(
+            f"warning: {where}: cell held {len(paragraphs)} paragraphs and now "
+            f"holds 1; the first paragraph's formatting was kept and the "
+            f"{'other paragraphs were emptied' if nested else 'rest were removed'}"
+            f" (a flat --text is a single paragraph).")
+    return notes
+
+
 def cmd_set_cell(doc, args) -> dict:
     """Set one table cell's text, refusing any index that names nothing.
 
@@ -96,6 +231,19 @@ def cmd_set_cell(doc, args) -> dict:
 
     Column count comes from the row itself rather than ``table.columns``: a
     cell grid can be ragged, and ``table.cell(row, col)`` indexes the row.
+
+    Two modes:
+
+    * default -- **preserve**. Paragraph formatting is kept, a single text run
+      is rewritten in place (its ``w:rPr`` survives), and a multi-run cell
+      inherits the first run's formatting with ``vertAlign`` stripped plus one
+      ``warning:`` line on stderr. See :func:`_fill_cell_text`.
+    * ``--replace-cell`` -- the old ``cell.text = text``: clear the whole cell
+      and write one paragraph with one run. Kept for the legitimate "I really
+      do want this cell emptied and rewritten" case, and it is the escape hatch
+      the warning points at.
+
+    Exit code is unchanged either way: a warning is not a failure.
     """
     tables = doc.tables
     _check_range("set-cell --table", args.table, len(tables))
@@ -103,8 +251,19 @@ def cmd_set_cell(doc, args) -> dict:
     rows = table.rows
     _check_range("set-cell --row", args.row, len(rows))
     _check_range("set-cell --col", args.col, len(rows[args.row].cells))
-    table.cell(args.row, args.col).text = args.text
-    return {"table": args.table, "row": args.row, "col": args.col}
+
+    where = f"table {args.table} row {args.row} col {args.col}"
+    cell = table.cell(args.row, args.col)
+    if getattr(args, "replace_cell", False):
+        cell.text = args.text
+        return {"table": args.table, "row": args.row, "col": args.col,
+                "mode": "replace-cell", "warnings": []}
+
+    notes = _fill_cell_text(cell, args.text, where)
+    for line in notes:
+        print(line, file=sys.stderr)
+    return {"table": args.table, "row": args.row, "col": args.col,
+            "mode": "preserve", "warnings": notes}
 
 
 class IndexOutOfRangeError(ValueError):
@@ -403,6 +562,10 @@ def main() -> int:
     p.add_argument("--row", type=int, required=True)
     p.add_argument("--col", type=int, required=True)
     p.add_argument("--text", required=True)
+    p.add_argument("--replace-cell", action="store_true",
+                   help="old behaviour: clear the whole cell and write one "
+                        "paragraph with one run (drops all run-level "
+                        "formatting). Default keeps what a flat string can keep.")
 
     p = sub.add_parser("insert", help="insert paragraph at body index")
     common(p)

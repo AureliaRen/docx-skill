@@ -445,6 +445,7 @@ and is loaded only when you need it:
 | [references/revisions-and-comments.md](references/revisions-and-comments.md) | comment anchoring, and the boundary of accept/reject on tracked changes |
 | [references/font-scheme.md](references/font-scheme.md) | style-layer plus run-layer font normalisation, and how the heading-size threshold is decided |
 | [references/merge-and-export.md](references/merge-and-export.md) | what to watch when merging two documents and exporting to PDF |
+| [references/editing-traps.md](references/editing-traps.md) | an edit finished green but the document came out wrong: `cell.text =` flattening a multi-run cell, a stray `vertAlign`, `inline_shapes` index drift, an empty `<w:drawing/>` Word refuses to open, `PermissionError` from an open WPS/Word file, cp936 mojibake |
 
 ## Testing
 
