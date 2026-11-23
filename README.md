@@ -215,7 +215,7 @@ features need it — every other script runs on a machine with no Office at all.
 
 ## Use
 
-Every script runs from a shell on its own, and **19 of the 26 CLIs expose an
+Every script runs from a shell on its own, and **20 of the 27 CLIs expose an
 argparse surface** — start with `--help`:
 
 ```bash
@@ -296,9 +296,10 @@ Full command table in [SKILL.md](SKILL.md).
 One rule holds for an agent consumer: the scripts that report structure write it
 to **stdout as JSON** — `docx_create`, `docx_read`, `docx_edit`, `docx_validate`,
 `docx_comments`, `docx_revisions`, `docx_section`, `docx_numbering`,
-`docx_crossref`, `docx_toc`. The rest write human-readable text that is meant to be
-read: `docx_mathify`, `table_width`, `insert_formula`, `docx_template` (`fill`
-excepted — it emits JSON). Diagnostics always go to stderr, and the exit code is
+`docx_crossref`, `docx_toc`, `docx_footer`. The rest write human-readable text
+that is meant to be read: `docx_mathify`, `table_width`, `insert_formula`,
+`docx_template` (`fill` excepted — it emits JSON). Diagnostics always go to
+stderr, and the exit code is
 worth branching on rather than testing against zero:
 
 | Code | Meaning |
@@ -322,48 +323,49 @@ success.
 
 ## Scripts
 
-`scripts/` holds **27 `.py` + 1 `.ps1` = 28 files**, all flat, no sub-package and
+`scripts/` holds **28 `.py` + 1 `.ps1` = 29 files**, all flat, no sub-package and
 no `__init__.py`. The split below follows one definition, and `ci.yml` derives it
 mechanically rather than trusting this prose — two unioned rules,
 `_*`-prefixed **or** no `if __name__ == "__main__"` guard, mean *pure library*:
 
 | Bucket | Count | Test |
 |---|---|---|
-| **CLI** | **26** | carries a `__main__` guard, so it can be run from a shell |
+| **CLI** | **27** | carries a `__main__` guard, so it can be run from a shell |
 | **pure library** | **1** | `_bootstrap.py` — private, imported before argument parsing, never run on its own |
 
-Of those 26 CLIs, **19 expose an argparse surface** (`--help` prints `usage: …`)
+Of those 27 CLIs, **20 expose an argparse surface** (`--help` prints `usage: …`)
 and are tabulated first. The other 7 have a `__main__` but no argparse: six print
 a one-line `… is a library module, import it:` self-description (`docx_pack`,
 `docx_utils`, `encoding`, `linear_to_latex`, `math_omml`, `minidom_compat`) and
 `fix_phasor_dot` runs its self-check. They are imported by bare name, exactly
 like `_bootstrap`. Full flags per command are in [SKILL.md](SKILL.md).
 
-**CLI tools (19 `.py` with argparse)**
+**CLI tools (20 `.py` with argparse)**
 
 | File | What it does |
 |---|---|
 | `docx_create.py` | Builds a `.docx` from a JSON spec (`page` / `styles` / `header` / `footer` / `blocks`) |
-| `docx_read.py` | Reads a document back: `--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` |
-| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` |
+| `docx_read.py` | Reads a document back: `--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--runs` (per-paragraph run inventory) / `--md` |
+| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` / `char-format` |
 | `docx_validate.py` | Package-level health check; exits 1 when `ok:false` |
 | `docx_comments.py` | Comments: `list` / `add --target` / `delete --id` (**ids start at `0`**) |
 | `docx_revisions.py` | Tracked changes: `list` / `accept-all` / `reject-all` / `accept` / `reject` |
 | `docx_common.py` | Shared paragraph walkers: `iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`; `--api` prints the exported surface |
 | `docx_template.py` | `extract` / `apply` (`-o` needs node + docx-js, `--to` writes into an existing file, `--fix-formulas` passes mathify's exit code through) / `fill` (`{{token}}`) |
 | `docx_numbering.py` | Real auto-numbering: `list` / `define` / `apply` / `detach` / `restart` |
-| `docx_crossref.py` | Captions and cross-references: `caption` / `ref` / `bookmark` / `renumber` / `list` |
+| `docx_crossref.py` | Captions and cross-references: `caption` / `ref` (`--static` writes the number as literal text instead of a REF field) / `bookmark` / `renumber` / `list` |
 | `docx_toc.py` | Static TOC as ordinary paragraphs: `build_static_toc` / `collect_outline` / `drop_existing_toc` |
 | `docx_section.py` | Sections: `list` / `break` / `pagenum` / `pagenums` / `header` / `footer` / `cols` |
 | `docx_mathify.py` | Bulk-converts linear formulas to OMML (`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`); `--dry-run` with `-o` is exit `2` |
 | `insert_formula.py` | Inserts one LaTeX formula into an unpacked directory (`--after` / `--before` / `--display` / `--dump`) |
-| `table_width.py` | Table geometry: `report` / `set --widths` / `sync` / `auto --content-width` |
+| `table_width.py` | Table geometry: `report` / `set --widths` / `sync` / `auto --content-width` / `check --page-width` (overflow check, `--json`) |
 | `fix_fonts.py` | Font normalisation across style layer, run layer, and over-sized headings (`--heading-threshold`) |
 | `fix_zoom.py` | Adds the `w:percent` that `<w:zoom>` needs to pass a strict XSD (`--percent`) |
 | `merge_docs.py` | Appends one document to another, keeping styles / numbering / media (`base src out`) |
-| `docx_preview.py` | Renders and lints the layout: `--pdf` / `--pages DIR` (per-page PNG, `--dpi`) / `--lint` (fill ratio, half-empty and blank pages, oversized images, split tables, orphan last lines) / `--json` |
+| `docx_preview.py` | Renders and lints the layout: `--pdf` / `--pages DIR` (per-page PNG, `--dpi`) / `--lint` (fill ratio, half-empty and blank pages, oversized images, split tables, orphan last lines) / `--gaps` (page-tail white in mm, `--max-tail-gap`, `--skip-last-page-gap`, `--no-header-band`) / `--json` |
+| `docx_footer.py` | Read-only footer health check, JSON on stdout: `check` / `--section` — footer shape, box width, and whether the page number actually fits |
 
-The 28th file is not a `.py`: `pdf_export.ps1` is the PowerShell export path —
+The one file in `scripts/` that is not a `.py`: `pdf_export.ps1` is the PowerShell export path —
 Word COM, `ExportAsFixedFormat(17)`, opened `ReadOnly` (`-DocxPath` /
 `-PdfPath`). See [Exporting to PDF](SKILL.md#exporting-to-pdf-additional-capability).
 
@@ -412,7 +414,7 @@ input.
 ## Layout
 
 ```
-scripts/     flat CLI modules, imported by bare name — 28 files (27 .py + 1 .ps1)
+scripts/     flat CLI modules, imported by bare name — 29 files (28 .py + 1 .ps1)
 tools/       Word COM acceptance helper — word_accept.py, which owns --page-probe
 references/  longer notes loaded on demand
 tests/       pytest suite
@@ -463,15 +465,15 @@ runs, same commit, different machines; the numbers differ only because the skips
 
 | Where | Result |
 |---|---|
-| Developer machine, local Office installed | **1576 passed / 239 skipped / 0 failed** (1815 collected) |
-| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file, **run on a clone of this repository** — the parent of a development checkout holds `_smoke/`, which flips one test from skip to pass) — the row `ci.yml` gates on | **1440 passed / 375 skipped / 0 failed** (1815 collected) |
+| Developer machine, local Office installed | **2458 passed / 239 skipped / 0 failed** (2697 collected) |
+| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file, **run on a clone of this repository outside the development tree**) — the row whose shape `ci.yml` gates on | **2220 passed / 477 skipped / 0 failed** (2697 collected) |
 
-The gap is exactly 135 tests — the ones that need `latex2mathml` **and**
-`MML2OMML.XSL`: they run in the first row and skip in the second. Neither row is a
-number to chase by editing a constant; `ci.yml` gates `passed >= 1440` and
+The gap is 238 tests: 143 that need `latex2mathml` **and** `MML2OMML.XSL`, plus
+95 that read the `_smoke/` baseline kept above a development checkout. Neither row
+is a number to chase by editing a constant; `ci.yml` gates `passed >= 1974` and
 `skipped <= collected / 4`.
 
-`tests/` holds 46 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
+`tests/` holds 76 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
 backs the PDF text-layer assertions and `pytest` is the runner; neither is a runtime
 dependency. Word COM tests skip exactly the same way when Word is absent.
 
@@ -492,26 +494,31 @@ installation at runtime; that file is not redistributed here.
 
 ## Acknowledgments
 
-The base CRUD, comment, revision, and template CLIs are adapted from the
-clean-room MIT implementations in
+The core CLIs — CRUD, validation, comments, revisions, numbering,
+cross-references, TOC, sections, template, footer, and preview — are adapted
+from the clean-room MIT implementations in
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
 (`skills/productivity/microsoft-office`), originally written from functional
 specs against `python-docx` and friends.
 
 Files derived from that base: `docx_create` / `docx_edit` / `docx_read` /
-`docx_validate` / `docx_comments` / `docx_revisions` / `docx_template` /
-`docx_common` / `docx_numbering` / `docx_crossref` / `docx_toc` /
-`docx_section` — twelve in all. **The authoritative marker is the file header:
-each of them carries `# MIT License. Part of the Hermes docx skill.`** Local
+`docx_validate` / `docx_comments` / `docx_revisions` / `docx_preview` /
+`docx_footer` / `docx_template` / `docx_common` / `docx_numbering` /
+`docx_crossref` / `docx_toc` / `docx_section` — fourteen in all. Twelve of
+them carry the header `# MIT License. Part of the Hermes docx skill.`; the
+other two are `docx_template` (its docstring documents the hermes CLI's
+positional-argument form) and `docx_common` (its header reads
+`# MIT License. Shared helpers for the docx skill scripts.`). Local
 changes are limited to the `sys.path` bootstrap header, UTF-8 stdio, and
 portability/defect fixes, plus (`docx_common`) an `--api` self-description entry
 and a replacement-iteration budget so a replacement value containing the needle
 cannot loop forever.
 
-**Written here, not derived** (no Hermes header): the formula chain —
+**Written here, not derived**: the formula chain —
 `linear_to_latex`, `math_omml`, `fix_phasor_dot`, `docx_mathify`,
 `insert_formula` — plus `table_width`, `fix_zoom`, `fix_fonts`, `merge_docs`,
-`pdf_export.ps1`, and `docx_pack`.
+`pdf_export.ps1`, `docx_pack`, and the plumbing modules `_bootstrap`,
+`docx_utils`, `encoding`, and `minidom_compat`.
 
 Per-file provenance and the list of local changes are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). That file also records what this

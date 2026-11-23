@@ -13,8 +13,12 @@ Usage:
   docx_read.py file.docx --revisions   # JSON: tracked changes / comments present?
 
 Text output is JSON: {"body": [...], "tables": [[...rows]], "headers": [...],
-"footers": [...]}. Body text is the accepted/as-is text (python-docx ignores
-deleted-in-revision text and shows inserted text).
+"footers": [...], "textboxes": [...]}. Body text is the accepted/as-is text
+(python-docx ignores deleted-in-revision text and shows inserted text).
+``textboxes`` carries the text of every text box in the **body** -- one entry per
+box, its paragraphs joined by newlines. Those paragraphs are not in ``body``:
+a box's content lives inside a ``w:drawing``/``w:pict`` run, i.e. in
+``w:txbxContent``, which no body-paragraph walk reaches (see ``iter_textboxes``).
 """
 from __future__ import annotations
 import _bootstrap  # noqa: F401
@@ -48,6 +52,222 @@ def table_to_rows(table) -> list:
     return [[cell_text(cell) for cell in row.cells] for row in table.rows]
 
 
+# ---------------------------------------------------------------- text boxes
+# Text boxes are unreachable from every other code path in this module. A box's
+# paragraphs live in ``w:txbxContent``, whose only parents are ``wps:txbx``
+# (inside a DrawingML ``w:drawing``) or ``v:textbox`` (inside a VML ``w:pict``)
+# -- never a direct child of ``w:body``. So ``body.iterchildren()`` in
+# `extract_blocks` cannot see them, and ``Paragraph.text`` only concatenates a
+# paragraph's own ``w:r`` children, so nothing that sits inside a run's
+# ``w:drawing`` is ever joined either. That is why all three read modes used to
+# report zero text for a document made of nothing but annotation boxes.
+#
+# The three container shapes are the ones `docx_footer.textboxes` documents as
+# "all three reach Word":
+#
+#   * DrawingML floating -- ``w:drawing`` -> ``wp:anchor`` -> ``wps:txbx``;
+#   * DrawingML inline   -- ``w:drawing`` -> ``wp:inline`` -> ``wps:txbx``;
+#   * VML                -- ``w:pict``    -> ``v:shape``   -> ``v:textbox``.
+#
+# This module does **not** import that function: it exists to measure box
+# geometry and needs the footer's ``StyleCtx`` (style inheritance, font metrics)
+# to do it, none of which a text extractor should drag in. The split is "footer
+# owns geometry, read owns text", and the traversal below stays generic on
+# purpose -- it looks for ``w:txbxContent`` anywhere under the root instead of
+# matching the three chains by hand, so a fourth container shape that some
+# writer invents is still read.
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_V = "urn:schemas-microsoft-com:vml"
+
+_W_P = "{%s}p" % _W
+_W_T = "{%s}t" % _W
+_TXBX = "{%s}txbxContent" % _W
+_MC_ALT = "{%s}AlternateContent" % _MC
+_MC_CHOICE = "{%s}Choice" % _MC
+_MC_FALLBACK = "{%s}Fallback" % _MC
+
+
+def _enclosing_box(el):
+    """The nearest ``w:txbxContent`` ancestor of *el*, or ``None``."""
+    parent = el.getparent()
+    while parent is not None:
+        if parent.tag == _TXBX:
+            return parent
+        parent = parent.getparent()
+    return None
+
+
+def _own_paragraphs(content):
+    """Paragraphs that belong to *content* itself, not to a box nested in it.
+
+    ``content.iter(w:p)`` would also reach the paragraphs of a box nested inside
+    this one; the ancestor test keeps each box's text its own, which is the same
+    reason ``Paragraph.text`` does not descend either.
+
+    The comparison is ``==``, not ``is``: lxml creates element proxies on demand,
+    so two expressions that name the same XML node can hand back different proxy
+    objects, while ``==`` compares the underlying node.
+    """
+    for p_el in content.iter(_W_P):
+        if _enclosing_box(p_el) == content:
+            yield p_el
+
+
+def _collect_boxes(node, found: list) -> None:
+    """Append every box under *node* to *found*, in document order.
+
+    ``mc:AlternateContent`` is where the counting goes wrong. Word and WPS wrap
+    one box in a Choice (DrawingML) + Fallback (VML) pair, and **both branches
+    carry the same text**, so walking the tree naively reports the box twice.
+    The rule here is the one the format implies: exactly one branch is the box
+    Word renders, so exactly one branch is read -- ``mc:Choice`` when it carries
+    text, otherwise ``mc:Fallback``.
+    """
+    for child in node.iterchildren():
+        tag = child.tag
+        if not isinstance(tag, str):
+            continue
+        if tag == _MC_ALT:
+            branch = _preferred_branch(child)
+            if branch is not None:
+                _collect_boxes(branch, found)
+        elif tag == _TXBX:
+            found.append(child)
+            # A box inside a box is a box of its own; its text is not the
+            # outer box's text (``_own_paragraphs`` keeps them apart).
+            _collect_boxes(child, found)
+        else:
+            _collect_boxes(child, found)
+
+
+def _boxes_in(node) -> list:
+    found: list = []
+    _collect_boxes(node, found)
+    return found
+
+
+def _preferred_branch(alt):
+    """The single branch of an ``mc:AlternateContent`` that should be read.
+
+    ``mc:Choice`` wins whenever it actually carries box text; an empty (or
+    box-less) Choice falls through to ``mc:Fallback``, because "the branch Word
+    renders" is not the same question as "the branch that has the content" --
+    a Choice whose box was emptied still leaves the Fallback's text readable.
+    Both branches are never returned, so the count stays one per box.
+    """
+    choice = fallback = None
+    for child in alt.iterchildren():
+        if child.tag == _MC_CHOICE and choice is None:
+            choice = child
+        elif child.tag == _MC_FALLBACK and fallback is None:
+            fallback = child
+    for candidate in (choice, fallback):
+        if candidate is not None and _branch_has_text(candidate):
+            return candidate
+    return choice if choice is not None else fallback
+
+
+def _branch_has_text(node) -> bool:
+    """Does this ``mc:Choice`` / ``mc:Fallback`` carry any non-blank ``w:t``?
+
+    A shape test, not a full read: the question here is only "which branch is
+    worth descending into", and answering it must not need a document object
+    (``_preferred_branch`` is called while no box record exists yet).
+    """
+    for t in node.iter(_W_T):
+        if (t.text or "").strip():
+            return True
+    return False
+
+
+def _box_flavor(content) -> str:
+    """Which of the three container shapes holds this box."""
+    parent = content.getparent()
+    while parent is not None:
+        tag = parent.tag
+        if tag == "{%s}anchor" % _WP:
+            return "drawing-floating"
+        if tag == "{%s}inline" % _WP:
+            return "drawing-inline"
+        if tag == "{%s}shape" % _V:
+            return "vml"
+        parent = parent.getparent()
+    return "unknown"
+
+
+def _box_text(content, doc) -> str:
+    """One box's text: its own paragraphs, newline-joined, blanks dropped.
+
+    Each paragraph is read through :class:`docx.text.paragraph.Paragraph`, i.e.
+    exactly the accessor every other mode uses, so a box paragraph's ``w:tab``,
+    ``w:br`` and hyperlink text come out the same way a body paragraph's does.
+    ``Paragraph.text`` walks only ``w:r`` / ``w:hyperlink`` **children**, so a
+    box nested inside one of those runs does not leak into its host paragraph --
+    the property that makes one-entry-per-box honest.
+    """
+    lines = [Paragraph(p_el, doc).text for p_el in _own_paragraphs(content)]
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _box_key(box) -> str:
+    """A stable identity for a box element, usable as a dict key.
+
+    ``id()`` is not one: lxml materialises element proxies on demand, so the
+    same node reached by two different expressions can yield two objects with
+    two ids (measured: a ``KeyError`` on a 43-box document). ``==`` compares
+    nodes but cannot be hashed, so the tree path -- unique per node by
+    construction -- is the key.
+    """
+    return box.getroottree().getpath(box)
+
+
+def _box_ordinals(root) -> dict:
+    """``{box key: document-wide ordinal}`` for every box under *root*."""
+    return {_box_key(box): i
+            for i, box in enumerate(iter_textboxes(root))}
+
+
+def iter_textboxes(root) -> list:
+    """Every text box at or under *root*, in document order, one entry per box.
+
+    The returned elements are the boxes' ``w:txbxContent`` nodes, so a caller
+    that wants runs can walk them and a caller that wants text can use
+    `textbox_texts`. ``mc:AlternateContent`` pairs are collapsed: one box whose
+    Choice and Fallback both carry the same sentence yields **one** element.
+
+    Scope note: this walks the tree it is handed. Pass ``doc.element.body`` for
+    the body (what the CLI modes do). Header/footer parts are separate trees and
+    are left to `docx_footer`, which already has a dedicated reader for them.
+    """
+    return _boxes_in(root)
+
+
+def textbox_texts(root, doc) -> list:
+    """Text of every box under *root*, doc order -- ``--text``'s view."""
+    return [_box_text(box, doc) for box in iter_textboxes(root)]
+
+
+def textbox_blocks(root, doc) -> list:
+    """One record per box: ordinal, container shape, text and paragraph split.
+
+    ``index`` is the box's ordinal in document order and is the same number
+    ``--runs`` reports as ``textbox``, so a caller can go from a ``--blocks``
+    entry straight to the runs inside it.
+    """
+    out = []
+    for ordinal, box in enumerate(iter_textboxes(root)):
+        paragraphs = [Paragraph(p_el, doc).text for p_el in _own_paragraphs(box)]
+        out.append({
+            "index": ordinal,
+            "flavor": _box_flavor(box),
+            "text": _box_text(box, doc),
+            "paragraphs": paragraphs,
+        })
+    return out
+
+
 def append_part_text(target: list[str], part, seen: set[int]) -> None:
     """Append one header/footer variant without duplicating linked parts."""
     marker = id(part._element)
@@ -62,7 +282,11 @@ def append_part_text(target: list[str], part, seen: set[int]) -> None:
 def extract_text(doc) -> dict:
     out = {"body": [p.text for p in doc.paragraphs],
            "tables": [table_to_rows(t) for t in doc.tables],
-           "headers": [], "footers": []}
+           "headers": [], "footers": [],
+           # `body` keeps its old meaning exactly: paragraphs that ARE body
+           # children. A box's paragraphs are not, so folding them in would
+           # change what `body` has always listed. They get their own key.
+           "textboxes": textbox_texts(doc.element.body, doc)}
     seen_headers: set[int] = set()
     seen_footers: set[int] = set()
     for section in doc.sections:
@@ -166,8 +390,27 @@ def extract_blocks(doc) -> list:
     The flat body[]/tables[] split loses insertion order; this keeps it, and
     carries the per-paragraph style plus any embedded image relationship ids
     so a markdown round trip can rebuild headings, tables and figures.
+
+    A **``textbox``** block follows the paragraph that anchors it (a box lives
+    inside a run of that paragraph, so "right after the host" is its authored
+    position). The type is additive: every pre-existing block keeps exactly the
+    keys and meanings it always had, which is what `to_markdown` relies on.
+
+    "Additive" is a claim about **keys**, not about bytes. A document without
+    boxes yields the same block list it always did, byte for byte — but only
+    because nothing is added there. In a document *with* boxes the list grows,
+    and every entry after an inserted ``textbox`` block necessarily moves down:
+    inserting after the host cannot leave later ordinals untouched, so
+    ``--blocks`` indices are **not** stable across the before/after of adding a
+    box (measured: a plain document numbered six paragraphs 0-5; four boxes
+    anchored inside paragraph 1 turned paragraph 5's index into 12, because each
+    box contributed its own paragraph record plus a ``textbox`` block). The shift
+    equals the number of records inserted ahead of the entry, never zero.
+    Positions and indices were never part of the contract — the block's
+    ``type`` / ``text`` / ``style`` keys are.
     """
     blocks = []
+    ordinals = _box_ordinals(doc.element.body)
     for child in doc.element.body.iterchildren():
         tag = child.tag.split("}")[-1]
         if tag == "p":
@@ -191,12 +434,34 @@ def extract_blocks(doc) -> list:
                 "text": para.text,
                 "images": names,
             })
+            blocks.extend(_textbox_blocks_after(child, doc, ordinals))
         elif tag == "tbl":
             table = Table(child, doc)
             blocks.append({"type": "table", "style": table.style.name
                            if table.style else "",
                            "rows": table_to_rows(table)})
+            # A box can sit inside a table cell too; the same rule applies.
+            blocks.extend(_textbox_blocks_after(child, doc, ordinals))
     return blocks
+
+
+def _textbox_blocks_after(host, doc, ordinals: dict) -> list:
+    """``textbox`` blocks for every box anchored under *host*, in order.
+
+    ``index`` is the box's document-wide ordinal, so ``--blocks`` and ``--runs``
+    name the same box by the same number even though this walk is per host.
+    """
+    out = []
+    for box in iter_textboxes(host):
+        out.append({
+            "type": "textbox",
+            "index": ordinals[_box_key(box)],
+            "flavor": _box_flavor(box),
+            "text": _box_text(box, doc),
+            "paragraphs": [Paragraph(p_el, doc).text
+                           for p_el in _own_paragraphs(box)],
+        })
+    return out
 
 
 # ---------------------------------------------------------------- run-level
@@ -273,6 +538,49 @@ def _rpr_font(rpr):
     return el.get(qn("w:ascii"))
 
 
+def _rpr_highlight(rpr):
+    """``w:highlight/@w:val`` — the character highlight colour.
+
+    Returns the **schema spelling** (``darkMagenta``), not the python-docx
+    member name: ``WD_COLOR_INDEX`` cannot express every legal value (it has no
+    ``DARK_MAGENTA``; it calls ``darkMagenta`` ``VIOLET``), so reporting its
+    names would hide the value a caller needs to write back. ``None`` means the
+    run states nothing — which is *not* the same as ``none``, the explicit
+    "no highlight" value; both are reported as the strings they are.
+
+    Kept as a plain attribute read rather than ``font.highlight_color`` for the
+    same reason: that property raises ``KeyError`` on a value it does not know,
+    and this file must be able to describe a document it cannot represent.
+    """
+    if rpr is None:
+        return None
+    el = rpr.find(qn("w:highlight"))
+    if el is None:
+        return None
+    return el.get(qn("w:val"))
+
+
+def _rpr_color(rpr):
+    """``w:color/@w:val`` — the run's explicit font colour, uppercase hex.
+
+    ``auto`` is passed through as-is (it is a legal value meaning "let the
+    style decide"), and a run whose colour resolves through ``w:themeColor``
+    reports that theme name with a ``theme:`` prefix. Both matter to a caller
+    about to override the colour: ``auto`` and ``theme:accent1`` both render
+    some colour, and neither is the hex value they might assume.
+    """
+    if rpr is None:
+        return None
+    el = rpr.find(qn("w:color"))
+    if el is None:
+        return None
+    theme = el.get(qn("w:themeColor"))
+    if theme:
+        return f"theme:{theme}"
+    val = el.get(qn("w:val"))
+    return val.upper() if val else None
+
+
 def describe_run(run) -> dict:
     """One run as JSON-able fields: text, character formatting, field/drawing."""
     r_el = run._r
@@ -284,6 +592,13 @@ def describe_run(run) -> dict:
         "italic": _rpr_flag(rpr, "i"),
         "size_pt": _rpr_size_pt(rpr),
         "font": _rpr_font(rpr),
+        # Character colour/highlight, so "I set a highlight" can be *read back*
+        # instead of trusted. Both are additions: every key above keeps its
+        # name and meaning (`_format_fingerprint` below is what
+        # `mixed_format` uses, and it deliberately does not include these two —
+        # see its docstring).
+        "highlight": _rpr_highlight(rpr),
+        "color": _rpr_color(rpr),
         # A field run carries the field's control characters, not content the
         # caller can overwrite with text; a drawing run carries a picture.
         # Both are called out so `--runs` never presents them as writable text.
@@ -295,7 +610,16 @@ def describe_run(run) -> dict:
 
 
 def _format_fingerprint(run_info: dict) -> tuple:
-    """Everything that would be lost by overwriting a run with flat text."""
+    """Everything that would be lost by overwriting a run with flat text.
+
+    ``highlight`` and ``color`` are **not** part of it, on purpose. This tuple
+    decides ``mixed_format``, whose meaning is pinned by
+    ``tests/test_read_runs.py``: "a flat string cannot say which character is a
+    subscript". Adding highlight would silently widen that flag to every
+    paragraph with a highlighted word in it — a different claim, and one that
+    would make the flag fire on paragraphs ``set-cell`` handles fine. A new
+    key must not redefine an old one.
+    """
     return (run_info["vert_align"], run_info["bold"], run_info["italic"],
             run_info["size_pt"], run_info["font"])
 
@@ -360,25 +684,66 @@ def _iter_paragraphs_annotated(container, table_path=(), seen_cells=None):
 def extract_runs(doc) -> dict:
     """Per-paragraph run inventory: the view a writer needs *before* writing.
 
-    Scope: body paragraphs plus every table cell, nested tables included.
-    Header/footer parts are **not** walked -- `--blocks` does not cover them
-    either, and `set-cell` cannot reach them, so listing them here would report
-    traps that no edit command can act on. Use `--text` for their text.
+    Scope: body paragraphs plus every table cell, nested tables included, and
+    the paragraphs **inside every text box**. Header/footer parts are **not**
+    walked -- `--blocks` does not cover them either, and `set-cell` cannot reach
+    them, so listing them here would report traps that no edit command can act
+    on. Use `--text` for their text.
+
+    A box's paragraphs carry ``"textbox": <n>`` where *n* is the box's ordinal
+    (the same number ``--blocks`` prints as ``textbox`` blocks' ``index``), and
+    their ``path`` reads ``textbox[n]`` (chained behind a cell path when the box
+    sits in a table).
+
+    Body and cell paragraphs keep ``"textbox": null`` and exactly the values they
+    had before for every pre-existing key — ``index`` included **only when the
+    document has no boxes**. Box records are inserted after their host
+    paragraph, so in a document with boxes every later record's ``index`` moves
+    down by the number of records inserted ahead of it (measured: six plain
+    paragraphs numbered 0-5; four boxes anchored inside paragraph 1 moved
+    paragraph 5 from ``index`` 4 to 12). What is stable is the record's
+    *content*: ``style`` / ``text`` / ``mixed_format`` / ``runs`` /
+    ``path`` and the new ``textbox`` key.
+
+    Not byte-identical, either, even with no boxes at all: ``--runs`` gained the
+    ``textbox: null`` field on every record. That is purely additive (an older
+    consumer reading the keys it knows is unaffected), but it *is* a new key, so
+    it is a superset rather than the same bytes.
     """
     paragraphs = []
-    for index, (para, label, table_path) in enumerate(
-            _iter_paragraphs_annotated(doc)):
-        runs = [describe_run(run) for run in para.runs]
-        paragraphs.append({
-            "index": index,
-            "path": label,
-            "table_path": [list(step) for step in table_path],
-            "style": para.style.name if para.style else "",
-            "text": para.text,
-            "mixed_format": is_mixed_format(runs),
-            "runs": runs,
-        })
+    ordinals = _box_ordinals(doc.element.body)
+    for para, label, table_path in _iter_paragraphs_annotated(doc):
+        paragraphs.append(_run_record(len(paragraphs), para, label,
+                                      table_path, None))
+        paragraphs.extend(_textbox_run_records(
+            len(paragraphs), para, doc, ordinals, table_path))
     return {"paragraphs": paragraphs}
+
+
+def _run_record(index, para, label, table_path, textbox) -> dict:
+    runs = [describe_run(run) for run in para.runs]
+    return {
+        "index": index,
+        "path": label,
+        "table_path": [list(step) for step in table_path],
+        "textbox": textbox,
+        "style": para.style.name if para.style else "",
+        "text": para.text,
+        "mixed_format": is_mixed_format(runs),
+        "runs": runs,
+    }
+
+
+def _textbox_run_records(start, host_para, doc, ordinals, table_path) -> list:
+    """``--runs`` records for the boxes anchored inside *host_para*, in order."""
+    out = []
+    for box in iter_textboxes(host_para._p):
+        ordinal = ordinals[_box_key(box)]
+        label = f"{_table_path_label(table_path)} textbox[{ordinal}]"
+        for p_el in _own_paragraphs(box):
+            out.append(_run_record(start + len(out), Paragraph(p_el, doc),
+                                   label, table_path, ordinal))
+    return out
 
 
 def detect_revisions(path: str) -> dict:
@@ -433,7 +798,18 @@ def to_markdown(doc, image_dir: str | None = None,
                 if r_i == 0:
                     out.append("|" + "|".join(["---"] * width) + "|")
             out.append("")
-        else:
+        elif b["type"] == "textbox":
+            # A box is a *drawing*: it has no authored position on the text
+            # line, so it cannot be merged into the surrounding paragraph
+            # without inventing an order Word does not have. It is emitted as
+            # its own quoted block, which keeps the text visible (the point)
+            # and keeps the markdown a faithful round trip of paragraphs.
+            text = b["text"].strip()
+            if text:
+                for line in text.split("\n"):
+                    out.append(f"> {line}".rstrip())
+                out.append("")
+        elif b["type"] == "paragraph":
             text = b["text"].strip()
             for img in b.get("images", []):
                 if image_dir and base_dir:
@@ -446,6 +822,9 @@ def to_markdown(doc, image_dir: str | None = None,
                 out.append(text)
             if text or b.get("images"):
                 out.append("")
+        # Unknown block types are skipped rather than guessed at: this loop is
+        # the markdown round trip's consumer, and a future type it has not been
+        # taught would otherwise crash the whole render.
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -520,8 +899,9 @@ def main() -> int:
                    help="ordered body stream (paragraphs + tables interleaved)")
     g.add_argument("--runs", action="store_true",
                    help="per-paragraph run inventory: text, sub/superscript, "
-                        "bold, italic, size, font, field/drawing, and "
-                        "mixed_format (read this before writing into a cell)")
+                        "bold, italic, size, font, highlight, colour, "
+                        "field/drawing, and mixed_format (read this before "
+                        "writing into a cell, and to verify a char-format run)")
     g.add_argument("--md", metavar="FILE",
                    help="write a Markdown plain-text rendition to FILE")
     ap.add_argument("--image-dir", metavar="DIR",
@@ -575,6 +955,8 @@ def _run(args) -> int:
                                         if b["type"] == "table"),
                           "headings": sum(1 for b in blocks
                                           if b["type"] == "heading"),
+                          "textboxes": sum(1 for b in blocks
+                                           if b["type"] == "textbox"),
                           "images": sum(len(b.get("images", []))
                                         for b in blocks)},
                          ensure_ascii=False))

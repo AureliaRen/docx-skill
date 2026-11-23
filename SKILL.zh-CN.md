@@ -6,8 +6,8 @@ license: MIT
 
 # docx — 离线 docx 处理
 
-`scripts/` 全平铺，**27 个 `.py` + 1 个 `.ps1` = 28 个文件**。**26 个是 CLI**（各自带 `if __name__ == "__main__"`
-守卫，能直接从命令行跑），**`_bootstrap.py` 是唯一的纯库**；这 26 个里 **19 个有 argparse 表面**（`--help` 打印 `usage: …`），另 7 个有 `__main__` 但没有 argparse——6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot.py` 跑的是自检。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码，`--page-probe` 只属于它）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
+`scripts/` 全平铺，**28 个 `.py` + 1 个 `.ps1` = 29 个文件**。**27 个是 CLI**（各自带 `if __name__ == "__main__"`
+守卫，能直接从命令行跑），**`_bootstrap.py` 是唯一的纯库**；这 27 个里 **20 个有 argparse 表面**（`--help` 打印 `usage: …`），另 7 个有 `__main__` 但没有 argparse——6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot.py` 跑的是自检。另有 `tools/word_accept.py` 做文档级外挂验收（Word COM 实测页码，`--page-probe` 只属于它）。一律 `python -X utf8 scripts/<名>.py ...`，参数以各文件 `main()` 为准。
 
 输出约定按脚本而异，这是刻意的：
 
@@ -80,6 +80,7 @@ pack("unpacked/", "out.docx", original="in.docx")
 | 删段落 | `python scripts/docx_edit.py delete in.docx --index 3 -o out.docx` |
 | 套段落样式 | `python scripts/docx_edit.py style in.docx --index 0 --style "Heading 1" -o out.docx` |
 | 合并格式相同的相邻 run | `python scripts/docx_edit.py normalize in.docx -o out.docx` |
+| 给锚点文字设高亮 / 颜色 / 粗体 / 斜体 | `python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta --bold -o out.docx` |
 | 插目录**域** | `python scripts/docx_edit.py toc in.docx --index 1 -o out.docx` |
 | 页脚加「第 X 页 / 共 Y 页」 | `python scripts/docx_edit.py page-numbers in.docx -o out.docx` |
 | 健康检查（包完整性、关系、图片 magic、样式引用） | `python scripts/docx_validate.py in.docx` |
@@ -174,7 +175,7 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 
 `docx_create.py` 读一份 JSON spec。顶层键：`page`、`styles`、`header`、`footer`、`footer_page_numbers`、`blocks`。每个 block 有一个 `type`：
 
-`footer_page_numbers`（顶层或 `section_break` 里）接受 `fmt`、`start`、`align`、`template`、`total`、`prefix`、`suffix`、`page_type`，以及 `font`、`size_pt`、`bold`——这三个作用于承载页码的 run：`font` 与 `size_pt` 文字 run 和域 run 都吃，`bold` 对承载页码数字的域 run 只在真值时生效（精确口径见下表）。它们早先一设就抛 `ValueError`，现在可用；中英混排的页脚里 `font` 会把四个 `w:rFonts` 槽（`ascii` / `hAnsi` / `eastAsia` / `cs`）一起绑死，`第 X 页 共 Y 页` 这种中文前缀才不会退回主题的东亚字体、让数字单独用你指定的那个。
+`footer_page_numbers`（顶层或 `section_break` 里）接受 `fmt`、`start`、`align`、`template`、`total`、`prefix`、`suffix`、`page_type`，以及 `font`、`size_pt`、`bold`——这三个作用于承载页码的 run：`font` 与 `size_pt` 文字 run 和域 run 都吃，`bold` 对承载页码数字的域 run 只在真值时生效（精确口径见下表）。它们早先一设就抛 `ValueError`，现在可用；中英混排的页脚里 `font` 会把四个 `w:rFonts` 槽（`ascii` / `hAnsi` / `eastAsia` / `cs`）一起绑死，`第 X 页　共 Y 页` 这种中文前缀才不会退回主题的东亚字体、让数字单独用你指定的那个。
 
 **`bold` 作用在两类 run 上，而这两类走两套规则——所以 `"bold": false` 与不传 `bold` 不是同一个请求。** 一份 `page_of` 页脚由文字 run（`"Page "`、`" of "`、中文前后缀）和域 run（`PAGE` / `NUMPAGES` 域：页码数字本身，外加它的 begin / separate / end 三根骨架）混成。文字 run 走 `run.font.bold`，三态；域 run 走 `_rpr()`，那里写的是 `if bold:`，两态。拿同一份页脚、把 `font` 与 `size_pt` 按住不动，XML 里的差别就是这三行：
 
@@ -194,7 +195,7 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 | `numbered_list` | `items`；可选 `num_id`（复用已有计数器）、`num_text`（默认 `%1.`）、`num_fmt`、`start`、`ilvl`、`indent_left`、`hanging` |
 | `caption` | `label`（默认 `图`）、`text`、可选 `bookmark` —— 写入 `图 N  题注`，带 `SEQ` 计数器 + 书签 |
 | `table_caption` | 字段同 `caption`，用于表格 |
-| `crossref` | `target`（书签名），可选 `prefix`、`suffix`、`format`（`default`/`full`/`above-below`/`page`/`number`）、`cached`、`own_paragraph` |
+| `crossref` | `target`（书签名），可选 `prefix`、`suffix`、`format`（`default`/`full`/`above-below`/`page`/`number`/`paragraph-number`/`relative-context`/`full-context`）、`cached`、`own_paragraph`、`superscript` / `vert_align`、`hyperlink`、`static`、`no_mergeformat` |
 | `table` | `header`、`rows`，可选 `style`（默认 `Table Grid`）、`header_bold`、`keep_together` |
 | `image` | `path`，以及 `width_mm` **或** `width_frac`（二者互斥） |
 | `page_break` | — |
@@ -209,6 +210,8 @@ blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one
 ```
 
 exit `2` 的承诺是**什么都没写**，所以改完 spec 直接重试，不用猜是不是留了半份文档。值也不做钳制：超范围的值会连同它本该被钳进去的区间一起报出来。
+
+**spec 的键名必须是目标命令真正读的那个名字，这一条不是白来的。** 校验器只证明键按**本表**的拼法写对了；随后 builder 把值经一个 namespace 对象交给 `cmd_ref` / `cmd_caption`，而它们用 `getattr(args, "name", 默认值)` 取值——**这个写法分不出「没有这个属性」和「属性是 false」**。所以名字对不上就是**静默 no-op**：修复前实测，`{"type": "crossref", "target": "g1", "hyperlink": false}` 依然产出一份含 `<w:hyperlink>` 的文档，`exit 0` 且 `{"ok": true}`。spec 里叫 `hyperlink`（正向，默认 true），`cmd_ref` 读的是 `no_hyperlink`（反向），所以 builder 必须**翻译而不是转发**。`tests/test_create_crossref_args.py` 从 `docx_crossref.py` 里把 `getattr` 的名字解析出来做全量对照，builder 少传一个就红。
 
 `styles[]` 条目接受 `font`、`font_east_asia`、`size_pt`、`bold`、`italic`、`color`、`base`、`outline_level`——最后一个会写 `<w:pPr><w:outlineLvl>`，Word 才把该样式当标题。缺了它，模板自带的 `卷标题` / `ChapterTitle` 在 Word 眼里就是**正文**，长得再像也没用：导航窗格是空的，`TOC \o` 一条也收不到。
 
@@ -328,6 +331,54 @@ Word 的编号是**两级间接**，本工具链别的脚本从没暴露过这�
 交叉引用是 `REF <bookmark>` 域，题注是包在书签里的 `SEQ <label> \* ARABIC` 域。本工具链写出的**每个域都带缓存结果**（`begin / instrText / separate / result / end`），所以编号在 Word 重算任何东西之前就已经看得见，F9 之后也仍然对。`renumber` 负责重算 `SEQ` 计数器并改写所有缓存的 `REF` 值——**这才是「读者从不更新域」也能读到正确编号的原因**。
 
 `docx_crossref bookmark` 是 `crossref` block 的先决条件：它给某一段打上具名书签，后面的 `ref`（或 spec 里的 `crossref` block）才有东西可指。名字必须唯一，同名再跑一次 exit `1`，报 `bookmark already exists`。
+
+### `ref --format` 的八个值，以及各自写的是哪个域
+
+`--format` 决定这条引用落成哪个 Word 域。合法值一共八个：前五个管日常，后三个是文档真需要时才出现的。
+
+| `--format` | 写出的域 | 读起来是 |
+|---|---|---|
+| `number` | 裸 `REF <bookmark>` 编号 | `3` |
+| `default` | `\h` —— 指向书签的超链接 | `3`，可点 |
+| `full` | 整段题注文字（要求书签跨住那一段） | `图 3 一张…` |
+| `above-below` | `\p` —— 位置相对词 | `上图` / `下图` |
+| `page` | `PAGEREF` —— 书签落在第几页 | `7` |
+| `paragraph-number` | `\n` —— 段号 | `[1]`，就是参考文献列表上那个编号 |
+| `relative-context` | `\r` —— 相对最近一个编号项的编号 | 相对所属标题 |
+| `full-context` | `\w` —— 书签的完整上下文 | 编号加上它所在的上下文 |
+
+四个开关的差别是「一个数字」和「读者能据此行动的数字」之间的差别：`\p` 回答**在哪一侧**，`PAGEREF` 回答**在第几页**，`\n` 回答**第几个编号项**，`\r` 回答**相对于谁**。**按句子在问什么挑域**，别按哪个输出看着顺眼挑。
+
+`--format full` 要求书签跨住那段。`--format page` 不能与 `--static` 同用（见下）：页码在分页发生之前不存在。
+
+### 上标引用：域还是静态，各自付什么代价
+
+「图¹」这类上标引注，是两种设计差别最明显的地方，而且**不是外观问题**。`--superscript` 写的是 `<w:vertAlign w:val="superscript">`，它能不能活到 PDF 里，取决于你选了下面哪种形状。
+
+| | `ref`（默认，域） | `ref --static` |
+|---|---|---|
+| 标记 | `<w:hyperlink>` 包着 5 个 run 的 `REF` 域 | `<w:hyperlink>` 包着**一个** `<w:r>`，编号就是 `<w:t>` 文本 |
+| 编号跟着题注走 | 会——F9 / 打印自动重算 | **不会**——写的时候就冻住 |
+| 熬得过 `Fields.Update()` | 熬得过，**但必须有 `\* MERGEFORMAT`** | 无条件熬得过：没有域可重绘 |
+| 要不要先按 F9 | 不用（缓存结果已写） | 永远不用 |
+| 在它上面加一张图 | 自动重编号 | 得重跑命令 |
+
+咬人的是第三行。Word 16.0 实测，整篇 `Fields.Update()` 后导 PDF，用 PyMuPDF 读回 span：
+
+```
+域 + \* MERGEFORMAT     '1'  sz 7.0  y 197.18     上抬 2.52 pt、半字号
+域 + --no-mergeformat   '1'  sz 11.0 y 199.70     上标没了
+--static                '1'  sz 7.0  y 197.18     与第一行一致
+正文                    sz 11.0 y 199.70          基线，供对照
+```
+
+所以 `MERGEFORMAT` **不是装饰**：没有它，Word 会从书签目标重新渲染域结果，下一次更新就把上抬的效果抹掉——**而导 PDF 正好就是一次更新**。它默认就写；`--no-mergeformat` 只用来复现这个故障。
+
+`--static` 用在你要让外观**结构性**成立、而不是靠一个开关撑着的时候——比如流水线上还有别的东西会重建域，或者文档必须在不更新域的阅读器里也是对的。代价要清楚：编号从此不跟题注走，增删图表就得重跑。**文档还在改的时候用域形式（默认）**；`--static` 是收尾那一遍用的。
+
+`--static` 会拒绝 `--format page` 与 `--format above-below`（exit `2`）：页码依赖分页，建文档时页面还没排出来；上方/下方由 Word 逐次判定。把这两个冻成字面量，等于写一个「看起来像对的错数」。
+
+两种模式都会在报告里说明自己用的是哪种：`"mode": "field"` 配 `"needs_field_update": true`，或 `"mode": "static"` 配 `"needs_field_update": false`。构建脚本可以直接断言拿到的是想要的那种，而不是从标记反推。
 
 ## 公式转换（LaTeX → 原生 Office Math）
 
@@ -496,6 +547,153 @@ python scripts/docx_read.py in.docx --runs
 凡这次没能保住的，都会在 stderr 打一行 `warning:`，同时进 JSON 的 `warnings`
 数组。**`exit 0` 不等于格子出来跟原来一样。**
 
+## 字符级格式：给锚点文字设高亮 / 颜色 / 粗体 / 斜体
+
+`set-cell` 和 `replace` 写的是**文字**。`char-format` 只改**已有的字**长什么样，
+而且按内容定位，不按下标：
+
+```bash
+python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta
+python scripts/docx_edit.py char-format in.docx --find "重点" --color 00a0ff --bold -o out.docx
+python scripts/docx_edit.py char-format in.docx --find "关键词" --bold --italic -o out.docx
+```
+
+**选择器是锚点字符串，而且命中几处就改几处。** `--find` 逐段比对（正文、表格、
+嵌套表格、页眉页脚），每一处都算 —— 两段各含一个 `重点` 时实测报告
+`{"occurrences": 2, "runs_changed": 2, "paragraphs_touched": 2,
+"paragraphs_searched": 8}`。这里刻意**没有** `--index`：`docx_read --runs` 的段落
+编号横跨正文 + 单元格 + 文本框，而 `doc.paragraphs` 只数正文段落，同一个工具对里
+「index 7」会指两个不同的段落。文字也是更耐久的定位器 —— 任何一次编辑都会让后面
+的位置整体平移，而平移后的位置照样「能用」，只是格式落到了别的行上。
+
+**锚点只占某个 run 的一部分时，会把这个 run 切开**，前后文字保住自己原有的格式。
+实测：`本段包含重点两个字，其余不变。` 上执行 `--find 重点` 之后，`--runs` 报出三个
+run —— `本段包含` / `重点` / `两个字，其余不变。`，只有中间那个带上了新属性。切不动
+的 run（里面还有制表符、换行、域或图片）会被**拒收**而不是整块改掉：「比你要求的
+多高亮了几个字」和 bug 在调用方眼里分不出来。
+
+### `--highlight` 的合法值，以及 python-docx 叫不出名字的那个
+
+合法 `w:highlight` 值共 17 个（`ST_HighlightColor`）：
+
+```
+black blue cyan darkBlue darkCyan darkGray darkGreen darkMagenta darkRed
+darkYellow green lightGray magenta none red white yellow
+```
+
+**拼法自由，值不自由。** `darkMagenta` / `DARK_MAGENTA` / `dark_magenta` 以及
+python-docx 的成员名 `VIOLET` 都会归一成 `darkMagenta` —— 实测 `--highlight
+violet` 退出 `0`，落盘是 `w:highlight w:val="darkMagenta"`。走别名路线是刻意
+设计的：`WD_COLOR_INDEX` 有 18 个成员，其中只有 16 个在这里合法（`AUTO` 写的是
+`default`、`INHERITED` 什么都不写），而且它**没有 `darkMagenta`** —— 恰恰是这个
+功能被要求支持的那个颜色；`VIOLET` 用一个人人都不叫的名字写它。所以那张枚举只
+被当作**别名来源**读取 `xml_value`，从不拿来做闸门；闸门是那 17 个值。
+
+报告会把**归一后**的值同时放进 `applied` 和顶层，确认「到底落进去什么」不必去翻
+XML：
+
+```json
+{"find": "重点", "occurrences": 2, "runs_changed": 2, "paragraphs_touched": 2,
+ "paragraphs_searched": 8, "applied": {"highlight": "darkMagenta", "color": "00A0FF", "bold": true},
+ "highlight": "darkMagenta", "color": "00A0FF", "bold": true, "ok": true, "output": "out.docx"}
+```
+
+`--color` 收六位十六进制（带不带 `#` 都行，如 `FF0000`、`#00a0ff`）或 `auto`；
+写盘时转大写（`#00a0ff` 落成 `00A0FF`），并且会替换掉该 run 上的主题色 —— 在
+`CT_Color` 里主题属性在渲染时压过 RGB 孪生值。
+
+### `--highlight none` 与 `--highlight inherit` 不是一回事
+
+在一个干净的 run 上两者看着都是「没有高亮」，所以这个区别必须写清楚。实测在一个
+**本来就带** `w:highlight w:val="yellow"` 的 run 上：
+
+| 旗标 | 调用后的 `w:rPr` | 含义 |
+|---|---|---|
+| `--highlight none` | `<w:rPr/>` —— 元素被**删掉** | 明确取消高亮；样式层的高亮会被压住 |
+| `--highlight inherit` | `<w:rPr><w:highlight w:val="yellow"/></w:rPr>` —— 原样不动 | 什么都不写；样式怎么说就怎么算 |
+
+`inherit` 就是「这个旗标别碰」：它的存在是为了让一次调用可以只设 `--color`（或
+`--bold`），而不顺手清掉别人放的高亮。`none` 是**主动删除**。两者都是
+`--highlight` 的合法*取值*，而且都不写假值。
+
+粗体斜体是同一套三态逻辑，`w:val="0"` 表示显式关：`--bold` 写 `<w:b/>`，
+`--no-bold` 写 `<w:b w:val="0"/>`（实测 `<w:rPr><w:b w:val="0"/><w:highlight
+w:val="yellow"/></w:rPr>`），两个都不给就什么都不写。只写拉丁孪生 `w:b` / `w:i`，
+从不写 `w:bCs` —— 一个和 `w:b` 打架的 `w:bCs` 本身就是另一种惊吓。
+
+### 拒收：`exit 2`、stderr 一行、一个字节都不写
+
+下面每一条都发生在 `doc.save()` **之前**，所以输入文件逐字节不变、stdout 保持空：
+
+| 情形 | stderr（实测原文） |
+|---|---|
+| 值不在那 17 个里 | `error: --highlight 'purple' is not a legal w:highlight value; legal: black, blue, cyan, … (any spelling, e.g. darkMagenta / DARK_MAGENTA / dark_magenta)` |
+| 没有任何 run 带这个锚点 | `error: char-format --find '不存在的字': no run in the document carries this text. Searched 8 paragraph(s) across body, tables, headers and footers (text boxes and tracked-change content are out of scope, as for every other run-level writer).` |
+| 一个格式旗标都没给 | `error: char-format needs at least one format to set: --highlight, --color, --bold/--no-bold, --italic/--no-italic` |
+| `--color` 不是十六进制 | `error: --color 'red' is not a colour: expected 6 hex digits (FF0000 or #00a0ff) or 'auto'` |
+
+拼错的颜色从前是**原样写进去**的，结果是文档能校验、能打开、**一点高亮都不显示**，
+而且没有任何东西解释为什么。锚点一处都没命中同样拒收，理由和 `replace` 那条一样
+（见[第 4 条：改文本不要用 shell 的字符串替换](#4-改文本不要用-shell-的字符串替换)）：
+静默的零看起来就像成功。
+
+### 验证靠读回
+
+设置不是证据，读回才是。`docx_read --runs` 会逐 run 报 `highlight` 与 `color`，
+正好是这条命令写的那两个：
+
+```bash
+python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta -o out.docx
+python scripts/docx_read.py out.docx --runs
+```
+
+实测切开后的读回：带 `重点` 的那个 run 报
+`{"text": "重点", "highlight": "darkMagenta", "color": "00A0FF", "bold": true}`，
+左右两个邻居三项全是 `null`。**邻居为 null 才是真正的检查** —— 它证明切 run 没有
+把格式渗到周围文字上。
+
+## 浮动文本框
+
+文本框里的段落**不是** body 段落。它们住在 `w:txbxContent` 里，父链只可能是
+`wps:txbx`（DrawingML `w:drawing` 内）或 `v:textbox`（VML `w:pict` 内），
+**永远不是 `w:body` 的直接子元素**。于是 `doc.paragraphs` 不列它们、
+`body.iterchildren()` 到不了它们、`Paragraph.text` 也只停在自己的 `w:r` 子元素上：
+**任何沿 body 段落遍历的模式都会把这种文档读成空的**。真实文件实测：一份阅读
+批注作业有 43 条批注全在浮动框里，`--text` / `--blocks` / `--runs` 三个模式
+**各读到 0 条** —— 这就是「用 `python-docx` 扫一遍，判定 43 处全是色块、没有
+批注文字」的来源。
+
+四种读取模式现在都覆盖它们：
+
+| 模式 | 框里的文字出现在哪 |
+|---|---|
+| `--text` | 新增独立键 `textboxes`（一个框一个字符串）；`body` 的语义不变 |
+| `--blocks` | 紧随宿主段落之后的 `textbox` 块，带 `index` / `flavor` / `text` / `paragraphs` |
+| `--runs` | 框自己的段落，每段带 `textbox: <n>`，`path` 形如 `body textbox[<n>]` |
+| `--md` | 框里的文字作为引用块（`>`）输出 |
+
+body 段落与表格单元格不受影响：无框文档的块序列与从前一致，`body` 的语义不变，
+每段的 run 字段也一个不少 —— 新增的只有恒为空的 `textboxes` 列表和每条 `--runs`
+记录上恒为 `null` 的 `textbox` 字段。最后这一点正是为什么「不变」不能读成
+「逐字节相同」：`--runs` 多了一个键，所以它的输出是**超集**，不是同一批字节。
+
+**有框**的文档里序号会平移，这没法避免：`textbox` 块插在宿主段落之后，于是插入点
+之后的每一条都往下挪（实测：六个无框段落编号 0-5；四个框锚在第 1 段里，正文第 5
+段的 `index` 从 `4` 变成 `12`——每个框既带来自己的段落记录，又带来一个 `textbox`
+块）。跨一次编辑缓存 index 之前要知道这件事 —— 稳定的是块的 `type` / `text` /
+`style` 这几个键，不是它的位置。
+
+读输出时要知道两件事：
+
+- **一个框一条**。Word / WPS 把框写成 `mc:AlternateContent`，里面 `mc:Choice`
+  （DrawingML）与 `mc:Fallback`（VML）**各存一份同样的文本**。读者在有文本的
+  Choice 里取，Choice 没文本时才退到 Fallback —— 所以 43 个框报 **43**，不是 86。
+  自己写遍历时必须合并这一对，否则每个计数都会静默翻倍。
+- **`index` 是框的序号**，`--blocks` 与 `--runs` 用同一个号码指同一个框。
+
+分工：`docx_footer.py` 读页眉页脚里的框并量它的几何；`docx_read.py` 读正文里
+框的**文字**。两边不重复实现。
+
 ## 表格几何
 
 Word 算列宽的方式会让人踩空：
@@ -576,6 +774,117 @@ pwsh scripts/pdf_export.ps1 -DocxPath in.docx [-PdfPath out.pdf]
 
 带 OMML 的文档别走 WPS。
 
+## 工作流程：每次存盘之后的那几项检查
+
+四条规矩，每一条都是真实交付事故换来的。有人给一份「阅读批注作业」做 Word 排版，成品要交。工具链就在手边，他一个检测器都没用，改走「转 PDF → 转 PNG → 肉眼看图 → 手动量 y 坐标」这一套，前后返工了**十几轮**。事后对成品跑一次 `--lint`，它当场说出了他肉眼追了十几轮的同一批问题：
+
+```
+lint: 2 issue(s), 5 page(s)
+lint: sparse_pages=[3, 5] blank_pages=[]
+  warning sparse-page page 3: fill_ratio 0.213 < 0.40 (content covers 21.3% of the page height; …)
+  warning sparse-page page 5: fill_ratio 0.117 < 0.40 (content covers 11.7% of the page height; …)
+```
+
+十几轮手工丈量，一条命令说完。当前版本那行 `lint:` 还会带上 `content_width_mm`。下面按「单位时间收益」排序。
+
+### 1. 每次存盘后跑 lint——最高优先级
+
+```bash
+python scripts/docx_preview.py FILE.docx --lint --text
+```
+
+只给 `--lint` 也会转一份临时 PDF（用完删掉），逐页量完再报 **8 个** issue code——常态报 7 个，加上 `--gaps` 再报 `tail-gap`。（`fill_ratio` 是逐页的数字，不算 code。）**先看输出的第二行**——`sparse_pages` 非空就是有半空页，那是没干完的活，不是一个可以放过的警告：
+
+| JSON 键 | issue code（级别） | 含义与处置 |
+|---|---|---|
+| `sparse_pages` | `sparse-page`（warning） | `fill_ratio` 低于 `--min-fill`（默认 `0.40`）的页。**非空 = 必须处理**：挪块、缩图、删掉多余的换页 |
+| `blank_pages` | `blank-page`（error） | 既无文字也无图片的页 |
+| `table_split` | `table-split`（warning） | 表格跨到了下一页。启发式、允许误报——读成「这页值得看一眼」 |
+| `orphan_last` | `orphan-last`（warning） | 该页正文末行只剩 1–2 个字符（`--max-orphan-chars`） |
+| `image_over_width` | `image-over-width`（error） | 图比版心宽（对照 `content_width_mm`） |
+| `issues` | `content-width-unknown`（warning） | 文档没报出节页宽，所以**图片宽度根本没比对**。这是**降级信号**，不是缺陷：此时 `image_over_width` 为空只说明「没量」，不说明「干净」 |
+| `issues` | `section-margins-differ`（warning） | 多个节的边距不一致，而几何只取第 1 节，所以后面几节的 `head_gap_mm` / `tail_gap_mm` 是拿错的正文区边界量出来的 |
+| `gap_pages`（需 `--gaps`） | `tail-gap`（warning） | `tail_gap_mm` 超过 `--max-tail-gap`（默认 `60`） |
+
+**`exit 0` 不代表版面没问题。** lint 的结果是**输出**，不是失败：`main()` 打完报告就返回 `0`，与严重性无关。实测一份单页文件，末行只剩一个 `脚`：它打出 `warning orphan-last page 1 ends with a lone '脚' on its last line`，退出码仍是 `0`。所以要去 grep 报告里的 `sparse_pages`、`blank_pages`、`issues`，**绝不能拿退出码当判据**。这与 `docx_validate` 那一侧是同一个坑的镜像：那边 `1` 才是答案。
+
+`fill_ratio` 给的是**比例**；`--gaps` 另给**毫米绝对值**。两个数回答的是不同问题——文字起始位置靠下时，某页可能只有 `0.213` 而页尾空白并不大。给人类看报告时引用毫米：`tail_gap_mm` 与 `head_gap_mm` 才是尺子量出来的那个数（「空了 8.3 厘米」），而且 `top_margin_mm + head_gap_mm` 可以拿去和渲染出的正文首行对账。
+
+### 2. 断定「文档里没有 X」之前，必须换一个读者交叉验证
+
+`python-docx` 只走一棵树，另一棵**静默跳过**。`paragraph.runs` 只覆盖**直属 run**：`w:txbxContent`（文本框内容）与 `mc:AlternateContent`（兼容包）不在那条路径上，会被无声丢掉、不报错。同一份批注文件实测：**43 条批注全在浮动框里**，`paragraph.runs` 扫出来是 **0 条**——于是被判定成「43 处全是色块、没有一处批注文字」，核心成果被当成主要缺陷，后续修改建议整个建在这个误判上。循环看着完全正确，结论是错的。
+
+改用三种模式交叉看：
+
+```bash
+python scripts/docx_read.py FILE.docx --blocks   # 有序 body 流 + textbox 块
+python scripts/docx_read.py FILE.docx --text     # 正文 + 独立 textboxes 列表
+python scripts/docx_read.py FILE.docx --runs     # 每段 run，带 textbox: <n>
+```
+
+三种现在都能读到浮动框——`--text` 有独立键 `textboxes`，`--blocks` 出 `textbox` 块，`--runs` 给框内每段打 `textbox: <n>`。机制、`mc:Choice` / `mc:Fallback` 计数翻倍的坑、以及两边共用的框序号，都在[浮动文本框](#浮动文本框)那一节；自己写遍历之前先读它。
+
+原则一句话：**「我扫了一遍没看到」不等于「文档里没有」——换工具再扫一遍。** 一个读者报 0，量的是那个读者，不是那个文件。
+
+### 3. 存盘后跑 validate
+
+```bash
+python scripts/docx_validate.py FILE.docx
+```
+
+`docx_validate` 回答 lint 答不了的那个结构问题：这个包本身是否健全。它能抓空 `<w:drawing/>`（Word 直接拒开）、内容部件的**非法嵌套**、悬空关系（`dangling-rel`）、`r:embed` / `r:id` 找不到关系（`unresolved-reference`）、引用了不存在的样式（`missing-style`）、run 属性里 Word 不收的值（`invalid-run-property` / `nonstandard-run-property`，见下），以及页脚那几项：浮动页脚框窄到装不下那一行字（`footer-textbox-overflow`——实测一个 4.56 pt 的框被要求装 121 pt 的文字）、页脚没有 PAGE 域（`footer-no-page-field`）、页脚部件读不出来。
+
+### `invalid-run-property` 与 `nonstandard-run-property`
+
+`<w:rPr>` 里那些 `w:val` 取自封闭值表的子元素（`w:highlight`、`w:vertAlign`、`w:effect`、`w:u`、`w:color`）按 **Word 实际怎么处理**来判，不按 schema 判。这一刀切出两个 code，分界线只有一个：**文件能不能打开**。
+
+| code | 严重度 | 含义 |
+|---|---|---|
+| `invalid-run-property` | **error**（退 `1`） | 这个值让 Word **拒绝打开整个包**——「文件可能已经损坏」，COM `Documents.Open` 报 `com_error` `0x800A1529`。这种文件里每一条关系都解析得通、python-docx 也照样能打开，所以本工具其他任何检查都看不见它 |
+| `nonstandard-run-property` | **warning**（退 `0`） | 值不合 schema，但 Word **能打开、只是重新解释**。是真事、值得说一句，但不构成拒收 |
+
+实测反例，两个方向各一条：
+
+- `w:highlight="purple"` → **文件打不开**，判 `invalid-run-property`。同档的还有 `DARK_MAGENTA`、`Magenta`、`FF0000`、`darkMagento`、`vertAlign="SUPERSCRIPT"`、`vertAlign="Baseline"`、`effect="blink"`，以及 `<w:highlight/>` / `<w:vertAlign/>` / `<w:effect/>` 这三种**缺 `w:val`** 的写法。
+- `w:u="SINGLE"` → **文件能打开**，Word 只是把它重读成 `single`，判 `nonstandard-run-property`。`w:color="#FF0000"`、`w:color="F00"`、`w:color="red"`、`w:color="ZZZZZZ"`、`w:color=""` 同样如此。
+
+**为什么要分两档而不是一档。** 这份报告被 `docx_edit`、`docx_template`、`docx_mathify` 下游消费，`ok: false` 会让它们拒收文档。把 `w:color="red"` 判成 error，等于拒收一份 Word 打得开的文件——**校验器自己成了缺陷**。所以分档才是本轮的设计要点：**严重度由 Word 实测决定，永远不由 schema 决定**，因为 schema 与 Word 在**两个方向上都**会打架：
+
+| 值 | 在 schema 里？ | Word 能打开？ | 判决 |
+|---|---|---|---|
+| `vertAlign="normal"` | **不在** | **能**（等同 baseline，`Superscript=0 Subscript=0`，存盘时元素被丢掉） | 放行，一条 issue 都不报 |
+| `effect="ants"` | **在** | **不能** | `invalid-run-property` |
+
+`normal` 同时也是 `docx_crossref.py` 里「不偏移」的写侧拼法，也就是 `--vert-align` 的默认值：判它 error 等于拒收本仓自己产出的文档。`ants` 是反向陷阱——一个 schema 合法、却被列进合法集合的值，而 Word 根本打不开；这是校验器绝不能产出的那一种结果。两条都用 Word 16.0 COM 实测，一个值一份新造的文档。
+
+`missing-style` 仍然是 **error**，虽然 Word 也打得开，这个区别值得知道：Word 对未知样式 id 不是「重读」，而是在存盘时**换成另一个样式**（实测 `NoSuchStyleXyz` 存回来变成了 `aa`），页面被静默重排。那是内容损失，不是拼法差异。
+
+它是**结构**检查，不判版面。一份文件完全可以返回 `{"ok": true, "issues": []}`，同时有三个半空页和一张越出版心的图——那个判决属于 `--lint`。两个都跑，它们不重叠。
+
+要读 JSON，不要读退出码：`ok: false` + `issues` 是这个工具的正常产出、退 `1`；而路径写错属于输入错误，退 `2`、stderr 一行 `error:`、stdout 为空。这个不对称是故意的，见[退出码](#退出码)。
+
+### 4. 改文本不要用 shell 的字符串替换
+
+PowerShell 的 `-replace`、以及任何 .NET 字符串的 `.Replace()`，**匹配不上时原样返回输入**，什么都不报。脚本在那之后打一行 `saved: …`，只证明调用返回过。同一份文件上它**静默失败至少 6 次**；发现的原因是日志文案不对，不是有任何东西抛了异常。多行文本、中文、带缩进的块最容易匹配不上——一个看不见的空白差异或软换行就够了。
+
+用精确匹配的单点替换：
+
+```bash
+python scripts/docx_edit.py replace FILE.docx --find "原文精确片段" --replace "新文本" -o OUT.docx
+```
+
+然后读那个计数。`docx_edit.py` 返回 `{"replacements": n, …}`；实测**匹配不上的 `--find` 照样退 `0`、照样写出输出文件、照样声称 `"ok": true`**，只是 `"replacements": 0`。这个计数是「替换真的发生了」的唯一信号，所以**改完必须回读**：对输出跑 `--text` 或 `--runs`，确认旧串没了、新串在。编辑器的精确 edit 或 agent 的 `edit` 工具同样够用；拿正则去刷整个文件不行。
+
+### 检查序列（一块看全）
+
+| 做完这件事 | 跑这个 |
+|---|---|
+| 存盘（任何写盘脚本） | `docx_preview.py FILE.docx --lint --text`——`sparse_pages` 为空、`issues` 逐条看过 |
+| 怀疑内容缺失 | `docx_read.py` 的 `--blocks` / `--text` / `--runs` 三种全跑 |
+| 动了结构（表格、图片、页脚、交叉引用） | `docx_validate.py FILE.docx`——`ok: true` |
+| 替换或插入过文字 | `docx_read.py --text`，把那段读回来 |
+| 准备交付 | 以上全部，再抽一次页面 PNG 亲眼看（`--pages DIR --dpi 150`） |
+
 ## 渲染与版面自检
 
 `docx_preview.py` 回答的是工具链其余部分答不出的那个问题：**第 4 页到底对不对？** 它把文档交给无头 LibreOffice 渲染，产出 PDF 与每页一张 PNG，再把「这一页填了多少」量成报告。不用 Word、不走 COM、不需要 Office 授权：
@@ -596,10 +905,33 @@ python scripts/docx_preview.py in.docx --lint --json
 | `--lint` | 报版面：填充率、半空页、空白页、超宽图、跨页表、孤字末行 |
 | `--min-fill RATIO` | 墨迹占比低于这个值就判「稀疏」（默认 `0.40`） |
 | `--max-orphan-chars N` | 一页最后一行不超过 N 个字符算孤字（默认 `2`） |
+| `--gaps` | 另报绝对空白（mm）：`text_bottom_mm`、`tail_gap_mm`、`head_gap_mm`、`top_margin_mm`，以及 `next_page_lead` 与 `gap_pages` |
+| `--max-tail-gap MM` | 正文墨迹停在该页正文区底之上超过这个距离，就算 `gap_page`（默认 `60`） |
+| `--skip-last-page-gap` | **不**报末页的页尾空白。默认关闭：末页算不算「半空」是判断题，不是测量结果 |
+| `--no-header-band` | 把页眉算成正文墨迹（P18 之前的读法）。只用于复现旧报告 |
 | `--timeout SECONDS` | soffice 转换超时（默认 `180`） |
 | `--json` / `--text` | 打一个 JSON 对象，或打人类可读的行（默认后者） |
 
-三个能力可任意组合：全传就是一次转换全拿到；至少要给一个。`--lint` 报告点名六类问题——逐页 `fill_ratio`、`sparse_pages`、`blank_pages`、`image_over_width`（图比版心宽）、`table_split`（表跨到了下一页）、`orphan_last`（末行只剩一个字）。**`table_split` 是启发式、允许误报**：它按表格几何跨页边界比对，所以一张只是恰好在页尾结束的表也可能被点出来。把它读成「这一页值得看一眼」，不是「这里坏了」。
+三个能力可任意组合：全传就是一次转换全拿到；至少要给一个。`--lint` 报告带 **8 个 issue code**——常态 7 个，加上 `--gaps` 再多个 `tail-gap`——另有逐页的 `fill_ratio` 数字（它不算 code）。这 8 个是：`sparse_pages`、`blank_pages`、`image_over_width`（图比版心宽）、`table_split`（表跨到了下一页）、`orphan_last`（末行只剩一个字）、`content-width-unknown`（文档没报页宽，图片宽度完全没比对）、`section-margins-differ`（多节边距不一致，几何只取第 1 节）、`tail-gap`。**`table_split` 是启发式、允许误报**：它按表格几何跨页边界比对，所以一张只是恰好在页尾结束的表也可能被点出来。把它读成「这一页值得看一眼」，不是「这里坏了」。`content-width-unknown` 与 `section-margins-differ` 这一对是**降级信号**：它们描述的不是版面，而是「某项测量被跳过或被近似」。一份报了这两条其中之一的文档，它的「干净」比没有这两条时更弱。
+
+### 什么算「正文墨迹」（以及为什么页眉不算）
+
+`--gaps` 回答的是「这页底下有多少白纸」——就是人拿尺子量出来说你那句「空了 8.3 厘米」的那个数。量之前要先去两条带，否则这个数没有意义：
+
+- **页脚**：起始位置低于 `0.88 × 页高` 的块是页码，不是正文；
+- **页眉**：结束位置高于**正文区顶**的块是页眉。
+
+页眉这条判据锚在**该文档自己的上边距**上，不是页高的固定比例。这个区别是量出来的、不是口味问题：A4 上 12% 的带结束于 101 pt，而一份上边距 36 pt 的文档，它合法的正文首行结束于 92 pt——按固定比例切，会把每一份紧边距文档的首行悄悄删掉。由 `tests/test_preview_header_band.py::test_a_body_line_near_the_top_is_not_mistaken_for_a_header` 钉住。
+
+这些数字能自己对上，所以你可以**验算而不是相信**：
+
+```
+top_margin_mm + head_gap_mm == 正文首行的 y（mm）
+```
+
+在 `source-snapshot/test_unpack/test_input.docx` 上：`24.99 + 9.56 = 34.55 mm`，正好是正文首行所在位置（97.9 pt）。切页眉之前，同一页报的是 `head_gap_mm = −9.76`——页眉（`TEST HEADER`，结束于正文区顶之上 12 pt）被当成了正文墨迹。
+
+拿不到上边距时，页眉这条判据是**跳过而不是猜**。这个不对称是故意的：漏掉的页眉会以**负的** `head_gap_mm` 呈现、人会看出来；而被猜出来的切法删掉的正文行，在报告里是看不见的。
 
 依赖与工具链其余部分不同：`docx_preview.py` 要 `PATH` 上有 `soffice`（或在标准 LibreOffice 安装位置），PNG 与 lint 那一半还要 PyMuPDF。缺任何一个都是 exit `1` 加一行 `error:`——属于环境干不了这活，不是参数写错。`fitz` 只在函数内 import、从不放模块顶层，所以光 import 这个模块不需要 PyMuPDF。
 
@@ -642,10 +974,10 @@ python scripts/docx_preview.py in.docx --lint --json
 ## 目录结构
 
 ```
-scripts/     平铺，按裸模块名 import —— 27 个 .py + 1 个 .ps1 = 28 个文件（26 个 CLI，1 个纯库）
+scripts/     平铺，按裸模块名 import —— 28 个 .py + 1 个 .ps1 = 29 个文件（27 个 CLI，1 个纯库）
 references/  较长的做法笔记，按需加载 —— 7 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 64 个 .py（63 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 77 个 .py（76 个 test_*.py + _omml.py 辅助）
 ```
 
 ## 写到哪儿去，以及有什么保护
@@ -653,7 +985,7 @@ tests/       pytest 套件 —— 64 个 .py（63 个 test_*.py + _omml.py 辅�
 不同脚本的落点不一样，而这件事直接决定「写错一次」会不会把原件搭进去。
 
 **`-o` 默认覆盖输入。** 所有编辑类 CLI 都收 `-o` / `--output`，不给就等于
-「写回你给我的那个文件」：`docx_edit`（八个子命令全收）、`docx_section`、
+「写回你给我的那个文件」：`docx_edit`（九个子命令全收）、`docx_section`、
 `docx_crossref`、`docx_toc`、`docx_comments`、`docx_revisions`。help 文本自己写
 着 `output path (default: overwrite input)` 或 `(default: overwrite)`。这也正是
 「人可能在 Word / WPS 里开着这个文件」时必须显式传 `-o` 的原因——文件被占用会
@@ -685,6 +1017,57 @@ tests/       pytest 套件 —— 64 个 .py（63 个 test_*.py + _omml.py 辅�
 **解包目录是另一种目标。** `table_width.py` 与 `insert_formula.py` 收的是解出来
 的**目录**而不是 `.docx`，直接在 XML 分片上改，改完自己打回包。把 `.docx` 递给
 它们是用法错误，不会被悄悄当成转换。见[在解包目录上工作](#在解包目录上工作)。
+
+## `{"ok": true}` 到底覆盖了什么，没覆盖什么
+
+`docx_validate` 只回答一个问题：**这个 Word 包是不是结构完好、内部自洽？** `{"ok": true, "issues": []}` 的意思是部件齐全、关系能解析、XML 元素顺序合 schema、没有空的 `<w:drawing/>`、python-docx 打得开。这个结论值得知道，但它**不等于「这份文档看起来是对的」**。
+
+**它是 XML 合法，不是排版健康。** 本工具链自己的产物上量到过两个缺陷，两次都返 `{"ok": true, "issues": []}`：
+
+- 一张**在 16 cm 版心上宽 19.05 cm 的表**——越出页边距，Word 直接画到纸外，而包里没有任何一样东西是畸形的；
+- 一个**浮动文本框页脚**，框宽只有 4.56 pt——页码一进位到两位数就被裁，而所有部件依旧合法。
+
+所以 `docx_validate` 绿了是必要条件，不是交付判据。版面相关的问题要另外问：
+
+| 要问的问题 | 用哪条命令 |
+|---|---|
+| 各列加起来，页面装得下吗？ | `table_width.py check --page-width 16`（越界 exit `1`） |
+| 页脚会不会裁字？带不带 PAGE 域？ | `docx_footer.py check` |
+| 每页的墨迹落在哪、空了多少？ | `docx_preview.py --lint --gaps` |
+| 交叉引用的锚点都指得到吗？ | `docx_crossref.py list` / `check_crossref_anchors` |
+
+一句话记法：**`docx_validate` 读的是包，这几条读的是版面。** 交付前跑 `docx_validate`；想相信它已经做完，还得再跑版面检查。
+
+### `docx_footer check`：那个宽度是**估算**，而且误差是双向的
+
+`page_number_width_pt` 不是量出来的。它不读 `hmtx`、不调排版引擎，是按一套声明的字宽模型算的——全角 1.0 em、ASCII 数字字母 0.5 em、空格 0.25 em、其余半角可打印字符 0.3 em——乘页脚自己的字号。报告里的 `estimate_model` 字段写明用的是哪套模型，所以这个数可以被解释，而不是只能被相信。
+
+**误差往两边走**，这一点要紧，因为读者会把 `overflow: false` 读成「量过了、装得下」：
+
+| 情形 | 模型 | 真实 | 后果 |
+|---|---|---|---|
+| CJK 卡在框宽上 | 约**低估** 11% | 更宽 | 85 pt 框装 `第 12 页　共 12 页` 实际要 90 pt → 报 `ok`，纸上裁字 |
+| 罗马数字 | 约**高估** 80% | 更窄 | 10 pt 框里的 `iii` 只有 7.48 pt，却被报成 error |
+
+所以把这个判定读成**两头可信、边界不可信**：4.56 pt 的框装 88 pt 的行是确凿的发现；而框宽与估算值只差几个点时，应该渲染一页确认（`docx_preview.py --pages`）。`usable_width_pt`（框宽减去内缩）正是为这个比对给的。
+
+还有一件数字不会说的事：文本框是不是**浮动**的。浮动框不参与重排、也不推挤邻居，所以那里裁字就是内容丢失；行内框会换行。报告里的 `shape: "floating-textbox"` 就是把这件事挑明的那一项。
+
+## 更新域：`Fields.Update()` 会连 SEQ 一起重排
+
+文档从 Word 回来、交叉引用是旧的，第一反应是 `doc.Fields.Update()`。那是**全篇、按顺序**的重算，不是「刷新某一个东西」：它按正文顺序走遍每一个域、逐个改写结果——**`SEQ` 计数器也在内**。所以在一份题注本来好好的文档上，一次全量更新反而**会改动**编号（两个题注家族的手工顺序一旦被打散，把表 3 和表 4 弄颠倒的正是这一步）；它还会抹掉那些「手工调过格式、而域指令没把格式钉住」的域结果（`\* MERGEFORMAT`，见上面的上标对照表）。
+
+按意图选做法：
+
+| 想干什么 | 用什么 |
+|---|---|
+| 只刷新目录 | `doc.TablesOfContents(i).Update()` |
+| 只刷新某一个域 | `doc.Fields(i).Update()` |
+| 重新分页后刷新页码或目录域 | 更新那个域，而不是整个集合 |
+| 只看不重算 | `tools/word_accept.py --no-update-fields` |
+| 什么都不做（域本来就带缓存结果） | 直接打开文档 |
+
+`word_accept.py` 的 `--no-update-fields` 就是为最后两行准备的：一个必须观察**文件写了什么**、而不是「Word 会把它变成什么」的探针。
 
 ## 退出码
 

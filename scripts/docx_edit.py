@@ -14,6 +14,9 @@ Subcommands:
                 idempotent - a footer that already carries a PAGE/NUMPAGES
                 field is left byte-for-byte alone, and an in-place re-run
                 writes nothing at all
+  char-format   set character formatting (highlight/colour/bold/italic) on
+                the runs that carry some anchor text; runs are split when the
+                anchor is only part of them, so untouched text keeps its format
 
 Examples:
   docx_edit.py replace in.docx --find old --replace new -o out.docx
@@ -24,6 +27,9 @@ Examples:
   docx_edit.py normalize in.docx -o out.docx
   docx_edit.py toc in.docx --index 1 -o out.docx
   docx_edit.py page-numbers in.docx -o out.docx
+  docx_edit.py char-format in.docx --find "见附录" --highlight darkMagenta
+  docx_edit.py char-format in.docx --find "重点" --highlight DARK_MAGENTA --color FF0000
+  docx_edit.py char-format in.docx --find "关键词" --bold --italic -o out.docx
 
 Field results (TOC entries, page numbers) are computed by Word or
 LibreOffice when the document is opened, not by python-docx; until then
@@ -33,9 +39,15 @@ from __future__ import annotations
 import _bootstrap  # noqa: F401
 
 import argparse
+import copy
 import json
 import os
+import re
 import sys
+
+from docx.enum.text import WD_COLOR_INDEX
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 from docx_common import iter_all_paragraphs, replace_in_paragraph
 
@@ -286,6 +298,50 @@ class InsertIndexError(IndexOutOfRangeError):
     Raised *before* the document is touched, so `main` can refuse with exit 2
     and nothing is written — the file is exactly as it was.
     """
+
+
+class CharFormatError(ValueError):
+    """`char-format` was given something it cannot write as asked.
+
+    Two shapes, both refused **before** the file is saved, so `main` returns
+    exit 2 with one ``error:`` line and the input is byte-for-byte untouched:
+
+    * **a value that is not legal** — an unknown highlight colour, a colour that
+      is not six hex digits, or a call that asks for no format at all.  Exit 2,
+      because the caller named an argument value that does not exist (the same
+      class as a bad ``--index``; see D-024 / D-030).
+    * **an anchor that selects nothing** — ``--find`` matched no run.  Exit 2 as
+      well, and for the same reason: the argument names something that is not
+      there.  Exit 1 is reserved for "the document is real but has a problem"
+      (`docx_validate`'s territory), and a text anchor this command cannot find
+      says nothing about the document's health.  Reporting 0 here would be the
+      worst outcome: the caller asked for a visible change, got none, and was
+      told it worked.
+    """
+
+
+def _apply_char_format_args(ap) -> None:
+    """The ``char-format`` option block, kept next to its handler."""
+    ap.add_argument("--find", required=True, metavar="TEXT",
+                    help="anchor text; only the runs carrying it are changed "
+                         "(runs are split when the anchor is part of one)")
+    ap.add_argument("--highlight", metavar="COLOR",
+                    help="w:highlight value: darkMagenta / DARK_MAGENTA / "
+                         "dark_magenta all work; also none (remove) and "
+                         "inherit (leave the element out). Legal set: "
+                         + ", ".join(HIGHLIGHT_VALUES))
+    ap.add_argument("--color", metavar="RRGGBB",
+                    help="font colour, six hex digits (FF0000 or #00a0ff) or "
+                         "'auto'; a theme colour on the run is replaced, since "
+                         "a theme attribute would win over the RGB value")
+    ap.add_argument("--bold", dest="bold", action="store_true", default=None,
+                    help="set bold on")
+    ap.add_argument("--no-bold", dest="bold", action="store_false",
+                    help="set bold explicitly off (w:val=\"0\", not absent)")
+    ap.add_argument("--italic", dest="italic", action="store_true", default=None,
+                    help="set italic on")
+    ap.add_argument("--no-italic", dest="italic", action="store_false",
+                    help="set italic explicitly off")
 
 
 def _body_index_of(doc, p_el) -> int | None:
@@ -540,6 +596,381 @@ def cmd_page_numbers(doc, args) -> dict:
     return {"footer_fields": list(PAGE_FIELD_CODES), "changed": True}
 
 
+# ---------------------------------------------------------------------------
+# char-format
+# ---------------------------------------------------------------------------
+# ``w:highlight/@w:val`` is ``ST_HighlightColor`` (wml.xsd) and holds exactly
+# these **17** values.  This list is the authority for the command, *not*
+# ``docx.enum.text.WD_COLOR_INDEX``: that enum has 18 members of which only 16
+# are legal here (``AUTO`` writes the string ``"default"`` and ``INHERITED``
+# writes nothing — neither is an ``ST_HighlightColor`` member), and it is
+# **missing** ``darkMagenta``, which is the one value the feature was requested
+# for.  ``WD_COLOR_INDEX.VIOLET`` writes ``darkMagenta`` under a name nobody
+# asked for, so the enum is accepted as an *alias* source, never as the gate.
+HIGHLIGHT_VALUES = (
+    "black", "blue", "cyan", "darkBlue", "darkCyan", "darkGray", "darkGreen",
+    "darkMagenta", "darkRed", "darkYellow", "green", "lightGray", "magenta",
+    "none", "red", "white", "yellow",
+)
+
+# ``w:highlight`` absent = inherit from the style; ``w:val="none"`` = explicitly
+# no highlight.  The command writes nothing for "inherit" and removes the
+# element for "none", so neither case leaves a value Word has to interpret.
+HIGHLIGHT_INHERIT = "inherit"
+
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+_COLOR_HEX = re.compile(r"^#?([0-9A-Fa-f]{6})$")
+
+
+def _highlight_key(value: str) -> str:
+    """Case/underscore/hyphen-insensitive key: ``DARK_MAGENTA`` → ``darkmagenta``."""
+    return re.sub(r"[\s_\-]", "", value).lower()
+
+
+def _build_highlight_aliases() -> dict:
+    """Every accepted spelling → the canonical ``ST_HighlightColor`` value.
+
+    Three spellings have to work, because three different things name the same
+    colour:
+
+    * the schema value itself — ``darkMagenta`` (what ``w:val`` stores);
+    * the python-docx member that produces it — ``VIOLET`` / ``DARK_MAGENTA``
+      style, i.e. ``WD_COLOR_INDEX`` names, mapped through ``.xml_value``;
+    * ``dark_magenta``, which is what a caller writes when they know the colour
+      but not which library spells it which way.
+
+    The enum is read for its ``xml_value``, so a member whose value is not a
+    legal ``ST_HighlightColor`` (``AUTO`` → ``"default"``) or that has no value
+    at all (``INHERITED``) is skipped instead of becoming a trap.
+    """
+    aliases = {}
+    legal = {v.lower(): v for v in HIGHLIGHT_VALUES}
+    for canon in HIGHLIGHT_VALUES:
+        aliases[_highlight_key(canon)] = canon
+    aliases[_highlight_key(HIGHLIGHT_INHERIT)] = HIGHLIGHT_INHERIT
+    for member in WD_COLOR_INDEX:
+        xml_value = getattr(member, "xml_value", None)
+        canon = legal.get((xml_value or "").lower())
+        if canon is not None:
+            aliases.setdefault(_highlight_key(member.name), canon)
+    return aliases
+
+
+HIGHLIGHT_ALIASES = _build_highlight_aliases()
+
+
+def normalize_highlight(value: str) -> str:
+    """Any accepted highlight spelling → the canonical ``ST_HighlightColor``.
+
+    Raises :class:`CharFormatError` for anything else: a misspelt colour used to
+    be written verbatim, which produced a document that validates and renders
+    *no highlight at all*, with nothing to explain why.
+    """
+    key = _highlight_key(value or "")
+    canon = HIGHLIGHT_ALIASES.get(key)
+    if canon is None:
+        raise CharFormatError(
+            f"--highlight {value!r} is not a legal w:highlight value; "
+            f"legal: {', '.join(HIGHLIGHT_VALUES)} "
+            f"(any spelling, e.g. darkMagenta / DARK_MAGENTA / dark_magenta)")
+    return canon
+
+
+def normalize_color(value: str) -> str:
+    """``--color`` → the ``RRGGBB`` written into ``w:color/@w:val``.
+
+    ``auto`` is passed through because it is a legal ``ST_HexColorAuto`` value
+    and means "let the style decide"; everything else must be six hex digits,
+    with or without a leading ``#``.  A three-digit shorthand is refused rather
+    than expanded: Word stores no shorthand, so accepting it would be inventing
+    a value the caller never wrote.
+    """
+    raw = (value or "").strip()
+    if raw.lower() == "auto":
+        return "auto"
+    m = _COLOR_HEX.match(raw)
+    if not m:
+        raise CharFormatError(
+            f"--color {value!r} is not a colour: expected 6 hex digits "
+            f"(FF0000 or #00a0ff) or 'auto'")
+    return m.group(1).upper()
+
+
+def _rpr_successors(tag: str) -> list:
+    """The ``w:``-prefixed tags that must follow ``tag`` inside ``w:rPr``.
+
+    A thin alias for :func:`docx_crossref.successors` on ``RPR_ORDER`` — the
+    repo's single copy of the ``CT_RPr`` sequence — so this file cannot drift
+    from ``docx_create``: that module builds the same element from the same
+    list, and a second hand-typed copy is exactly how ``w:highlight`` ends up
+    appended after ``w:u`` on one path and before it on another.
+
+    Why this matters at all: ``w:rPr`` is ``xsd:sequence``.  A child at the
+    wrong position still produces well-formed XML, still passes
+    ``docx_validate`` (it only checks well-formedness plus a few structure
+    rules), and is **silently dropped by Word** — the page shows no highlight
+    and nothing reports an error.
+    """
+    from docx_crossref import successors
+    return successors(tag)
+
+
+def _put_child(rpr, tag: str, value=None):
+    """Create-or-replace ``w:<tag>`` in ``w:rPr``, at its schema position.
+
+    The old element is **removed and rebuilt**, not patched.  Two reasons, both
+    observed:
+
+    * a pre-existing element may sit at the wrong index (a hand-written
+      ``rPr.append(...)``, or content written by another tool).  Patching it in
+      place would keep the bad position, so the "fix" would change the XML and
+      not the page;
+    * ``w:color`` may carry ``w:themeColor`` / ``w:themeShade`` / ``w:themeTint``,
+      and in ``CT_Color`` a theme attribute wins over the RGB twin at render
+      time.  Rebuilding drops them, which is what makes ``--color`` able to
+      override a themed style at all (same reasoning as
+      ``docx_create._blacken_run_colour``).
+
+    Returns the element now in the tree.
+    """
+    old = rpr.find(_q(tag))
+    if old is not None:
+        rpr.remove(old)
+    el = OxmlElement(f"w:{tag}")
+    if value is not None:
+        el.set(_q("val"), value)
+    rpr.insert_element_before(el, *_rpr_successors(tag))
+    return el
+
+
+def _splittable(r_el) -> bool:
+    """True for a run this command may cut into pieces.
+
+    Only ``w:rPr`` + exactly one ``w:t`` qualifies.  A run holding a ``w:tab``,
+    ``w:br``, ``w:fldChar`` or ``w:drawing`` has a ``run.text`` that is a
+    *rendering* of several children, so a character offset into that string does
+    not name a cut point in the XML.  Cutting anyway would move a tab or a
+    picture into the wrong fragment.
+    """
+    others = [c.tag for c in r_el if c.tag != _q("rPr")]
+    return len(others) == 1 and others[0] == _q("t")
+
+
+def _merge_ranges(ranges) -> list:
+    """Sort and coalesce ``(start, end)`` pairs so no offset is cut twice."""
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _split_run_for(run, ranges) -> list:
+    """Cut *run* so each range in *ranges* becomes its own run element.
+
+    Returns the run elements that cover the requested ranges; the untouched
+    fragments are returned to the tree around them.  Every fragment is a
+    ``copy.deepcopy`` of the original ``w:r``, so the run's whole ``w:rPr`` —
+    bold, size, font, subscript, anything — travels with the text; this is the
+    same "clone the carrier" idea as ``_fill_cell_text``, applied at character
+    granularity instead of cell granularity.
+
+    A run that cannot be cut (:func:`_splittable`) is only acceptable when a
+    range covers it whole; a partial range there is refused instead of being
+    rounded up to the whole run, because "highlight a bit more text than you
+    asked for" is indistinguishable from a bug at the caller's end.
+    """
+    text = run.text
+    total = len(text)
+    cuts = {0, total}
+    for start, end in ranges:
+        # A range may extend past the run (the caller clipped it) — clamp so the
+        # cut set only contains real offsets.
+        cuts.add(max(0, min(total, start)))
+        cuts.add(max(0, min(total, end)))
+    cuts = sorted(cuts)
+    segments = []
+    for start, end in zip(cuts, cuts[1:]):
+        if start == end:
+            continue
+        wanted = any(a <= start and end <= b for a, b in ranges)
+        segments.append((start, end, wanted))
+
+    if len(segments) == 1 and segments[0][2]:
+        return [run._r]
+    if not _splittable(run._r):
+        raise CharFormatError(
+            f"cannot apply character formatting to part of a run: the run "
+            f"holding {text!r} also carries tabs, breaks, fields or a drawing, "
+            f"so it cannot be split without moving those children. Format a "
+            f"wider anchor that covers the whole run, or edit the run directly.")
+
+    r_el = run._r
+    parent = r_el.getparent()
+    made = []
+    for start, end, wanted in segments:
+        fragment = copy.deepcopy(r_el)
+        t_el = fragment.find(_q("t"))
+        t_el.text = text[start:end]
+        # A fragment that starts or ends with a space is trimmed by Word unless
+        # the run says otherwise; set it on every fragment because any of them
+        # may be the one holding the edge.
+        t_el.set(_XML_SPACE, "preserve")
+        parent.insert(parent.index(r_el), fragment)
+        if wanted:
+            made.append(fragment)
+    parent.remove(r_el)
+    return made
+
+
+def _apply_char_format(r_el, *, highlight, colour, bold, italic) -> None:
+    """Write one run's character formatting, in schema order, idempotently."""
+    rpr = r_el.get_or_add_rPr()
+    if highlight == HIGHLIGHT_INHERIT:
+        pass
+    elif highlight == "none":
+        old = rpr.find(_q("highlight"))
+        if old is not None:
+            rpr.remove(old)
+    elif highlight is not None:
+        _put_child(rpr, "highlight", highlight)
+    if colour is not None:
+        _put_child(rpr, "color", colour)
+    # ``w:b`` / ``w:i`` with no ``w:val`` mean "on"; ``w:val="0"`` means "off"
+    # and is *not* the same as absent, which inherits from the style.  Only the
+    # Latin twin is written: python-docx's ``font.bold`` does the same, and a
+    # ``w:bCs`` that disagrees with ``w:b`` is its own kind of surprise.
+    if bold is not None:
+        _put_child(rpr, "b", None if bold else "0")
+    if italic is not None:
+        _put_child(rpr, "i", None if italic else "0")
+
+
+def cmd_char_format(doc, args) -> dict:
+    """Set character formatting on the runs that carry ``--find``.
+
+    Selector and scope, both deliberate:
+
+    * **``--find`` only, no ``--index``.**  ``docx_read --runs`` numbers
+      paragraphs across body *and* table cells *and* text boxes, while
+      ``doc.paragraphs`` numbers body paragraphs only.  Offering ``--index``
+      here would mean two different things called "index 7" in the same tool
+      pair, and the caller would have no way to tell which one they got.  Text
+      is also the more durable selector: any edit shifts positions, and a
+      shifted position still "works" while highlighting the wrong line.
+    * **Scope matches ``replace``**: body, tables (nested included), headers and
+      footers.  Text boxes and tracked-change (``w:ins``) content are outside
+      it, for the same reason ``set-cell`` is — ``Paragraph.runs`` does not
+      reach them, so neither can a run-level writer.
+
+    A run is only touched when it overlaps the anchor; a run that carries the
+    anchor *and* other text is split, so the surrounding characters keep the
+    formatting they had.  The anchor may span several consecutive runs.
+    """
+    highlight = None
+    if args.highlight is not None:
+        highlight = normalize_highlight(args.highlight)
+    colour = normalize_color(args.color) if args.color is not None else None
+    bold, italic = args.bold, args.italic
+    if highlight is None and colour is None and bold is None and italic is None:
+        raise CharFormatError(
+            "char-format needs at least one format to set: --highlight, "
+            "--color, --bold/--no-bold, --italic/--no-italic")
+    if not args.find:
+        raise CharFormatError("char-format --find must not be empty")
+
+    applied = {}
+    if highlight is not None:
+        applied["highlight"] = highlight
+    if colour is not None:
+        applied["color"] = colour
+    if bold is not None:
+        applied["bold"] = bold
+    if italic is not None:
+        applied["italic"] = italic
+
+    occurrences = 0
+    touched_paragraphs = 0
+    changed_runs = 0
+    paragraphs_seen = 0
+    # Dedupe by element *equality*, not by ``id()``.  lxml builds a proxy on
+    # demand, so an ``id()`` taken here can be recycled by a later proxy for a
+    # different node — measured: a header paragraph and a footer paragraph came
+    # back with the same ``id()`` and the footer was skipped, so `--find` on
+    # footer text reported "no run carries this text" for text that was there.
+    # Element ``==`` compares the underlying node (see
+    # ``docx_read._own_paragraphs``), which is the identity that matters.
+    seen = []
+
+    for para in iter_all_paragraphs(doc):
+        # Merged table cells are yielded once per grid column they span; acting
+        # twice on the same ``w:p`` is harmless (the second pass finds the runs
+        # already cut), but it would inflate every count in the report.
+        p_el = para._p
+        if any(p_el == other for other in seen):
+            continue
+        seen.append(p_el)
+        paragraphs_seen += 1
+
+        runs = [r for r in para.runs if _writable_run(r)]
+        spans = []
+        pos = 0
+        for run in runs:
+            text = run.text
+            spans.append((run, pos, pos + len(text)))
+            pos += len(text)
+        joined = "".join(run.text for run, _, _ in spans)
+        if not joined:
+            continue
+
+        found = []
+        at = joined.find(args.find)
+        while at >= 0:
+            found.append((at, at + len(args.find)))
+            at = joined.find(args.find, at + len(args.find))
+        if not found:
+            continue
+
+        occurrences += len(found)
+        touched_paragraphs += 1
+
+        per_run = {}
+        for start, end in found:
+            for run, r_start, r_end in spans:
+                if r_end > start and r_start < end:
+                    per_run.setdefault(run, []).append(
+                        (max(start, r_start) - r_start,
+                         min(end, r_end) - r_start))
+
+        for run, _, _ in spans:
+            if run not in per_run:
+                continue
+            for r_el in _split_run_for(run, _merge_ranges(per_run[run])):
+                _apply_char_format(r_el, highlight=highlight, colour=colour,
+                                   bold=bold, italic=italic)
+                changed_runs += 1
+
+    if not occurrences:
+        raise CharFormatError(
+            f"char-format --find {args.find!r}: no run in the document carries "
+            f"this text. Searched {paragraphs_seen} paragraph(s) across body, "
+            f"tables, headers and footers (text boxes and tracked-change "
+            f"content are out of scope, as for every other run-level writer).")
+
+    result = {"find": args.find, "occurrences": occurrences,
+              "runs_changed": changed_runs,
+              "paragraphs_touched": touched_paragraphs,
+              "paragraphs_searched": paragraphs_seen, "applied": applied}
+    # Flattened at top level as well, so a caller can read
+    # ``result["highlight"]`` without knowing the ``applied`` wrapper — the
+    # value reported is the **normalized** one that was actually written, which
+    # is how a caller confirms ``DARK_MAGENTA`` landed as ``darkMagenta``.
+    result.update(applied)
+    return result
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Edit a .docx file.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -595,6 +1026,15 @@ def main() -> int:
                        help="add PAGE/NUMPAGES fields to the footer")
     common(p)
 
+    p = sub.add_parser(
+        "char-format",
+        help="set run-level character formatting (highlight/colour/bold/italic)",
+        description="Set character formatting on the runs that carry an "
+                    "anchor text. Runs are split when the anchor is only part "
+                    "of one, so the text around it keeps its own formatting.")
+    common(p)
+    _apply_char_format_args(p)
+
     args = ap.parse_args()
     # The input file is validated here — before `Document()` and before any
     # subcommand — because a broken package used to be a bare traceback with
@@ -635,8 +1075,17 @@ def main() -> int:
                 result = cmd_toc(doc, args)
             elif args.cmd == "page-numbers":
                 result = cmd_page_numbers(doc, args)
+            elif args.cmd == "char-format":
+                result = cmd_char_format(doc, args)
             else:
                 result = cmd_style(doc, args)
+        except CharFormatError as exc:
+            # A bad colour value or an anchor that matches nothing: the caller
+            # named something that is not there, which is exit 2 everywhere
+            # else in this CLI (D-024 / D-030). `doc.save()` is below, so the
+            # input file is untouched.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         except IndexOutOfRangeError as exc:
             # Same exit code argparse uses for a bad argument value: the
             # caller named a paragraph/table/row/column that does not exist.

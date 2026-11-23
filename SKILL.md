@@ -6,10 +6,10 @@ license: MIT
 
 # Word documents (.docx)
 
-Scripts live flat in `scripts/` — **27 `.py` + 1 `.ps1` = 28 files**, no
-sub-package, no `__init__.py`. **26 are CLIs** (each carries an
+Scripts live flat in `scripts/` — **28 `.py` + 1 `.ps1` = 29 files**, no
+sub-package, no `__init__.py`. **27 are CLIs** (each carries an
 `if __name__ == "__main__"` guard); **`_bootstrap.py` is the one pure library**.
-Of the 26, **19 expose an argparse surface** with `--help` and the other 7 print a
+Of the 27, **20 expose an argparse surface** with `--help` and the other 7 print a
 one-line self-description or run a self-check. Run them with any Python 3.10+ that
 has `python-docx` and `lxml` installed.
 
@@ -115,6 +115,7 @@ anything is written. The refused shapes, each one exercised by the test suite:
 | Delete a paragraph | `python scripts/docx_edit.py delete in.docx --index 3 -o out.docx` |
 | Apply a paragraph style | `python scripts/docx_edit.py style in.docx --index 0 --style "Heading 1" -o out.docx` |
 | Merge adjacent identical runs | `python scripts/docx_edit.py normalize in.docx -o out.docx` |
+| Highlight / colour / bold / italic an anchored string | `python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta --bold -o out.docx` |
 | Insert a TOC *field* | `python scripts/docx_edit.py toc in.docx --index 1 -o out.docx` |
 | Add "Page X of Y" to the footer | `python scripts/docx_edit.py page-numbers in.docx -o out.docx` |
 | Health-check a document | `python scripts/docx_validate.py in.docx` |
@@ -305,7 +306,7 @@ bold".)
 | `numbered_list` | `items`; optional `num_id` (reuse an existing counter), `num_text` (default `%1.`), `num_fmt`, `start`, `ilvl`, `indent_left`, `hanging` |
 | `caption` | `label` (default `图`), `text`, optional `bookmark` — inserts `图 N  题注` with a `SEQ` counter + bookmark |
 | `table_caption` | the same fields as `caption`, for a table |
-| `crossref` | `target` (a bookmark), optional `prefix`, `suffix`, `format` (`default`/`full`/`above-below`/`page`/`number`), `cached`, `own_paragraph` |
+| `crossref` | `target` (a bookmark), optional `prefix`, `suffix`, `format` (`default`/`full`/`above-below`/`page`/`number`/`paragraph-number`/`relative-context`/`full-context`), `cached`, `own_paragraph`, `superscript` / `vert_align`, `hyperlink`, `static`, `no_mergeformat` |
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold`, `keep_together` |
 | `image` | `path`, and `width_mm` **or** `width_frac` (mutually exclusive) |
 | `page_break` | — |
@@ -327,6 +328,19 @@ Exit `2` promises that **nothing was written**, so you can fix the spec and
 retry without wondering whether half a document exists. Values are not clamped
 either: an out-of-range value is reported with the range it would have been
 clamped into.
+
+**A spec key must be the name the target command actually reads, and that is not
+free.** The validator only proves a key is spelled as *this* table spells it; the
+builder then hands the value to `cmd_ref` / `cmd_caption` through a namespace
+object, and those read it with `getattr(args, "name", default)` — an idiom that
+cannot distinguish "absent" from "false". A mismatched name is therefore a
+**silent no-op**: measured before it was fixed, `{"type": "crossref", "target":
+"g1", "hyperlink": false}` still produced a document containing
+`<w:hyperlink>`, with `exit 0` and `{"ok": true}`. The spec says `hyperlink`
+(positive, default true); `cmd_ref` reads `no_hyperlink` (negative), so the
+builder translates rather than forwards. `tests/test_create_crossref_args.py`
+guards the whole set by parsing the `getattr` names out of `docx_crossref.py`
+and failing if the builder stops supplying one.
 
 `styles[]` entries take `font`, `font_east_asia`, `size_pt`, `bold`, `italic`,
 `color`, `base`, and `outline_level` — the last one writes
@@ -541,6 +555,78 @@ readers that never update fields.
 puts a named bookmark on one paragraph so a later `ref` — or a `crossref` block
 in a spec — has something to point at. The name has to be unique; a second run
 with the same name exits `1` with `bookmark already exists`.
+
+### `ref --format`: the eight values, and the field each one writes
+
+`--format` picks which Word field the reference becomes. There are eight legal
+values; the first five cover the ordinary cases and the last three are the ones
+that only appear when a document needs them.
+
+| `--format` | Writes | Reads as |
+|---|---|---|
+| `number` | a bare `REF <bookmark>` number | `3` |
+| `default` | `\h` — a hyperlink to the bookmark | `3`, clickable |
+| `full` | the whole caption text (needs the bookmark to span the paragraph) | `图 3 一张…` |
+| `above-below` | `\p` — the relative-position word | `上图` / `下图` |
+| `page` | `PAGEREF` — the page the bookmark falls on | `7` |
+| `paragraph-number` | `\n` — the paragraph number | `[1]`, the one the reference list shows |
+| `relative-context` | `\r` — the number relative to the nearest numbered item | `relative to the enclosing heading` |
+| `full-context` | `\w` — the full context of the bookmark | the number plus its enclosing context |
+
+The four switches are the difference between "a number" and "a number a reader
+can act on": `\p` answers *where*, `PAGEREF` answers *on which page*, `\n`
+answers *which numbered item*, `\r` answers *relative to what*. Pick the field by
+the question the sentence asks, not by which output looks tidiest.
+
+`--format full` needs the bookmark span. `--format page` cannot be combined with
+`--static` (see below): the page number does not exist until pagination does.
+
+### Superscript references: field or static, and what each one costs
+
+A superscript citation like 图¹ is the case where the two designs visibly
+differ, and the choice is not cosmetic. `--superscript` writes
+`<w:vertAlign w:val="superscript">` on the runs of the reference. Whether that
+survives to the PDF depends on which of two shapes you asked for.
+
+| | `ref` (default, a field) | `ref --static` |
+|---|---|---|
+| Markup | `<w:hyperlink>` around a 5-run `REF` field | `<w:hyperlink>` around **one** `<w:r>` holding the number as `<w:t>` |
+| Number tracks its caption | yes — F9 / print recomputes it | **no** — frozen at write time |
+| Survives `Fields.Update()` | yes, **but only with `\* MERGEFORMAT`** | yes, unconditionally: there is no field to re-render |
+| Needs F9 before it reads right | no (cached result written) | never |
+| Add a figure above it | renumbering is automatic | re-run the command |
+
+The middle row is the one that bites. Measured on Word 16.0, full
+`Fields.Update()` then PDF export, spans read back with PyMuPDF:
+
+```
+field + \* MERGEFORMAT     '1'  sz 7.0  y 197.18     raised 2.52 pt, half size
+field, --no-mergeformat    '1'  sz 11.0 y 199.70     the superscript is gone
+--static                   '1'  sz 7.0  y 197.18     identical to row 1
+body text                  sz 11.0 y 199.70          the baseline, for reference
+```
+
+So `MERGEFORMAT` is not decoration: without it Word re-renders the field result
+from the bookmark target and the raised look is lost on the next update — which
+is exactly what a PDF export performs. It is written by default; `--no-mergeformat`
+turns it off and is only for reproducing that failure.
+
+`--static` is for when you want the look to be **structural** rather than
+dependent on a switch — for example when something else in the pipeline rebuilds
+fields, or when the document must read correctly in a viewer that never updates
+fields. Take it knowing the number stops tracking: adding or removing a figure
+means re-running the build. For a document still being edited, the field form is
+the right default; `--static` is for the last pass.
+
+`--static` refuses `--format page` and `--format above-below` (exit `2`): a page
+number depends on pagination that does not exist at build time, and 上方/下方 is
+decided by Word per occurrence. Freezing either would write a plausible-looking
+wrong number.
+
+Both modes report which one they used — `"mode": "field"` with
+`"needs_field_update": true`, or `"mode": "static"` with
+`"needs_field_update": false` — so a build script can assert it got the shape it
+asked for instead of inferring it from the markup.
 
 ## Formula conversion (LaTeX → native Office Math)
 
@@ -802,6 +888,177 @@ Anything the call could not keep is reported on stderr as a `warning:` line and
 in the JSON `warnings` array; `exit 0` alone does not mean the cell came out
 identical.
 
+## Character formatting: highlight / colour / bold / italic on an anchor
+
+`set-cell` and `replace` write text. `char-format` changes only the *appearance*
+of text that is already there, and it addresses the text by content, not by
+index:
+
+```bash
+python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta
+python scripts/docx_edit.py char-format in.docx --find "重点" --color 00a0ff --bold -o out.docx
+python scripts/docx_edit.py char-format in.docx --find "关键词" --bold --italic -o out.docx
+```
+
+**Scope is an anchor string, and every occurrence is formatted.** `--find`
+matches against the text of each paragraph (body, tables, nested tables, headers
+and footers) and every occurrence counts — measured on two paragraphs each
+holding `重点`: `{"occurrences": 2, "runs_changed": 2,
+"paragraphs_touched": 2, "paragraphs_searched": 8}`. There is no `--index`:
+`docx_read --runs` numbers paragraphs across body *and* cells *and* boxes while
+`doc.paragraphs` numbers body paragraphs only, so "index 7" would mean two
+different paragraphs in the same tool pair. Text is also the durable selector —
+an edit shifts every later position, and a shifted position still "works" while
+formatting the wrong line.
+
+**Runs are split when the anchor is only part of one**, so the characters
+around it keep the formatting they had. Measured on `本段包含重点两个字，其余不变。`
+after `--find 重点`: `--runs` reports three runs, `本段包含` / `重点` /
+`两个字，其余不变。`, and only the middle one carries the new properties. A run
+that cannot be split (it also holds a tab, a break, a field or a drawing) is
+refused rather than formatted whole, because "highlight a bit more text than you
+asked for" is indistinguishable from a bug at your end.
+
+### `--highlight` values, and the ones python-docx cannot name
+
+Legal `w:highlight` values (all 17, from `ST_HighlightColor`):
+
+```
+black blue cyan darkBlue darkCyan darkGray darkGreen darkMagenta darkRed
+darkYellow green lightGray magenta none red white yellow
+```
+
+**Spelling is free, the value is not.** `darkMagenta`, `DARK_MAGENTA`,
+`dark_magenta` and the python-docx member name `VIOLET` all normalize to
+`darkMagenta` — measured: `--highlight violet` exits `0` and stores
+`w:highlight w:val="darkMagenta"`. The command takes the alias route on purpose:
+`WD_COLOR_INDEX` has 18 members of which only 16 are legal here (`AUTO` writes
+`default`, `INHERITED` writes nothing) **and it is missing `darkMagenta`**, which
+is the colour this feature was asked for; `VIOLET` writes it under a name nobody
+uses. So the enum is read for its `xml_value` as an alias source, never used as
+the gate — the 17-value list is.
+
+The report echoes the **normalized** value both inside `applied` and at top level,
+so confirming what actually landed does not require opening the XML:
+
+```json
+{"find": "重点", "occurrences": 2, "runs_changed": 2, "paragraphs_touched": 2,
+ "paragraphs_searched": 8, "applied": {"highlight": "darkMagenta", "color": "00A0FF", "bold": true},
+ "highlight": "darkMagenta", "color": "00A0FF", "bold": true, "ok": true, "output": "out.docx"}
+```
+
+`--color` takes six hex digits with or without `#` (`FF0000`, `#00a0ff`) or
+`auto`; it is upper-cased on write (`#00a0ff` lands as `00A0FF`) and replaces a
+theme colour on that run, because in `CT_Color` a theme attribute wins over the
+RGB twin at render time.
+
+### `--highlight none` and `--highlight inherit` are not the same thing
+
+Both leave the page looking unhighlighted on a plain run, which is exactly why
+the difference has to be stated. Measured on a run that already carries
+`w:highlight w:val="yellow"`:
+
+| Flag | `w:rPr` after the call | Meaning |
+|---|---|---|
+| `--highlight none` | `<w:rPr/>` — the element is **removed** | explicitly no highlight; a style-level highlight is overridden |
+| `--highlight inherit` | `<w:rPr><w:highlight w:val="yellow"/></w:rPr>` — untouched | nothing is written; whatever the style says applies |
+
+`inherit` is the "don't touch this flag" option: it exists so one call can set
+`--color` (or `--bold`) without silently clearing a highlight somebody else put
+there. `none` is a deliberate removal. Both are legal *values* of `--highlight`;
+neither writes a fake `w:val`.
+
+For bold and italic the same three-state logic applies, with `w:val="0"` as the
+explicit off: `--bold` writes `<w:b/>`, `--no-bold` writes `<w:b w:val="0"/>`
+(measured: `<w:rPr><w:b w:val="0"/><w:highlight w:val="yellow"/></w:rPr>`), and
+omitting both writes nothing. Only the Latin twin `w:b` / `w:i` is written, never
+`w:bCs` — a `w:bCs` that disagrees with `w:b` is its own kind of surprise.
+
+### Refusals: `exit 2`, one line on stderr, nothing written
+
+Every rejection below happens **before** `doc.save()`, so the input file is
+byte-for-byte unchanged and stdout stays empty:
+
+| Case | stderr (measured) |
+|---|---|
+| a value outside the 17 | `error: --highlight 'purple' is not a legal w:highlight value; legal: black, blue, cyan, … (any spelling, e.g. darkMagenta / DARK_MAGENTA / dark_magenta)` |
+| an anchor no run carries | `error: char-format --find '不存在的字': no run in the document carries this text. Searched 8 paragraph(s) across body, tables, headers and footers (text boxes and tracked-change content are out of scope, as for every other run-level writer).` |
+| no format flag at all | `error: char-format needs at least one format to set: --highlight, --color, --bold/--no-bold, --italic/--no-italic` |
+| `--color` that is not hex | `error: --color 'red' is not a colour: expected 6 hex digits (FF0000 or #00a0ff) or 'auto'` |
+
+A misspelt colour used to be written verbatim, which produced a document that
+validates, opens, and shows **no highlight at all** — nothing to explain why. An
+anchor that matches nothing is refused for the same reason `replace` is
+(see [Never rewrite text through a shell string
+replacement](#4-never-rewrite-text-through-a-shell-string-replacement)): a silent
+zero looks like success.
+
+### Verify by reading it back
+
+Setting is not evidence; reading it back is. `docx_read --runs` reports
+`highlight` and `color` per run, which is the pair this command writes:
+
+```bash
+python scripts/docx_edit.py char-format in.docx --find "重点" --highlight darkMagenta -o out.docx
+python scripts/docx_read.py out.docx --runs
+```
+
+Measured read-back after the split: the run that held `重点` reports
+`{"text": "重点", "highlight": "darkMagenta", "color": "00A0FF", "bold": true}`,
+and its two neighbours report `null` for all three. That null-in-the-neighbours
+part is the real check — it is what proves the split did not bleed formatting
+into the surrounding text.
+
+## Floating text boxes
+
+A text box's paragraphs are not body paragraphs. They live in
+`w:txbxContent`, whose only parents are `wps:txbx` (inside a DrawingML
+`w:drawing`) or `v:textbox` (inside a VML `w:pict`) — never a direct child of
+`w:body`. So `doc.paragraphs` does not list them, `body.iterchildren()` does not
+reach them, and `Paragraph.text` stops at its own `w:r` children: **every mode
+that walks body paragraphs reads such a document as empty**. Measured on a real
+annotation file: 43 comments, all in floating boxes, and `--text` / `--blocks` /
+`--runs` each reported zero of them — the reason a `python-docx` sweep once
+concluded "43 coloured boxes, no annotation text".
+
+All read modes now cover them:
+
+| Mode | Where the box text appears |
+|---|---|
+| `--text` | a separate `textboxes` key (one string per box); `body` keeps its old meaning |
+| `--blocks` | a `textbox` block right after the paragraph that anchors it, with `index` / `flavor` / `text` / `paragraphs` |
+| `--runs` | the box's own paragraphs, each carrying `textbox: <n>` and a `path` of `body textbox[<n>]` |
+| `--md` | the box text as a quoted (`>`) block |
+
+Body paragraphs and table cells are untouched by this: on a document with no
+boxes, the block list is what it was, `body` keeps its meaning, and every
+per-paragraph run field is unchanged — the only additions are an empty
+`textboxes` list and a `textbox: null` field on each `--runs` record. That last
+part is why "unchanged" must not be read as "byte-identical": `--runs` gained a
+key, so its output is a **superset**, not the same bytes.
+
+Indices move in a document that *does* have boxes, and that is unavoidable:
+a `textbox` block is inserted after its host paragraph, so every entry after the
+insertion point shifts down (measured: six plain paragraphs numbered 0-5; four
+boxes anchored inside paragraph 1 moved paragraph 5 from index `4` to `12`,
+because each box contributes its own paragraph record plus a `textbox` block). It
+is worth knowing before you cache an index across an edit — the block's `type` /
+`text` / `style` keys are the stable part, not its position.
+
+Two things to know when you read the output:
+
+- **One box, one entry.** Word and WPS write a box as an
+  `mc:AlternateContent` holding an `mc:Choice` (DrawingML) **and** an
+  `mc:Fallback` (VML) that both carry the same text. The reader takes the
+  Choice when it has text and falls back only when it does not, so a 43-box
+  document reports **43**, not 86. If you write your own traversal, collapse
+  that pair or you will silently double every count.
+- **`index` is the box ordinal**, shared by `--blocks` and `--runs`, so the two
+  modes name the same box with the same number.
+
+`docx_footer.py` reads boxes in header/footer parts and measures their geometry;
+`docx_read.py` reads box **text** in the body. Neither duplicates the other.
+
 ## Table geometry
 
 Word resolves column widths in a way that surprises people:
@@ -957,6 +1214,204 @@ the shell's.
 
 Do not route a document with OMML through WPS.
 
+## Workflow: the checks after every save
+
+Four rules, each earned by a real delivery that went wrong. A reading-annotation
+assignment was laid out in Word and had to be handed over. The author had this
+toolkit in hand, used none of its checkers, and instead looped *PDF → PNG → look
+at the picture → measure a y coordinate by hand* for **a dozen rounds of
+rework**. One `--lint` run on the finished file then named the same defects he
+had been chasing by eye:
+
+```
+lint: 2 issue(s), 5 page(s)
+lint: sparse_pages=[3, 5] blank_pages=[]
+  warning sparse-page page 3: fill_ratio 0.213 < 0.40 (content covers 21.3% of the page height; …)
+  warning sparse-page page 5: fill_ratio 0.117 < 0.40 (content covers 11.7% of the page height; …)
+```
+
+Twelve rounds of hand-measuring; one command said the same thing. Current builds
+also print `content_width_mm` on that first `lint:` line. The order below is by
+return per second spent.
+
+### 1. Lint after every save — highest priority
+
+```bash
+python scripts/docx_preview.py FILE.docx --lint --text
+```
+
+`--lint` alone converts to a temporary PDF (deleted afterwards), measures every
+page and reports **eight** issue codes — seven of them always, and `tail-gap`
+only once `--gaps` is added. (`fill_ratio` is a per-page number, not a code.)
+Read the second
+output line first —
+`sparse_pages` non-empty means half-empty pages, and that is work left undone,
+not a warning to accept:
+
+| JSON key | Issue code (severity) | What it means, and what to do |
+|---|---|---|
+| `sparse_pages` | `sparse-page` (warning) | pages whose `fill_ratio` is under `--min-fill` (default `0.40`). **Non-empty = must be dealt with**: move a block, shrink a figure, remove a needless page break |
+| `blank_pages` | `blank-page` (error) | a page with neither text nor an image |
+| `table_split` | `table-split` (warning) | a table continues onto the next page. Heuristic, may over-report — read it as "look at this page" |
+| `orphan_last` | `orphan-last` (warning) | the page's last body line holds 1–2 characters (`--max-orphan-chars`) |
+| `image_over_width` | `image-over-width` (error) | an image wider than the text block (`content_width_mm`) |
+| `issues` | `content-width-unknown` (warning) | the document reports no section page width, so image widths **were not checked at all**. A degradation signal, not a defect: `image_over_width` being empty here means "not measured", not "clean" |
+| `issues` | `section-margins-differ` (warning) | sections disagree on margins while the geometry is taken from section 1 only, so `head_gap_mm` / `tail_gap_mm` on later sections are measured against the wrong text-block edges |
+| `gap_pages` (needs `--gaps`) | `tail-gap` (warning) | `tail_gap_mm` over `--max-tail-gap` (default `60`) |
+
+**`exit 0` does not mean the layout is fine.** Lint findings are *output*, not
+failure: `main()` prints the report and returns `0` whatever the severities were.
+Measured on a one-page file whose last line held a lone `脚`: the run printed
+`warning orphan-last page 1 ends with a lone '脚' on its last line` and still
+exited `0`. So grep the report — `sparse_pages`, `blank_pages`, `issues` — and
+never gate on the exit code. This is the same trap `docx_validate` documents from
+the other side: there, `1` *is* the answer.
+
+`fill_ratio` is a **ratio**; `--gaps` adds **absolute lengths** in millimetres.
+The two answer different questions — a page can score `0.213` and still have a
+small tail gap if its text starts low on the page. When the report is for a
+human, quote the millimetres: `tail_gap_mm` and `head_gap_mm` are what a ruler
+would say ("8.3 cm of white"), and `top_margin_mm + head_gap_mm` is checkable
+against the rendered first line.
+
+### 2. Before saying "the document has no X", cross-check with a second reader
+
+`python-docx` walks one tree, and it silently skips the others. `paragraph.runs`
+covers **direct runs only**: `w:txbxContent` (text-box content) and
+`mc:AlternateContent` (compatibility wrapper) are not on that path and are
+dropped without an error. Measured on the same annotation file: **43 comments,
+every one inside a floating box**, and a `paragraph.runs` sweep read **0** of
+them — which was then reported as "43 coloured boxes, no annotation text". The
+core deliverable got diagnosed as the main defect and the fix advice was built on
+that. It was wrong advice, produced by a correct-looking loop.
+
+Cross-read the three modes instead:
+
+```bash
+python scripts/docx_read.py FILE.docx --blocks   # ordered body stream + textbox blocks
+python scripts/docx_read.py FILE.docx --text     # body text + a separate textboxes list
+python scripts/docx_read.py FILE.docx --runs     # per-paragraph runs, textbox: <n>
+```
+
+All three now reach floating boxes — `--text` carries a `textboxes` key,
+`--blocks` emits a `textbox` block, `--runs` tags each box paragraph with
+`textbox: <n>`. The mechanics, the `mc:Choice` / `mc:Fallback` double-count trap
+and the shared box ordinal are in [Floating text boxes](#floating-text-boxes);
+read that before writing your own traversal.
+
+The rule is one line: **"I swept it and saw nothing" is not "the document does
+not contain it" — sweep it with a different tool.** A count of zero from one
+reader is a measurement of that reader, not of the file.
+
+### 3. Validate after every save
+
+```bash
+python scripts/docx_validate.py FILE.docx
+```
+
+`docx_validate` answers the structural question lint cannot: is this package
+sound? It catches an **empty `<w:drawing/>`** (Word refuses to open the file),
+**invalid nesting** of the content parts, dangling relationships
+(`dangling-rel`), an `r:embed` / `r:id` with no relationship
+(`unresolved-reference`), a style reference with no style definition
+(`missing-style`), a run property carrying a value Word will not accept
+(`invalid-run-property` / `nonstandard-run-property`, below), and the footer
+checks: a floating footer box too narrow to hold its line
+(`footer-textbox-overflow` — measured on a 4.56 pt box asked to carry 121 pt of
+text), a footer with no PAGE field (`footer-no-page-field`), an unreadable footer
+part.
+
+### `invalid-run-property` and `nonstandard-run-property`
+
+`<w:rPr>` children whose `w:val` comes from a closed value list (`w:highlight`,
+`w:vertAlign`, `w:effect`, `w:u`, `w:color`) are checked against what **Word**
+does with the value, not against what the schema allows. Two codes come out of
+that split, and the difference is whether the file opens:
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `invalid-run-property` | **error** (exit `1`) | the value makes Word **refuse to open the whole package** — `文件可能已经损坏`, COM `Documents.Open` → `com_error` `0x800A1529`. Every relationship in such a file still resolves and python-docx still opens it, so no other check in the tool can see it |
+| `nonstandard-run-property` | **warning** (exit `0`) | the value is outside the schema but Word **opens the file and re-interprets** it. Real, worth naming, not a rejection |
+
+Measured counter-examples, one per direction:
+
+- `w:highlight="purple"` → **the file does not open**. `invalid-run-property`.
+  The same applies to `DARK_MAGENTA`, `Magenta`, `FF0000`, `darkMagento`,
+  `vertAlign="SUPERSCRIPT"`, `vertAlign="Baseline"`, `effect="blink"`, and to
+  `<w:highlight/>` / `<w:vertAlign/>` / `<w:effect/>` with no `w:val` at all.
+- `w:u="SINGLE"` → **the file opens**, Word just re-reads it as `single`.
+  `nonstandard-run-property`. `w:color="#FF0000"`, `w:color="F00"`,
+  `w:color="red"`, `w:color="ZZZZZZ"` and `w:color=""` behave the same way.
+
+**Why two tiers and not one.** This report is consumed downstream by
+`docx_edit`, `docx_template` and `docx_mathify`, and `ok: false` makes them
+refuse the document. Calling `w:color="red"` an error therefore rejects a file
+that Word opens fine — the validator becomes the defect. The split is the whole
+design point: **severity is decided by Word's measured behaviour, never by the
+schema**, because schema and Word disagree in *both* directions:
+
+| Value | In the schema? | Word opens? | Verdict |
+|---|---|---|---|
+| `vertAlign="normal"` | **no** | **yes** (baseline, `Superscript=0 Subscript=0`, dropped on save) | accepted — no issue at all |
+| `effect="ants"` | **yes** | **no** | `invalid-run-property` |
+
+`normal` is also `docx_crossref.py`'s default spelling of "no offset", i.e. the
+default value of `--vert-align`: rejecting it would reject the repository's own
+output. `ants` is the opposite trap — a schema-legal value listed as legal while
+Word refuses the package, which is the one outcome a validator must never
+produce. Both were measured with Word 16.0 COM, one freshly built document per
+value.
+
+`missing-style` stays an **error** even though Word opens the file, and the
+distinction is worth knowing: Word does not merely re-read an unknown style id,
+it *substitutes* a different style on save (measured: `NoSuchStyleXyz` came back
+as `aa`), so the page is silently re-formatted. That is content loss, not a
+spelling difference.
+
+It is a **structure** check, not a layout check. A file can come back
+`{"ok": true, "issues": []}` and still have three half-empty pages and an image
+hanging past the right margin — that verdict belongs to `--lint`. Run both; they
+do not overlap.
+
+Read the JSON, not the exit code: `ok: false` with `issues` is this tool's normal
+answer and exits `1`, while a bad input path exits `2` with one `error:` line on
+stderr and empty stdout. That asymmetry is deliberate and is spelled out under
+[Exit codes](#exit-codes).
+
+### 4. Never rewrite text through a shell string replacement
+
+`-replace` in PowerShell, and `.Replace()` on any .NET string, **return the input
+unchanged when nothing matches** and report nothing. A script that logs
+`saved: …` after the call proves only that the call returned. On one file this
+failed silently **at least six times**; it was noticed because the log line read
+wrong, not because anything raised. Multi-line text, CJK, and indented blocks
+break the match most easily — an invisible difference of whitespace or a soft
+line break is enough.
+
+Use a precise single-point replacement:
+
+```bash
+python scripts/docx_edit.py replace FILE.docx --find "OLD EXACT TEXT" --replace "NEW" -o OUT.docx
+```
+
+Then read the count. `docx_edit.py` reports `{"replacements": n, …}` and,
+measured, a `--find` that matches nothing still exits `0`, still writes the
+output file, and still claims `"ok": true` — with `"replacements": 0`. The count
+is the only signal the replacement happened, so **read the text back**: `--text`
+or `--runs` on the output, and confirm the old string is gone and the new one is
+present. An editor's exact-match edit or an agent's `edit` tool is equally fine;
+a regex over the whole file is not.
+
+### The sequence, in one block
+
+| After you… | Run |
+|---|---|
+| saved the document (any writer) | `docx_preview.py FILE.docx --lint --text` — `sparse_pages` empty, `issues` reviewed |
+| suspect something is missing | `docx_read.py` with all three of `--blocks` / `--text` / `--runs` |
+| changed structure (tables, images, footers, cross-references) | `docx_validate.py FILE.docx` — `ok: true` |
+| replaced or inserted text | `docx_read.py --text` and read the passage back |
+| are about to hand the file over | all of the above, plus one look at the page PNGs (`--pages DIR --dpi 150`) |
+
 ## Rendering and linting the layout
 
 `docx_preview.py` answers the question the rest of the toolkit cannot: **does
@@ -980,17 +1435,64 @@ python scripts/docx_preview.py in.docx --lint --json
 | `--lint` | report the layout: fill ratio, half-empty pages, blank pages, oversized images, split tables, orphaned last lines |
 | `--min-fill RATIO` | pages below this share of ink are "sparse" (default `0.40`) |
 | `--max-orphan-chars N` | a page's last line of at most N characters is an orphan (default `2`) |
+| `--gaps` | also report absolute white space in mm: `text_bottom_mm`, `tail_gap_mm`, `head_gap_mm`, `top_margin_mm`, plus `next_page_lead` and `gap_pages` |
+| `--max-tail-gap MM` | a page whose body ink stops more than this above the text block's bottom is a `gap_page` (default `60`) |
+| `--skip-last-page-gap` | do **not** report the final page's tail white. Off by default: whether an ending page counts as "half empty" is a judgement, not a measurement |
+| `--no-header-band` | count running headers as body ink (the pre-P18 reading). Only for reproducing an old report |
 | `--timeout SECONDS` | soffice conversion timeout (default `180`) |
 | `--json` / `--text` | one JSON object, or human-readable lines (the default) |
 
 The three capabilities compose: pass all of them and one conversion produces
-everything. At least one is required. The `--lint` report names six classes of
-problem — `fill_ratio` per page, `sparse_pages`, `blank_pages`,
+everything. At least one is required. The `--lint` report carries **eight issue
+codes** — seven always, plus `tail-gap` once `--gaps` is added — alongside a
+per-page `fill_ratio` number. The codes: `sparse_pages`, `blank_pages`,
 `image_over_width` (an image wider than the text block), `table_split` (a table
-that continues onto the next page) and `orphan_last` (a single character alone on
-the last line). `table_split` is a **heuristic and may over-report**: it matches
+that continues onto the next page), `orphan_last` (a single character alone on
+the last line), `content-width-unknown` (no page width in the document, so image
+widths were not checked at all), `section-margins-differ` (sections disagree
+on margins, so geometry from section 1 stands in for the rest), and `tail-gap`.
+`table_split` is
+a **heuristic and may over-report**: it matches
 table geometry across a page boundary, so a table that merely ends near a page
 break can be flagged. Read it as "look at this page", not "this is broken".
+`content-width-unknown` and `section-margins-differ` are the two **degradation**
+codes: they do not describe the layout, they say a measurement was skipped or
+approximated. A clean report from a document that emitted either one is a weaker
+statement than the same report without them.
+
+### What counts as body ink (and why the header is not)
+
+`--gaps` answers "how much blank paper is at the bottom of this page" — the number
+a person measures with a ruler when they say *8.3 cm of white*. Two bands are
+removed first, or the answer is meaningless:
+
+- **footer**: a block starting below `0.88 × page height` is a page number, not body;
+- **header**: a block ending above the **text-block top** is a running header.
+
+The header cut is anchored on the document's own top margin, not on a fixed
+fraction of the page height. That distinction is measured, not stylistic: on A4
+a 12 % band ends at 101 pt, while a legitimate first body line above a 36 pt top
+margin ends at 92 pt — a fraction-based cut silently deletes the first line of
+every tightly-margined document. Pinned by
+`tests/test_preview_header_band.py::test_a_body_line_near_the_top_is_not_mistaken_for_a_header`.
+
+The numbers reconcile, and that is how you check them rather than trust them:
+
+```
+top_margin_mm + head_gap_mm == y of the first body line, in mm
+```
+
+On `source-snapshot/test_unpack/test_input.docx`: `24.99 + 9.56 = 34.55 mm`,
+which is exactly where the body's first line starts (97.9 pt). Before the header
+cut, that same page reported `head_gap_mm = −9.76` — the running header
+(`TEST HEADER`, ending 12 pt above the text-block top) was being counted as body
+ink.
+
+When no top margin is available the header cut is skipped rather than guessed.
+The asymmetry is deliberate: an escaped header shows up as a *negative*
+`head_gap_mm` a reader will notice, while a body line deleted by a guessed cut is
+invisible in the report.
+
 
 Requirements differ from the rest of the toolkit: `docx_preview.py` needs
 `soffice` on `PATH` (or in a standard LibreOffice location) and PyMuPDF for the
@@ -1060,10 +1562,10 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 ## Layout
 
 ```
-scripts/     flat, imported by bare module name — 27 .py + 1 .ps1 = 28 files (26 CLIs, 1 pure library)
+scripts/     flat, imported by bare module name — 28 .py + 1 .ps1 = 29 files (27 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 7 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 64 .py (63 test_*.py + _omml.py helper)
+tests/       pytest suite — 77 .py (76 test_*.py + _omml.py helper)
 ```
 
 ## Where a write lands, and what protects it
@@ -1073,7 +1575,7 @@ because it decides whether a mistake costs you the original.
 
 **`-o` defaults to overwriting the input.** Every editing CLI takes `-o` /
 `--output`, and leaving it off means "write back over the file you gave me":
-`docx_edit` (all eight subcommands), `docx_section`, `docx_crossref`,
+`docx_edit` (all nine subcommands), `docx_section`, `docx_crossref`,
 `docx_toc`, `docx_comments`, `docx_revisions`. The help text says so — `output
 path (default: overwrite input)` or `(default: overwrite)` — and it is the
 reason to pass `-o` explicitly whenever a human may have the file open in Word
@@ -1109,6 +1611,89 @@ twice does not produce `.bak.1`, it overwrites the earlier backup.
 parts in place; you repack afterwards. Passing one of them a `.docx` is a usage
 error, not a silent conversion. See [Working on an unpacked
 document](#working-on-an-unpacked-document).
+
+## What `{"ok": true}` covers — and what it does not
+
+`docx_validate` answers one question: **is this a well-formed, internally
+consistent Word package?** A `{"ok": true, "issues": []}` means the parts are
+present, the relationships resolve, the XML matches the schema's element order,
+no `<w:drawing/>` is empty, and python-docx can open it. That is worth knowing,
+and it is not the same as "this document looks right".
+
+**It is legal XML, not healthy layout.** Two defects measured on this toolkit's
+own output, both of which came back `{"ok": true, "issues": []}`:
+
+- a table **19.05 cm wide on a 16 cm text block** — overflows the margins, Word
+  draws it off the page, and nothing in the package is malformed;
+- a **floating-textbox footer** whose box is 4.56 pt wide — the page number is
+  clipped the moment it reaches two digits, and again every part is valid.
+
+So a green `docx_validate` is a necessary condition, not a delivery check. Ask
+the layout-aware commands separately:
+
+| Question | Command |
+|---|---|
+| Do the columns add up to something the page can hold? | `table_width.py check --page-width 16` (`exit 1` on overflow) |
+| Is the footer clip-safe, and does it carry a PAGE field? | `docx_footer.py check` |
+| Where is the ink on each page, and how much of the page is empty? | `docx_preview.py --lint --gaps` |
+| Do cross-reference anchors all resolve? | `docx_crossref.py list` / `check_crossref_anchors` |
+
+The rule of thumb: **`docx_validate` reads the package, these read the page.**
+Run `docx_validate` before handing a file over; run the layout checks before
+believing it is finished.
+
+### `docx_footer check`: the width is an estimate, in both directions
+
+`page_number_width_pt` is not a measurement. No `hmtx` is read and no layout
+engine is invoked, so the width is computed from a declared character model —
+full-width 1.0 em, ASCII digits/letters 0.5 em, space 0.25 em, other printable
+half-width 0.3 em — at the footer's own font size. The `estimate_model` field in
+the report states which model ran, so a number can be explained rather than
+trusted.
+
+**The error goes both ways**, which matters because a reader will treat
+`overflow: false` as "measured, and it fits":
+
+| case | model says | real | effect |
+|---|---|---|---|
+| CJK at the box's limit | ~11 % **low** | wider | 85 pt box, `第 12 页　共 12 页` needs 90 pt → reports `ok`, clips on paper |
+| Roman numerals | ~80 % **high** | narrower | 10 pt box, `iii` is 7.48 pt but is reported as an error |
+
+So treat the verdict as **reliable at the extremes and unreliable at the
+boundary**: a 4.56 pt box holding an 88 pt line is a real finding, while a box
+within a few points of the estimate should be confirmed by rendering one page
+(`docx_preview.py --pages`). The `usable_width_pt` (box minus insets) is
+included for exactly that comparison.
+
+One more thing the numbers do not say: whether the text box is *floating*. A
+floating box does not re-flow and does not push its neighbours, so clipping there
+is content loss; an inline box would wrap instead. `shape: "floating-textbox"` in
+the report is what makes the difference explicit.
+
+## Updating fields: `Fields.Update()` renumbers SEQ too
+
+When a document comes back from Word with stale cross-references, the reflex is
+`doc.Fields.Update()`. That is a **document-wide, ordered** recalculation, not a
+refresh of one thing: it walks every field in body order and rewrites each
+result — `SEQ` counters included. On a document whose captions were fine, a
+global update can therefore *change* the numbering (with two caption families
+whose counters were interleaved by hand, a full update is what swaps 表 3 and
+表 4), and it also drops any field result that was hand-formatted where the
+instruction does not pin the format (`\* MERGEFORMAT`; see the superscript table
+above).
+
+What to do instead, by intent:
+
+| Goal | Use |
+|---|---|
+| Refresh the table of contents only | `doc.TablesOfContents(i).Update()` |
+| Refresh one field | `doc.Fields(i).Update()` |
+| Refresh a page-number or TOC field after a repagination | update that field, not the collection |
+| Inspect without recalculating anything | `tools/word_accept.py --no-update-fields` |
+| Nothing at all (fields written with cached results) | do nothing — open the document |
+
+`word_accept.py` exposes `--no-update-fields` for exactly the last two rows: a
+probe that must observe what the file says, not what Word would make of it.
 
 ## Exit codes
 

@@ -551,10 +551,28 @@ def test_numbered_list_without_prefix_has_no_bookmarks():
 
 
 def test_crossref_display_switches_are_passed_through():
+    """Builder-side check: spec values reach the namespace in the right shape.
+
+    **Scope note, added in P18.** This test used to assert
+    ``plain.hyperlink is True`` / ``off.hyperlink is False`` -- i.e. it pinned
+    the *spec-side* spelling on the namespace object.  That made the bug look
+    like the contract: ``cmd_ref`` reads ``no_hyperlink``, so the positive name
+    was forwarded into the void and ``{"hyperlink": false}`` silently did
+    nothing (see ``docs/reports/P18-SPEC-AND-HEADER.md`` §二).  The test was
+    green throughout, because it only ever asked what the builder *put in*, never
+    what ``cmd_ref`` *read out*.
+
+    The names are now the ones ``cmd_ref`` reads, and the end-to-end behaviour
+    (does the hyperlink actually disappear?) is asserted in
+    ``test_create_crossref_args.py``.  Both halves are needed: this one catches
+    a wrong translation, that one catches a wrong name.
+    """
     plain = dc._crossref_field_args({"target": "图_1"}, 3, "图")
     assert plain.superscript is False
     assert plain.vert_align == "normal"
-    assert plain.hyperlink is True
+    assert plain.no_hyperlink is False          # positive spec -> not suppressed
+    assert plain.static is False
+    assert plain.no_mergeformat is False
     sup = dc._crossref_field_args({"target": "ref_1", "superscript": True},
                                   3, "")
     assert sup.superscript is True and sup.vert_align == "superscript"
@@ -563,7 +581,7 @@ def test_crossref_display_switches_are_passed_through():
     assert sub.vert_align == "subscript" and sub.superscript is False
     off = dc._crossref_field_args({"target": "ref_1", "hyperlink": False,
                                    "cached": "9"}, 3, "")
-    assert off.hyperlink is False and off.cached == "9"
+    assert off.no_hyperlink is True and off.cached == "9"
     assert off.index == 3
 
 

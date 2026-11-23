@@ -139,7 +139,7 @@ $env:MML2OMML_XSL = 'D:\Office\root\Office16\MML2OMML.XSL'
 
 ## 典型用法
 
-19 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——逐文件清单见下一节「脚本清单」的末列：
+20 个带 argparse 表面的 CLI，先看 `--help` 再动手；另有 7 个模块没有 argparse 表面（只能 `import`，或裸跑看一行自述 / 跑自检），`_bootstrap.py` 是唯一的纯库——逐文件清单见下一节「脚本清单」的末列：
 
 ```bash
 python scripts/docx_create.py --help
@@ -220,7 +220,7 @@ python scripts/docx_create.py spec.json report.docx
 
 完整命令表在 [SKILL.md](SKILL.md)（中文版 [SKILL.zh-CN.md](SKILL.zh-CN.md)）。
 
-还有一个面向 agent 的往返：结构性结果一律走 **stdout 的 JSON**——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_section` / `docx_numbering` / `docx_crossref` / `docx_toc`；其余出人读文本（`docx_mathify` / `table_width` / `insert_formula` / `docx_template`，`fill` 除外，它出 JSON）。诊断信息一律走 stderr。退出码别只判「是不是 0」，按四档分：
+还有一个面向 agent 的往返：结构性结果一律走 **stdout 的 JSON**——`docx_create` / `docx_read` / `docx_edit` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_section` / `docx_numbering` / `docx_crossref` / `docx_toc` / `docx_footer`；其余出人读文本（`docx_mathify` / `table_width` / `insert_formula` / `docx_template`，`fill` 除外，它出 JSON）。诊断信息一律走 stderr。退出码别只判「是不是 0」，按四档分：
 
 | 码 | 含义 |
 |---|---|
@@ -233,42 +233,43 @@ python scripts/docx_create.py spec.json report.docx
 
 用法错误只往 stderr 写一行、stdout 留空、什么都不碰——输入文件逐字节不变。这条在 `docx_read` 上最要紧：它每一种成功模式都出 JSON，所以缺文件、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，一律 exit `2` 且 stdout **一个字节都没有**，而不是回一份会被每个 `json.loads(stdout)` 调用方读成成功的失败 JSON。
 
-## 脚本清单（`scripts/`，28 个文件）
+## 脚本清单（`scripts/`，29 个文件）
 
-`scripts/` 下 **27 个 `.py` + 1 个 `.ps1`，共 28 个文件**，全部平铺、无子包、无 `__init__.py`。分类只用一条判据，且 `ci.yml` 是机械推导的、不靠这段文字自觉——两条规则取并集（`_*` 前缀 **或** 没有 `if __name__ == "__main__"` 守卫）即判为**纯库**：
+`scripts/` 下 **28 个 `.py` + 1 个 `.ps1`，共 29 个文件**，全部平铺、无子包、无 `__init__.py`。分类只用一条判据，且 `ci.yml` 是机械推导的、不靠这段文字自觉——两条规则取并集（`_*` 前缀 **或** 没有 `if __name__ == "__main__"` 守卫）即判为**纯库**：
 
 | 桶 | 数量 | 判据 |
 |---|---|---|
-| **CLI** | **26** | 带 `__main__` 守卫，能直接从命令行跑 |
+| **CLI** | **27** | 带 `__main__` 守卫，能直接从命令行跑 |
 | **纯库** | **1** | `_bootstrap.py` —— 私有模块，在解析参数之前就被 import，永远不单独运行 |
 
-这 26 个 CLI 里，**19 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。每个命令的完整参数见 [SKILL.zh-CN.md](SKILL.zh-CN.md)。
+这 27 个 CLI 里，**20 个有 argparse 表面**（`--help` 打印 `usage: …`）。另外 7 个有 `__main__` 但没有 argparse：6 个只打印一行「是库模块，import 它」自述（`docx_pack` / `docx_utils` / `encoding` / `linear_to_latex` / `math_omml` / `minidom_compat`），`fix_phasor_dot` 跑的是自检。它们与 `_bootstrap` 一样按裸模块名 import。每个命令的完整参数见 [SKILL.zh-CN.md](SKILL.zh-CN.md)。
 
-**CLI 工具（19 个带 argparse 的 `.py`）**
+**CLI 工具（20 个带 argparse 的 `.py`）**
 
 | 文件 | 作用 |
 |---|---|
 | `docx_create.py` | 按 JSON spec 生成 `.docx`（`page` / `styles` / `header` / `footer` / `blocks`） |
-| `docx_read.py` | 读回文档：`--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--md` |
-| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` |
+| `docx_read.py` | 读回文档：`--text` / `--structure` / `--styles` / `--images DIR` / `--revisions` / `--blocks` / `--runs`（逐段落 run 清单）/ `--md` |
+| `docx_edit.py` | `replace` / `set-cell` / `insert` / `delete` / `style` / `normalize` / `toc` / `page-numbers` / `char-format` |
 | `docx_validate.py` | 包级健康检查，`ok:false` 时 exit 1 |
 | `docx_comments.py` | 批注 `list` / `add --target` / `delete --id`（**id 从 `0` 起**） |
 | `docx_revisions.py` | 修订 `list` / `accept-all` / `reject-all` / `accept` / `reject` |
 | `docx_common.py` | 共享段落遍历：`iter_all_paragraphs` / `iter_part_roots` / `replace_in_paragraph`；`--api` 打印导出面 |
 | `docx_template.py` | `extract` / `apply`（`-o` 需 node + docx-js，`--to` 打回现有文档，`--fix-formulas` 透传 mathify 的退出码）/ `fill`（`{{token}}`） |
 | `docx_numbering.py` | 自动编号 `list` / `define` / `apply` / `detach` / `restart` |
-| `docx_crossref.py` | 交叉引用与题注 `caption` / `ref` / `bookmark` / `renumber` / `list` |
+| `docx_crossref.py` | 交叉引用与题注 `caption` / `ref`（`--static` 把编号写成纯文本而非 REF 域）/ `bookmark` / `renumber` / `list` |
 | `docx_toc.py` | 静态目录 `build_static_toc` / `collect_outline` / `drop_existing_toc` |
 | `docx_section.py` | 分节 `list` / `break` / `pagenum` / `pagenums` / `header` / `footer` / `cols` |
 | `docx_mathify.py` | 批量把线性公式换成 OMML（`--report` / `--tex` / `--dry-run` / `--no-merged-script-fix`）；`--dry-run` 与 `-o` 同传是 exit `2` |
 | `insert_formula.py` | 解包目录插单条 LaTeX 公式（`--after` / `--before` / `--display` / `--dump`） |
-| `table_width.py` | 表宽 `report` / `set --widths` / `sync` / `auto --content-width` |
+| `table_width.py` | 表宽 `report` / `set --widths` / `sync` / `auto --content-width` / `check --page-width`（溢出检查，`--json`） |
 | `fix_fonts.py` | 字体统一：样式层 + run 层 + 手动放大标题（`--heading-threshold`） |
 | `fix_zoom.py` | 给 `<w:zoom>` 补 schema 强制的 `w:percent`（`--percent`） |
 | `merge_docs.py` | 合并两份 docx（样式/编号/图片关系/sectPr，`base src out`） |
-| `docx_preview.py` | 渲染并自检版面：`--pdf` / `--pages DIR`（每页 PNG，`--dpi`）/ `--lint`（填充率、半空页与空白页、超宽图、跨页表、孤字末行）/ `--json` |
+| `docx_preview.py` | 渲染并自检版面：`--pdf` / `--pages DIR`（每页 PNG，`--dpi`）/ `--lint`（填充率、半空页与空白页、超宽图、跨页表、孤字末行）/ `--gaps`（页尾留白毫米数，`--max-tail-gap` / `--skip-last-page-gap` / `--no-header-band`）/ `--json` |
+| `docx_footer.py` | 只读页脚体检，stdout 出 JSON：`check` / `--section` —— 页脚形状、文本框宽度、页码到底放不放得下 |
 
-第 28 个文件不是 `.py`：`pdf_export.ps1` 是 PowerShell 导出通道——Word COM、`ExportAsFixedFormat(17)`、以 `ReadOnly` 打开（`-DocxPath` / `-PdfPath`）。详见 [导出 PDF](SKILL.zh-CN.md#pdf-导出附加能力)。
+第 29 个文件不是 `.py`：`pdf_export.ps1` 是 PowerShell 导出通道——Word COM、`ExportAsFixedFormat(17)`、以 `ReadOnly` 打开（`-DocxPath` / `-PdfPath`）。详见 [导出 PDF](SKILL.zh-CN.md#pdf-导出附加能力)。
 
 **库与自述模块（7 个）**——按裸模块名 import；前六个带一行 `__main__` 自述，`fix_phasor_dot` 跑的是自检。`_bootstrap.py` 是唯一的纯库，单独列在最后。
 
@@ -291,7 +292,7 @@ python scripts/docx_create.py spec.json report.docx
 ## 仓内目录与 import 纪律（Layout）
 
 ```
-scripts/    所有 CLI，平铺，按裸模块名 import —— 28 个文件（26 个 CLI + 1 个纯库 + 1 个 .ps1）
+scripts/    所有 CLI，平铺，按裸模块名 import —— 29 个文件（27 个 CLI + 1 个纯库 + 1 个 .ps1）
 tools/      word_accept.py 等验收工具；**`--page-probe` 只在这里**
 references/ 长文档笔记，按需阅读，不进 import 路径
 tests/      pytest 套件
@@ -328,23 +329,23 @@ python -X utf8 -m pytest tests -q
 
 | 环境 | 结果 |
 |---|---|
-| 开发机，本机装了 Office | **1576 passed / 239 skipped / 0 failed**（collected 1815） |
-| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件，**且必须在仓库的 clone 里跑**——开发树的上层目录有 `_smoke/`，会让其中一条用例从 skip 变成 pass）——`ci.yml` 卡的就是这一行 | **1440 passed / 375 skipped / 0 failed**（collected 1815） |
+| 开发机，本机装了 Office | **2458 passed / 239 skipped / 0 failed**（collected 2697） |
+| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件，**且必须在开发树之外的 clone 里跑**——上层目录若有 `_smoke/`，有 95 条用例会从 skip 变成 pass）——`ci.yml` 门禁的形状就是这一行 | **2220 passed / 477 skipped / 0 failed**（collected 2697） |
 
-差的就是那 135 条：需要 `latex2mathml` **加** `MML2OMML.XSL` 的用例在第一行真跑、在第二行 skip。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1440` 与 `skipped <= collected / 4`。
+差的就是那 238 条：143 条需要 `latex2mathml` **加** `MML2OMML.XSL`，另 95 条要读 `_smoke/` 基线。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1974` 与 `skipped <= collected / 4`。
 
-`tests/` 里是 46 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
+`tests/` 里是 76 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 
 ## 授权
 
 MIT，见 [LICENSE](LICENSE)。第三方来源与运行期组件单独记在 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
-本项目的骨架来自 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT，`skills/productivity/microsoft-office`）里的 clean-room 实现：`docx_create` / `docx_edit` / `docx_read` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_template` / `docx_common` / `docx_numbering` / `docx_crossref` / `docx_toc` / `docx_section` 这 12 个文件由它衍生（**判据是各文件头部的 `# MIT License. Part of the Hermes docx skill.` 标记，那是权威来源标记**），本地改动限于 `sys.path` 自举头、UTF-8 stdio 与若干可移植性/缺陷修复（`docx_common.py` 另加 `--api` 自述入口与替换迭代预算，防替换值本身含查找串时死循环）。上游 MIT 授权对它们原样适用。
+本项目的骨架来自 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT，`skills/productivity/microsoft-office`）里的 clean-room 实现：`docx_create` / `docx_edit` / `docx_read` / `docx_validate` / `docx_comments` / `docx_revisions` / `docx_preview` / `docx_footer` / `docx_template` / `docx_common` / `docx_numbering` / `docx_crossref` / `docx_toc` / `docx_section` 这 14 个文件由它衍生——其中 12 个头部带 `# MIT License. Part of the Hermes docx skill.` 标记，另外两个是 `docx_template`（docstring 记录了 hermes CLI 的位置参数形式，属同源证据）与 `docx_common`（头部为 `# MIT License. Shared helpers for the docx skill scripts.`）。本地改动限于 `sys.path` 自举头、UTF-8 stdio 与若干可移植性/缺陷修复（`docx_common.py` 另加 `--api` 自述入口与替换迭代预算，防替换值本身含查找串时死循环）。上游 MIT 授权对它们原样适用。
 
-**自研增量**（头部不带上面那个 Hermes 标记的那批）：`linear_to_latex.py`、`math_omml.py`、`fix_phasor_dot.py`、`docx_mathify.py`、`insert_formula.py`（公式链）、`table_width.py`、`fix_zoom.py`、`fix_fonts.py`、`merge_docs.py`、`pdf_export.ps1`（本地移植的 6 项能力即 `fix_fonts` / `merge_docs` / `pdf_export` / `fix_zoom` / `minidom_compat` / `encoding` 所在的那批），以及 `docx_pack.py`。
+**自研增量**（非衍生、本仓库原创）：`linear_to_latex.py`、`math_omml.py`、`fix_phasor_dot.py`、`docx_mathify.py`、`insert_formula.py`（公式链）、`table_width.py`、`fix_zoom.py`、`fix_fonts.py`、`merge_docs.py`、`pdf_export.ps1`（本地移植的 6 项能力即 `fix_fonts` / `merge_docs` / `pdf_export` / `fix_zoom` / `minidom_compat` / `encoding` 所在的那批），以及 `docx_pack.py` 和纯管线模块 `_bootstrap.py`、`docx_utils.py`、`encoding.py`、`minidom_compat.py`。
 
 **不随本仓库分发**的组件：`MML2OMML.XSL` 是 Microsoft Office 的一部分，运行时从本机 Office 读取；`pdf_export.ps1` 通过 COM 驱动本机 Word，脚本本身不含微软代码。`latex2mathml`、`python-docx`、`lxml` 也由用户自行安装，不 vendor 进来。上游早期版本的 `LICENSE.txt` 属专有条款，未随本仓库分发。
 
 ## 致谢
 
-感谢 NousResearch 的 [hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT）：基础 CRUD、批注、修订与模板 CLI 由那份 clean-room 实现改写而来，它本身是照功能规格对着 `python-docx` 一行行写出来的。逐文件的来源归属与本地改动清单见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+感谢 NousResearch 的 [hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT）：基础 CRUD、校验、批注、修订、模板、编号、交叉引用、目录、分节、页脚与预览等核心 CLI 由那份 clean-room 实现改写而来，它本身是照功能规格对着 `python-docx` 一行行写出来的。逐文件的来源归属与本地改动清单见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。

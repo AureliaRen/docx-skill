@@ -33,23 +33,56 @@ Usage:
     # split the text width evenly across all columns of every table
     python table_width.py auto unpacked/ --content-width 14.6
 
+    # read-only: is any table wider than the page's text block?
+    python table_width.py check unpacked/ --page-width 16
+    python table_width.py check unpacked/ --page-width 16cm --json
+
 Notes:
   * ``--content-width`` is the usable text width in cm (A4 minus margins);
     ``auto`` splits it evenly across columns.
   * All w:w values here are dxa (twentieths of a point); 1 cm = 566.93 dxa.
   * Row heights are left alone; this script only touches horizontal geometry.
 
+``check`` (read-only) — the overflow detector
+---------------------------------------------
+``report`` prints ``total = 10800 dxa (19.05 cm)`` and exits 0 no matter how
+wide that is; it has no notion of "too wide" because it is not told what the
+text block is.  ``check`` supplies that missing half::
+
+    python table_width.py check unpacked/ --page-width 16
+    python table_width.py check unpacked/ --page-width 16cm --json
+    python table_width.py check unpacked/ --page-width 16 --table 3
+
+``--page-width`` accepts ``16``, ``16cm``, ``16 cm``, ``160mm``, ``6.3in`` and
+``453.5pt``; the unit defaults to cm.  **It has no default and this script will
+not guess one.**  ``auto``'s ``--content-width 14.6`` is the *default text width
+it writes with* — a different question from "how wide is this page", and using
+it here would report every table in a 16 cm text block as compliant.  Without
+``--page-width`` each table still reports its own widths and ``overflow`` is
+``null`` (not ``false``: "not judged" is not "judged fine").
+
+Which total is compared: ``tblGrid``'s ``gridCol`` sum when the grid carries
+widths (it is the authority under ``tblLayout=fixed``), otherwise the first
+row's ``tcW`` sum (the authority under autofit).  ``source`` says which one was
+used.  The one sentence worth memorising is in every human report and in the
+``hint`` field: **tblLayout=fixed 时只认 tblGrid，改 tcW 无效**.
+
 Exit codes:
   * ``0``  done.  ``report`` on a document that genuinely has no tables is
-    still ``0`` — reading an empty result is a real answer.
+    still ``0`` — reading an empty result is a real answer.  ``check`` with no
+    overflow, or with no ``--page-width`` to judge against, is also ``0``.
   * ``1``  usage error, or nothing was written (e.g. a mutating action on a
     document with no tables reports ``no tables found; nothing written``), or
-    ``word/document.xml`` does not exist at all.
+    ``word/document.xml`` does not exist at all.  For ``check`` specifically,
+    ``1`` means **a table was found wider than --page-width** (the grep
+    convention: a finding is not a crash).
   * ``2``  the document could not be used: ``word/document.xml`` exists but is
     not an unpacked Word body part, or is not well-formed XML;
     also an explicit ``--widths`` list that carries *more* values than the
     table has columns — dropping the extras would be silent data loss.
-    Nothing is written in either case.
+    Nothing is written in either case.  For ``check``, a bad ``--page-width``
+    (not a number, negative, zero) or a ``--table`` outside ``1..N`` is also
+    ``2``: the arguments are wrong, nothing is read and nothing is written.
 
 ``--widths`` may carry fewer values than the table has columns: the last value
 is repeated to fill the rest (a deliberate convenience, see ``references/
@@ -58,6 +91,7 @@ table-geometry.md``).  That padding is announced on stderr as
 """
 import _bootstrap  # noqa: F401
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -219,6 +253,204 @@ def _read_widths(tbl):
     return _read_tcw(tbl)
 
 
+DXA_PER_CM = 1440.0 / 2.54
+"""1440 dxa per inch, 2.54 cm per inch — the same ratio as ``cm_to_dxa``."""
+
+FIXED_HINT = ("tblLayout=fixed 时只认 tblGrid，改 tcW 无效 "
+              "(tblLayout=fixed renders from tblGrid only; editing tcW has no "
+              "effect — run 'sync' to copy tcW into the grid, or 'set' to give "
+              "the widths explicitly)")
+
+_PAGE_WIDTH_UNITS = (
+    ("cm", 1.0), ("mm", 0.1), ("in", 2.54), ("pt", 2.54 / 72.0),
+)
+
+
+def _parse_page_width(text):
+    """``"16"`` / ``"16cm"`` / ``"160mm"`` / ``"6.3in"`` / ``"453.5pt"`` → cm float.
+
+    Returns ``(cm, None)`` on success and ``(None, reason)`` on a bad value.  The
+    unit is optional and defaults to cm, because ``--page-width 16`` is what a
+    person types first.  A bare suffix is matched case-insensitively so ``16CM``
+    works too.
+
+    Rejecting non-positive widths matters more than it looks: ``0`` would make
+    every table "overflow" and a negative value would make every table compliant
+    — two silent wrong answers instead of one error.
+    """
+    raw = text.strip()
+    if not raw:
+        return None, "empty value"
+    lowered = raw.lower().replace(" ", "")
+    factor = 1.0
+    for suffix, unit_cm in _PAGE_WIDTH_UNITS:
+        if lowered.endswith(suffix) and len(lowered) > len(suffix):
+            factor = unit_cm
+            lowered = lowered[: -len(suffix)]
+            break
+    try:
+        value = float(lowered)
+    except ValueError:
+        return None, "not a number: %r" % text
+    if value != value or value in (float("inf"), float("-inf")):
+        return None, "not a finite number: %r" % text
+    cm = value * factor
+    if cm <= 0:
+        return None, "must be greater than 0, got %r" % text
+    return cm, None
+
+
+def _check_widths(tbl):
+    """``(per_column_dxa_list, source)`` — the widths this table will render at.
+
+    **Two knobs, and which one wins depends on whether ``tblW`` states a width.**
+    Not a reading of the spec: measured on Word 16.0 with ``Table.Columns(i)``
+    after layout, on seven tables that differ in one knob at a time
+    (``work/probe_table_knobs.py``).  A 3 × 5 cm grid, text block 15.24 cm:
+
+    =============  ==============  ============  ============  ==========
+    case           tblW            tblGrid       tcW           Word
+    =============  ==============  ============  ============  ==========
+    base_15        dxa 15.00       15.00         15.00          15.00
+    tcw_19         dxa 15.00       15.00         **19.05**      15.00
+    tblw_19        **dxa 19.05**   15.00         19.05          19.05
+    auto_19        auto            15.00         **19.05**      19.05
+    now_19         absent          15.00         **19.05**      19.05
+    grid45         **dxa 15.00**   45.00         45.00          15.00
+    nolayout_19    auto            —             19.05          15.62
+    =============  ==============  ============  ============  ==========
+
+    So, under ``tblLayout=fixed``:
+
+    * ``tblW`` states a dxa width → **``tblW`` wins outright**.  ``tcw_19`` shows
+      tcW ignored; ``grid45`` shows the grid ignored too, even at 45 cm.
+    * ``tblW`` is ``auto`` or absent → **``tcW`` wins** (``auto_19``, ``now_19``);
+      the grid is only how Word records what the cells asked for.
+    * With no ``tblLayout`` at all Word autofits to the text block
+      (``nolayout_19`` → 15.62 cm), so no static reading is authoritative; the
+      tcW reading is used and the caller is told the layout was autofit.
+
+    Two earlier attempts at this function were wrong in opposite directions and
+    both looked plausible from a handful of samples:
+
+    * "fixed ⇒ tblGrid" — ``auto_19`` renders 19.05 cm while the grid says 15.00
+      (a 4 cm false negative on the *common* python-docx shape);
+    * "take the widest of the three" — ``tcw_19`` then reports 19.05 for a table
+      Word renders at 15.00 (a false positive).
+
+    Neither could be settled by reasoning about the schema.  Two minutes of
+    controlled probes settled it; that is the lesson, not the rule.
+
+    ``source`` names the knob that won, so a surprising total is traceable.
+    """
+    grid = _read_grid(tbl)
+    grid_clean = [w for w in grid if w]
+    tblPr = tbl.find(wtag("tblPr"))
+    layout = tblPr.find(wtag("tblLayout")) if tblPr is not None else None
+    layout_type = layout.get(wtag("type")) if layout is not None else None
+    fixed = layout_type == "fixed"
+    tcw = [w for w in _read_tcw(tbl) if w]
+
+    def _stated_tblw():
+        """``tblW`` as a total in dxa, or ``None`` when it does not state one."""
+        el = tblPr.find(wtag("tblW")) if tblPr is not None else None
+        if el is None:
+            return None
+        if el.get(wtag("type")) not in (None, "auto", "dxa"):
+            return None                      # pct / nil: not a dxa total
+        raw = el.get(wtag("w"))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value or None
+
+    stated = _stated_tblw()
+    n_cols = len(grid_clean) or len(tcw) or 1
+
+    if fixed:
+        if stated is not None:
+            # tblW wins; split it evenly so the per-column list stays usable.
+            return [int(round(stated / n_cols))] * n_cols, "tblW"
+        if tcw:
+            return tcw, "tcW"
+        if grid_clean:
+            return grid_clean, "tblGrid"
+        return [], None
+
+    # No tblLayout, or autofit: the cells drive the width, and Word scales the
+    # result to the text block, so the tcW reading is the honest maximum.
+    if tcw:
+        return tcw, "tcW"
+    if stated is not None:
+        return [int(round(stated / n_cols))] * n_cols, "tblW"
+    if grid_clean:
+        return grid_clean, "tblGrid"
+    return [], None
+
+
+def _check_table(tbl, idx, page_width_cm):
+    """One table's overflow verdict, as a plain dict (JSON-safe)."""
+    rows = tbl.findall(wtag("tr"))
+    n = _col_count(tbl)
+    tblPr = tbl.find(wtag("tblPr"))
+    layout_el = tblPr.find(wtag("tblLayout")) if tblPr is not None else None
+    layout_type = layout_el.get(wtag("type")) if layout_el is not None else None
+    layout = "fixed" if layout_type == "fixed" else "autofit"
+
+    widths, source = _check_widths(tbl)
+    total_cm = round(sum(widths) / DXA_PER_CM, 2) if widths else None
+
+    overflow = None
+    overflow_by_cm = None
+    if page_width_cm is not None and total_cm is not None:
+        overflow = total_cm > page_width_cm + 1e-9
+        overflow_by_cm = round(total_cm - page_width_cm, 2)
+
+    return {
+        "table": idx,
+        "rows": len(rows),
+        "cols": n,
+        "layout": layout,
+        "source": source,
+        "total_dxa": sum(widths) if widths else None,
+        "total_cm": total_cm,
+        "page_width_cm": (round(page_width_cm, 2)
+                          if page_width_cm is not None else None),
+        "overflow": overflow,
+        "overflow_by_cm": overflow_by_cm,
+    }
+
+
+def _print_check(results, page_width_cm):
+    """Human-readable ``check`` output — same shape as ``_report``."""
+    if page_width_cm is None:
+        print("page width: not provided — overflow cannot be judged")
+        print("  (pass --page-width 16 or --page-width 16cm; this action does"
+              " not guess a default)")
+    else:
+        print(f"page width: {page_width_cm:.2f} cm (text block)")
+    print()
+    for row in results:
+        print(f"table {row['table']}: {row['rows']} rows x {row['cols']} cols"
+              f"  layout={row['layout']}")
+        if row["total_cm"] is None:
+            print("  total     = (no usable widths found — no tblGrid, no tcW)")
+            continue
+        print(f"  total     = {row['total_dxa']} dxa ({row['total_cm']:.2f} cm)"
+              f"  from {row['source']}")
+        if row["overflow"] is None:
+            print("  overflow  = ? (page width unknown)")
+        elif row["overflow"]:
+            print(f"  overflow  = YES  +{row['overflow_by_cm']:.2f} cm over the"
+                  f" {row['page_width_cm']:.2f} cm text block")
+        else:
+            print(f"  overflow  = no   {abs(row['overflow_by_cm']):.2f} cm of"
+                  f" slack in the {row['page_width_cm']:.2f} cm text block")
+        print()
+    print("hint: " + FIXED_HINT)
+
+
 def _report(tbl, idx):
     rows = tbl.findall(wtag("tr"))
     n = _col_count(tbl)
@@ -279,7 +511,7 @@ def _report(tbl, idx):
 
 def main():
     ap = argparse.ArgumentParser(description="Fix table column widths in an unpacked docx")
-    ap.add_argument("action", choices=["report", "set", "sync", "auto"])
+    ap.add_argument("action", choices=["report", "set", "sync", "auto", "check"])
     ap.add_argument("unpacked_dir")
     ap.add_argument("--table", type=int, default=None,
                     help="1-based table index (default: all)")
@@ -288,7 +520,32 @@ def main():
                     help="comma-separated column widths in cm, e.g. 2.4,4.2,2.4,5.6")
     ap.add_argument("--content-width", type=float, default=14.6,
                     help="usable text width in cm for 'auto' (default 14.6 = A4 - 3.17cm margins)")
+    # `check` only.  Kept as a string, not `type=float`: "16cm" is the spelling a
+    # person actually types, and argparse's float would reject it with a usage
+    # dump instead of the one-line error this script's exit-2 contract promises.
+    ap.add_argument("--page-width", default=None, metavar="CM",
+                    help="text-block width for 'check', e.g. 16 or 16cm "
+                         "(no default: without it overflow cannot be judged)")
+    ap.add_argument("--json", action="store_true",
+                    help="'check': print one JSON object on stdout")
     args = ap.parse_args()
+
+    # ---- `check`'s own arguments, validated before anything is read ---------
+    # D-030: a bad argument is refused *before* the document is opened, so a
+    # typo in --page-width can never be reported as a problem with the file.
+    page_width_cm = None
+    if args.page_width is not None:
+        if args.action != "check":
+            print("error: --page-width is only meaningful with 'check'",
+                  file=sys.stderr)
+            return 2
+        page_width_cm, why = _parse_page_width(args.page_width)
+        if page_width_cm is None:
+            print(f"error: --page-width {why}", file=sys.stderr)
+            return 2
+    if args.json and args.action != "check":
+        print("error: --json is only meaningful with 'check'", file=sys.stderr)
+        return 2
 
     # ---- 输入校验（P9-C）-------------------------------------------------
     # 本脚本的输入是**解包目录**而不是 .docx，三档坏输入在这里平移成：
@@ -339,15 +596,52 @@ def main():
 
     tables = _tables(root)
     if not tables:
-        if args.action == "report":
+        if args.action in ("report", "check"):
             # An empty reading is a real answer for a read-only command.
-            print("no tables found")
+            if args.json:
+                print(json.dumps({"ok": True, "tables": [], "overflow": [],
+                                  "page_width_cm": (round(page_width_cm, 2)
+                                                    if page_width_cm is not None
+                                                    else None),
+                                  "hint": FIXED_HINT}, ensure_ascii=False))
+            else:
+                print("no tables found")
             return 0
         # For a mutating action the same empty result is *not* success: not a
         # single width was written, so exit 0 would let a caller believe the
         # geometry had been pinned.
         print("no tables found; nothing written", file=sys.stderr)
         return 1
+
+    if args.action == "check":
+        targets_check = tables
+        if args.table is not None:
+            if not (1 <= args.table <= len(tables)):
+                # 2, not 1: the caller named a table that does not exist, and
+                # nothing was read past this point.  (The mutating path below
+                # keeps its historical 1 — changing it here would break callers
+                # that already handle it.)
+                print(f"error: table {args.table} out of range (1..{len(tables)})",
+                      file=sys.stderr)
+                return 2
+            targets_check = [tables[args.table - 1]]
+        results = [_check_table(t, i, page_width_cm)
+                   for i, t in enumerate(targets_check,
+                                         args.table if args.table else 1)]
+        overflowing = [r for r in results if r["overflow"]]
+        if args.json:
+            print(json.dumps({
+                "ok": not overflowing,
+                "page_width_cm": (round(page_width_cm, 2)
+                                  if page_width_cm is not None else None),
+                "page_width_given": page_width_cm is not None,
+                "tables": results,
+                "overflow": [r["table"] for r in overflowing],
+                "hint": FIXED_HINT,
+            }, ensure_ascii=False))
+        else:
+            _print_check(results, page_width_cm)
+        return 1 if overflowing else 0
 
     if args.action == "report":
         for i, t in enumerate(tables, 1):

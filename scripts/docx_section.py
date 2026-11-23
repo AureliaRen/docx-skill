@@ -75,6 +75,12 @@ from docx.shared import Mm
 from docx_read import InputError, _check_input, _open_document
 from docx_utils import fix_child_order, insert_ordered
 
+# ``has_field`` 是「页脚里有没有 PAGE 域」的**唯一**判定（`docx_footer.py`），
+# 这里 import 而不是重写：两种域形态（``w:fldSimple`` 与 complex）的识别细节只
+# 该有一份，否则 ``docx_section list`` 与 ``docx_footer check`` 会对同一份文档给
+# 出相反的结论。import 方向是 section → footer，footer 不 import section，无环。
+from docx_footer import has_field
+
 XMLSPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 # CT_SectPr is an xsd:sequence (source: wml.xsd).  ``w:pgNumType`` sits between
@@ -977,6 +983,7 @@ def section_info(doc, index: int, section) -> dict:
     refs = _hf_refs(sectPr)
     for r in refs:
         r["preview"] = _hf_preview(doc, r)
+    footer = _effective_footer(doc, index, section)
     return {
         "index": index,
         "start_type": _start_type_name(sectPr),
@@ -990,7 +997,133 @@ def section_info(doc, index: int, section) -> dict:
         "sectPr_location": "body" if _is_body_sectPr(doc, sectPr)
         else "paragraph",
         "header_footer": refs,
+        # --- derived (P17-A) -------------------------------------------------
+        "pages": _display_pages(index, section, pg),
+        "footer_kind": footer["kind"],
+        "footer_has_page_field": footer["has_page_field"],
     }
+
+
+# ---- derived fields: pages / footer kind / footer page field (P17-A) --------
+#
+# 这三个字段加进来是因为 `docx_section list` 原先只报「输入」不报「推论」：
+# 主人拿到 ``page_number: {fmt, start}`` 和一条 ``header_footer[].preview`` 字
+# 符串，还得自己算「这一节显示第几页到第几页」「这一节的页码到底有没有落到页脚
+# 上」。算错的两处代价都很实在：页码区间算错 → 交稿后目录页码对不上；以为页脚有
+# 号而实际没有 → 整篇没有页码，而没有任何工具说过。
+#
+# 全部是**派生**字段：只新增，不改任何既有键的名字 / 类型 / 语义（`page_number`
+# 仍是原来的 `{fmt, start}`，`header_footer` 仍是原来那四条）。
+
+
+def _display_pages(index: int, section, pg) -> dict:
+    """Displayed page numbers for this section — as far as they can be known.
+
+    **本节末页永远推不出来。** 它等于「本节起页 + 本节页数 − 1」，而 python-docx
+    不排版：文档里没有任何地方存着「这一节占几页」，那是 Word 打开时才决定的。
+    所以 ``to`` 一律 ``null`` 并附 ``reason``；给出一个像模像样的数字就是编造。
+
+    ``from`` 则有三档，能算就算、算不出就 null：
+
+    * 本节自己带 ``<w:pgNumType w:start="N"/>`` —— 起页就是 ``N``，与前面各节占
+      了几页无关（这正是不重编就从 1 起排的标准用法），**唯一能确定的形态**；
+    * 第 0 节且没有 ``start`` —— 计数器从 1 起，起页是 1；
+    * 其余节 —— 起页 = 上一节末页 + 1，而上一节末页本身就是未知数，所以 null。
+
+    ``fmt`` 若是 ``lowerRoman`` 之类，``from`` 是**计数器值**而不是渲染出来的字
+    符；`:mod:docx_section` 里已有 ``cached_page()`` 可以把值转成字面量，这里不重
+    复实现，免得两处对罗马数字的口径分叉。
+    """
+    start = (pg or {}).get("start")
+    fmt = (pg or {}).get("fmt")
+    as_text = None
+    first = None
+    if start is not None:
+        try:
+            first = int(start)
+        except (TypeError, ValueError):
+            first = None
+        if first is not None:
+            try:
+                as_text = cached_page(fmt, first)
+            except Exception:                 # noqa: BLE001 - cosmetic only
+                as_text = None
+        source = "pgNumType.start"
+    elif index == 0:
+        first = 1
+        try:
+            as_text = cached_page(fmt, 1)
+        except Exception:                     # noqa: BLE001
+            as_text = None
+        source = "document default (first section starts at 1)"
+    else:
+        source = None
+
+    if first is None:
+        reason = ("cannot derive this section's first page: it has no "
+                  "<w:pgNumType w:start>, so it continues the previous "
+                  "section's counter, and that section's page count needs "
+                  "layout before it is known")
+    else:
+        reason = ("cannot derive this section's last page: it needs the page "
+                  "count of this very section, which only a layout engine "
+                  "(Word / LibreOffice) produces — python-docx does not "
+                  "render, and the file does not store it")
+    return {
+        "from": first,
+        "to": None,
+        "from_text": as_text,
+        "source": source,
+        "reason": reason,
+    }
+
+
+def _effective_footer(doc, index: int, section) -> dict:
+    """The footer this section actually renders, plus whether it holds a PAGE field.
+
+    ``footer_kind`` 三档的判据就是「本节的 ``<w:footerReference w:type="default"/>``
+    在不在」：
+
+    * ``own`` —— 本节有自己的 default 页脚引用；
+    * ``inherited`` —— 本节没有，但**前面某一节有**，Word 就把那一份拿来用
+      （python-docx 的 ``section.footer`` 也是这么解析的，见 :func:`own_hdrftr`
+      的第一条注释）；
+    * ``none`` —— 前面也没有，本节根本没页脚。
+
+    区分 ``inherited`` 与 ``none`` 是为了让「封面没有页码」这种布局可读：封面节
+    是 ``none``，正文节是 ``own``，而中间那些既没引用又排在正文之后的节会是
+    ``inherited``。
+    """
+    secs = sections_of(doc)
+    own = _ref_id(section._sectPr, "footer", "default")
+    if own is not None:
+        return {"kind": "own", "has_page_field": _part_has_page(doc, own),
+                "r_id": own}
+    # Walk back: Word inherits the nearest preceding default footer.
+    for back in range(index - 1, -1, -1):
+        rid = _ref_id(secs[back]._sectPr, "footer", "default")
+        if rid is not None:
+            return {"kind": "inherited", "has_page_field": _part_has_page(doc, rid),
+                    "r_id": rid}
+    return {"kind": "none", "has_page_field": False, "r_id": None}
+
+
+def _part_has_page(doc, r_id) -> bool:
+    """True when the referenced footer part carries a PAGE field.
+
+    两种形态都认 —— ``w:fldSimple`` 与 complex（``fldChar begin`` / ``instrText``
+    / ``separate`` / ``end``）—— 由 :func:`docx_footer.has_field` 单点判定，不在
+    这里抄第二份。页脚部件缺失 / 损坏时返回 ``False`` 而不是抛：``list`` 是只读报
+    告，一个坏页脚不该让整张表消失。
+    """
+    try:
+        part = doc.part.related_parts[r_id]
+    except KeyError:
+        return False
+    try:
+        return has_field(part.element, "PAGE")
+    except Exception:                     # noqa: BLE001 - report, never crash
+        return False
 
 
 def _is_body_sectPr(doc, sectPr) -> bool:

@@ -116,8 +116,39 @@ roughly 0.02-0.05, so the threshold sits in a wide gap rather than on a cliff.
 DEFAULT_MARGIN_MM = 25.4
 """Fallback top/bottom margin when the section does not report one."""
 
+DEFAULT_MAX_TAIL_GAP = 60.0
+"""``--max-tail-gap`` default, in mm: a page whose body ink stops more than
+60 mm above the bottom of the text block is reported as a ``gap_page``.
+
+60 mm is the value the P17 report asked for, and it was chosen against the real
+corpus, not from taste: an A4 page with 25.4 mm margins has a 246 mm text block,
+so 60 mm of tail white means the last quarter of the page is empty — visible to
+a reader, and well past the few millimetres a normal last line leaves.  Measured
+on the corpus in ``docs/reports/P17-B-LAYOUT.md``: full pages sat at 0-25 mm,
+the genuinely half-used pages at 120-170 mm, so the threshold sits in a wide
+valley.  The companion ``fill_ratio`` (a *ratio*) is deliberately left alone:
+that one is scale-free and already has consumers.
+"""
+
 PT_PER_MM = 72.0 / 25.4
 """1 mm in PostScript points (PDF user units)."""
+
+HEADER_TOLERANCE_PT = 1.0
+"""How far **above** the text-block top a block must end to count as a header.
+
+A block whose bottom edge lands on the text-block top is body text starting at
+the margin; requiring a full point of clearance keeps a first line that
+coincides with the margin (float rounding puts ``70.85 <= 70.85`` on a knife
+edge) and still catches every real header, which sits in the margin itself --
+the measured corpus header ended 12.15 pt above it.  Erring this way is safe:
+a header that escapes the cut produces a *visible* negative ``head_gap_mm``,
+while a wrongly deleted body line is silent.
+
+(Note: the string above is documentation for a *reader*, not a real docstring —
+these are floats, and a float has no ``__doc__`` slot.  Same convention as
+``PT_PER_MM`` above: the literal sits directly under its assignment so the
+constant and its rationale stay together.)
+"""
 
 WIDTH_TOLERANCE_PT = 1.0
 """Images are flagged only when they exceed the text block by more than a
@@ -260,7 +291,28 @@ def convert_to_pdf(docx_path: str, out_dir, soffice: str,
     ]
     started = time.time()
     try:
+        # ``encoding="utf-8"`` is mandatory, exactly as in
+        # ``docx_template.py:_run_node``.  With bare ``text=True`` subprocess
+        # decodes the child's pipes with ``locale.getpreferredencoding(False)``
+        # -- cp936 on a Chinese Windows -- and soffice echoes the *path* it is
+        # converting, so a Chinese directory name lands in the pipe as UTF-8
+        # and the decode raises inside subprocess' own reader thread:
+        #
+        #     UnicodeDecodeError: 'gbk' codec can't decode byte 0xaf in
+        #     position 46: illegal multibyte sequence
+        #
+        # The damage is worse than a crash: the exception kills the reader
+        # thread, so ``_tail(proc)`` then sees an empty pipe, the real error
+        # message is lost, and the process still exits 0 -- a false green.
+        #
+        # Measured on this machine (LibreOffice 25.8, cp936 console, UTF-8
+        # mode off): soffice stdout and stderr are **UTF-8**, e.g.
+        # ``b'...\\xe4\\xb8\\xad\\xe6\\x96\\x87\\xe7\\x9b\\xae\\xe5\\xbd\\x95...'``
+        # decodes cleanly as UTF-8 and fails as cp936.  ``errors="replace"``
+        # is the belt-and-braces rule: whatever a locale-localised soffice
+        # build emits, this call must never raise UnicodeDecodeError.
         proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
                               timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         raise PreviewError(
@@ -371,12 +423,30 @@ def _issue(issues, severity: str, code: str, detail: str) -> None:
     issues.append({"severity": severity, "code": code, "detail": detail})
 
 
-def _body_blocks(page) -> list[dict]:
-    """Text/image blocks above the footer band.
+def _body_blocks(page, header_band: bool = True,
+                 body_top_pt: float | None = None) -> list[dict]:
+    """Body text/image blocks, with the running header and footer removed.
 
     ``get_text("blocks")`` returns ``(x0, y0, x1, y1, text, block_no, type)``.
     A block that *starts* inside the footer band is footer content (page number,
     "第 3 页 共 8 页") and is dropped -- see :data:`FOOTER_BAND_START`.
+
+    A block that ends **strictly above the text-block top** is a running header
+    and is dropped too.  That cut is anchored on the document's own top margin
+    (``body_top_pt``) and not on a fixed fraction of the page, because a
+    fraction cannot tell a header from a body line: on A4 the 12% band ends at
+    101 pt while a legitimate first body line starting at a 36 pt margin ends at
+    92 pt, so a fraction-based cut would silently delete the first line of every
+    tightly-margined document.  Measured, and pinned by
+    ``test_a_body_line_near_the_top_is_not_mistaken_for_a_header``.
+
+    When *body_top_pt* is None the header cut is skipped rather than guessed:
+    the only safe fallback is the pre-P18 reading, and a missed header shows up
+    as a negative ``head_gap_mm`` which is visible, whereas a deleted body line
+    is not.
+
+    *header_band* is a testing seam: pass ``False`` to reproduce the pre-P18
+    reading and prove the cut is what changed it.
     """
     height = page.rect.height
     cutoff = height * FOOTER_BAND_START
@@ -384,6 +454,9 @@ def _body_blocks(page) -> list[dict]:
     for block in page.get_text("blocks"):
         x0, y0, x1, y1, text, _no, btype = block[:7]
         if y0 >= cutoff:
+            continue
+        if header_band and body_top_pt is not None \
+                and y1 <= body_top_pt - HEADER_TOLERANCE_PT:
             continue
         blocks.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1,
                        "text": text, "type": btype})
@@ -466,6 +539,75 @@ def _last_line(blocks) -> str:
     return lines[-1] if lines else ""
 
 
+def _first_line(blocks) -> str:
+    """The first text line of the page body, stripped.  ``""`` when there is none.
+
+    The mirror of :func:`_last_line`: "first" is the smallest ``y0``, and within
+    that block the first non-empty ``splitlines()`` entry.  Used to answer the
+    question a bare gap measurement cannot — *is the following page starting a
+    fresh paragraph, or is it the rest of something that got pushed over?*
+    """
+    text_blocks = [b for b in blocks if b["text"].strip()]
+    if not text_blocks:
+        return ""
+    first = min(text_blocks, key=lambda b: b["y0"])
+    lines = [line.strip() for line in first["text"].splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
+def _text_bottom_mm(blocks) -> float | None:
+    """Lowest ink on the page, in mm from the page's top edge.
+
+    ``None`` for a page with no body blocks at all -- "nothing was printed here"
+    is not the same reading as "ink ends at 0 mm", and a caller that folds them
+    together reports a blank page as a huge tail gap.
+
+    *Blocks* come from :func:`_body_blocks`, so footer content (page numbers)
+    is already excluded; a page number at the bottom of an otherwise empty page
+    must not count as body ink.
+    """
+    if not blocks:
+        return None
+    return round(max(b["y1"] for b in blocks) / PT_PER_MM, 2)
+
+
+def _head_gap_mm(blocks, body_top_pt: float) -> float | None:
+    """Blank between the top of the text block and the first line, in mm.
+
+    Positive when the first line starts below the text-block top (normal), and
+    **negative** when content starts above it — a paragraph with negative
+    space-before, or a header word LibreOffice placed in the body layer.  The
+    sign is kept rather than clamped: a negative value is evidence, not noise.
+    """
+    if not blocks:
+        return None
+    top = min(b["y0"] for b in blocks)
+    return round((top - body_top_pt) / PT_PER_MM, 2)
+
+
+def _tail_gap_mm(blocks, body_bottom_pt: float) -> float | None:
+    """Blank between the lowest ink and the bottom of the text block, in mm.
+
+    This is the number a person measures with a ruler when a page looks
+    half-used: 8.3 cm of white paper above the bottom margin.  ``None`` when the
+    page has no body blocks — see :func:`_text_bottom_mm`.
+
+    Can be **negative** when content overflows the bottom margin (a table that
+    would not split, a figure pushed down); kept signed for the same reason as
+    :func:`_head_gap_mm`.
+
+    Units: ``body_bottom_pt`` is points (say, 720.0 for a 792 pt page with a
+    25.4 mm bottom margin) and the result is millimetres, so the conversion
+    happens once, here.  Doing it at the call site mixes a millimetre reading
+    with a point reading and flips the sign — which is exactly how the first
+    version of this function reported a full page as ``-170 mm``.
+    """
+    bottom = _text_bottom_mm(blocks)
+    if bottom is None:
+        return None
+    return round(body_bottom_pt / PT_PER_MM - bottom, 2)
+
+
 def _image_boxes(page) -> list[tuple]:
     """Bounding boxes of the images placed on this page, in points."""
     try:
@@ -534,11 +676,35 @@ def _page_geometry(doc) -> dict:
             geometry[key] = round(float(margin.mm), 2) if margin is not None else None
         except Exception:
             geometry[key] = None
+    # Flag the one case the approximation is actually wrong for.  `_page_geometry`
+    # returns the FIRST section because the PDF gives no page→section map, and
+    # that is fine while every section shares the same margins: the header cut
+    # and the text-block bottom are then the same lines on every page.  Once
+    # margins differ, `head_gap_mm` on a later section is measured against the
+    # wrong text-block top and a running header can read as body ink.  Reporting
+    # the condition is honest; silently approximating is what got missed.
+    try:
+        margins = set()
+        for s in doc.sections:
+            m = (getattr(s, "top_margin", None),
+                 getattr(s, "bottom_margin", None),
+                 getattr(s, "left_margin", None),
+                 getattr(s, "right_margin", None))
+            margins.add(tuple(None if v is None else round(v.mm, 2)
+                              for v in m))
+        geometry["sections"] = len(doc.sections)
+        geometry["section_margins_differ"] = len(margins) > 1
+    except Exception:
+        geometry["sections"] = None
+        geometry["section_margins_differ"] = None
     return geometry
 
 
 def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
-             max_orphan_chars: int = 2) -> dict:
+             max_orphan_chars: int = 2, gaps: bool = False,
+             max_tail_gap: float = DEFAULT_MAX_TAIL_GAP,
+             tail_gap_skip_last: bool = False,
+             header_band: bool = True) -> dict:
     """Layout report for a PDF.  Pure reading: nothing is written.
 
     Checks, and what each one can and cannot see:
@@ -576,22 +742,55 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
         ``"]"``).  **Heuristic.**  The footer band is excluded first, so a page
         number is never mistaken for an orphan.
 
+    ``gaps=True`` additionally reports **absolute** lengths, which
+    ``fill_ratio`` cannot express (a ratio says "this page is 30% full"; the
+    question that gets asked is "how many centimetres of paper are blank"):
+
+    ``text_bottom_mm`` / ``tail_gap_mm`` / ``head_gap_mm``
+        Per page: the lowest ink measured from the page's top edge, the blank
+        between that ink and the bottom of the text block, and the blank
+        between the top of the text block and the first line.  All in mm, all
+        signed where a page overflows its margins.  ``None`` -- never ``0`` --
+        for a page with no body blocks, because "no ink" and "ink at 0 mm" are
+        different readings.
+    ``next_page_lead``
+        The first 40 characters of the next page's first body line.  This is
+        the *association* a bare number cannot give: a page with 120 mm of tail
+        white whose successor opens mid-sentence is content that ran out, while
+        one whose successor opens with a fresh heading (or a table) is a block
+        that got pushed whole onto the next page.  Same reading, different fix.
+    ``gap_pages`` / ``tail-gap`` issues
+        Pages whose ``tail_gap_mm`` exceeds ``max_tail_gap``.  Thresholded on an
+        absolute length on purpose: ``fill_ratio`` is scale-free and therefore
+        cannot say "8.3 cm", which is the number a reader actually measures.
+
     Severity: ``blank-page`` and ``image-over-width`` are ``error`` (a reader
-    sees a broken page); ``sparse-page``, ``table-split``, ``orphan-last`` and
-    ``content-width-unknown`` are ``warning``.
+    sees a broken page); ``sparse-page``, ``table-split``, ``orphan-last``,
+    ``tail-gap`` and ``content-width-unknown`` are ``warning``.
+
+    **Every key added by** ``gaps=True`` **is absent when it is** ``False``, so a
+    caller that already parses a ``--lint`` report sees byte-identical output.
+    That is why the two switches are separate rather than one flag: ``--lint``
+    has consumers (this repository's own round reports among them), and
+    silently widening its schema would break them for no gain.
     """
     fitz = _fitz()
     geometry = geometry or {}
     content_width_mm_value = geometry.get("content_width_mm")
     content_width_pt = (float(content_width_mm_value) * PT_PER_MM
                         if content_width_mm_value else None)
-    top_pt = (float(geometry.get("top_margin_mm") or DEFAULT_MARGIN_MM)
-              * PT_PER_MM)
-    # Only the top margin is needed: `table_split` asks "does the next page open
-    # with a table", which is a top-edge question.  The bottom edge was tried and
-    # discarded -- LibreOffice stops a split table wherever its last row ends,
-    # measured 11 pt short of the bottom margin -- so `bottom_margin_mm` stays in
-    # the geometry dict for callers but is not consumed here.
+    top_margin_mm = float(geometry.get("top_margin_mm")
+                          or DEFAULT_MARGIN_MM)
+    top_pt = top_margin_mm * PT_PER_MM
+    bottom_margin_mm = float(geometry.get("bottom_margin_mm")
+                             or DEFAULT_MARGIN_MM)
+    # Only the top margin is needed by `table_split`, which asks "does the next
+    # page open with a table" -- a top-edge question.  The bottom margin is not
+    # used there: LibreOffice stops a split table wherever its last row ends,
+    # measured 11 pt short of the bottom margin on a real split.  `gaps` does
+    # need it, and for a different question: where the *text block* bottoms out
+    # (page height - bottom margin), which is the line a person holds a ruler
+    # against when they say "8.3 cm of blank paper".
 
     pages: list[dict] = []
     issues: list[dict] = []
@@ -603,18 +802,32 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
     heights: list[float] = []
     lowest_bottom: list[float | None] = []
     table_boxes: list[list[tuple]] = []
+    gap_pages: list[dict] = []
+    first_lines: list[str] = []
 
     if content_width_pt is None:
         _issue(issues, "warning", "content-width-unknown",
                "the document reports no section page width, so image widths "
                "were not checked against the text block")
 
+    # Geometry is read from the first section only (see `_page_geometry`); once
+    # sections disagree on margins that approximation affects `head_gap_mm` and
+    # the text-block bottom on later sections.  Say so instead of letting a
+    # plausible number stand for a measurement it is not.
+    if geometry.get("section_margins_differ"):
+        _issue(issues, "warning", "section-margins-differ",
+               "sections %s have different margins, but the layout geometry is "
+               "taken from section 1; head_gap_mm and tail_gap_mm on later "
+               "sections may be measured against the wrong text-block edges"
+               % geometry.get("sections", "?"))
+
     with fitz.open(str(pdf_path)) as pdf:
         count = pdf.page_count
         for number, page in enumerate(pdf, 1):
             height = page.rect.height
             heights.append(height)
-            blocks = _body_blocks(page)
+            blocks = _body_blocks(page, header_band=header_band,
+                                  body_top_pt=top_pt)
             images = _image_boxes(page)
             ratio = _fill_ratio(blocks, height)
             ink = _ink_ratio(blocks, height)
@@ -625,8 +838,15 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
             table_boxes.append(boxes)
             lowest_bottom.append(max((b["y1"] for b in blocks), default=None))
 
+            text_bottom = _text_bottom_mm(blocks) if gaps else None
+            head_gap = (_head_gap_mm(blocks, top_pt) if gaps else None)
+            tail_gap = (_tail_gap_mm(blocks, height - bottom_margin_mm * PT_PER_MM)
+                        if gaps else None)
+            if gaps:
+                first_lines.append(_first_line(blocks))
+
             is_blank = chars == 0 and not images
-            pages.append({
+            page_row = {
                 "page": number,
                 "fill_ratio": ratio,
                 "ink_ratio": ink,
@@ -635,7 +855,12 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
                 "image_count": len(images),
                 "last_line": last_line,
                 "blank": is_blank,
-            })
+            }
+            if gaps:
+                page_row["text_bottom_mm"] = text_bottom
+                page_row["tail_gap_mm"] = tail_gap
+                page_row["head_gap_mm"] = head_gap
+            pages.append(page_row)
 
             if is_blank:
                 blanks.append(number)
@@ -648,6 +873,25 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
                        "of the page height; %d char(s) in %d block(s))"
                        % (number, ratio, min_fill, ratio * 100.0, chars,
                           len(blocks)))
+
+            # Absolute tail white.  Kept apart from `sparse-page` on purpose:
+            # a page can be genuinely full in ratio terms and still leave a big
+            # tail if the text starts far down the page, and a two-line page
+            # leaves a huge tail while scoring a tiny ratio -- the two numbers
+            # answer different questions, so both are reported and neither
+            # suppresses the other.  A blank page is excluded: its tail gap is
+            # the whole text block, which is already reported as `blank-page`
+            # and would otherwise double-count the same defect.
+            if gaps and not is_blank and tail_gap is not None \
+                    and tail_gap > max_tail_gap \
+                    and not (tail_gap_skip_last and number == count):
+                gap_pages.append({"page": number, "tail_gap_mm": tail_gap,
+                                  "text_bottom_mm": text_bottom})
+                _issue(issues, "warning", "tail-gap",
+                       "page %d: body ink stops at %.1f mm from the page top, "
+                       "leaving %.1f mm blank above the bottom margin "
+                       "(> %.1f mm)"
+                       % (number, text_bottom or 0.0, tail_gap, max_tail_gap))
 
             if content_width_pt is not None:
                 for index, box in enumerate(images):
@@ -691,7 +935,18 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
                        "(heuristic: verify against the two PNGs)" % (index + 1,
                                                                     index + 2))
 
-    return {
+    # Cross-page association for `gaps`: attach each page's successor lead line.
+    # Done after the loop because the lead of page n is page n+1's first line,
+    # which is not known while page n is being summarised.
+    if gaps:
+        for index, page_row in enumerate(pages):
+            if index + 1 < len(first_lines):
+                lead = first_lines[index + 1]
+                page_row["next_page_lead"] = lead[:40] if lead else ""
+            else:
+                page_row["next_page_lead"] = None   # last page: no successor
+
+    result = {
         "page_count": count,
         "min_fill": min_fill,
         "content_width_mm": content_width_mm_value,
@@ -703,6 +958,19 @@ def lint_pdf(pdf_path, geometry=None, min_fill: float = DEFAULT_MIN_FILL,
         "orphan_last": orphans,
         "issues": issues,
     }
+    if gaps:
+        # Only present when asked for -- see the docstring: `--lint` already has
+        # consumers and its schema must not grow under them.
+        result["gap_pages"] = gap_pages
+        result["max_tail_gap_mm"] = max_tail_gap
+        result["bottom_margin_mm"] = bottom_margin_mm
+        # `head_gap_mm` is measured against the top of the text block, so the
+        # top margin is what lets a caller check the number instead of trusting
+        # it: first_line_y = top_margin_mm + head_gap_mm.  Without it the only
+        # way to reconcile a surprising `head_gap_mm` was to re-render the page,
+        # which is exactly the work `--gaps` exists to remove.
+        result["top_margin_mm"] = top_margin_mm
+    return result
 
 
 # --------------------------------------------------------------------------- CLI
@@ -722,6 +990,26 @@ def _parser() -> argparse.ArgumentParser:
                     help="report the layout: fill ratio, half-empty pages, "
                          "blank pages, oversized images, split tables, "
                          "orphaned last lines")
+    ap.add_argument("--gaps", action="store_true",
+                    help="also report absolute page-tail lengths in mm "
+                         "(text_bottom_mm / tail_gap_mm / head_gap_mm), the "
+                         "next page's opening line, and pages whose tail white "
+                         "exceeds --max-tail-gap")
+    ap.add_argument("--max-tail-gap", type=float, default=DEFAULT_MAX_TAIL_GAP,
+                    metavar="MM",
+                    help="a page whose body ink stops more than MM above the "
+                         "bottom of the text block is a gap_page "
+                         "(default %.0f)" % DEFAULT_MAX_TAIL_GAP)
+    ap.add_argument("--skip-last-page-gap", action="store_true",
+                    help="do not report the final page's tail white as a "
+                         "gap_page.  A document ends where its last sentence "
+                         "ends, so the last page is half empty by definition; "
+                         "whether that counts as a defect is the caller's "
+                         "call, which is why it is a flag and not the default")
+    ap.add_argument("--no-header-band", action="store_true",
+                    help="count running headers as body ink (pre-P18 reading). "
+                         "Only useful to reproduce the old negative "
+                         "head_gap_mm; the default excludes them")
     ap.add_argument("--min-fill", type=float, default=DEFAULT_MIN_FILL,
                     metavar="RATIO",
                     help="pages below this share of ink are 'sparse' "
@@ -760,9 +1048,16 @@ def main(argv=None) -> int:
     # ---- refusals first: nothing below this line has read or written anything
     if args.json and args.text:
         return _usage_error("--json and --text are mutually exclusive")
-    if not (args.pdf or args.pages or args.lint):
+    # `--gaps` counts as a capability in its own right: it produces the whole
+    # lint report (the gap fields are extra keys on it), so demanding `--lint`
+    # alongside it would be asking for the same flag twice.  It also *implies*
+    # --lint's work, so `args.lint` is set below rather than making `--gaps`
+    # alone emit a reduced report that no caller expects.
+    if args.gaps:
+        args.lint = True
+    if not (args.pdf or args.pages or args.lint or args.gaps):
         return _usage_error("nothing to do: give at least one of "
-                            "--pdf OUT.pdf, --pages DIR, --lint")
+                            "--pdf OUT.pdf, --pages DIR, --lint, --gaps")
     if not 20 <= args.dpi <= 600:
         return _usage_error("--dpi must be between 20 and 600, got %d" % args.dpi)
     if not 0.0 <= args.min_fill <= 1.0:
@@ -771,6 +1066,9 @@ def main(argv=None) -> int:
     if args.max_orphan_chars < 0:
         return _usage_error("--max-orphan-chars must be >= 0, got %d"
                             % args.max_orphan_chars)
+    if args.max_tail_gap < 0:
+        return _usage_error("--max-tail-gap must be >= 0, got %r"
+                            % args.max_tail_gap)
     if args.timeout <= 0:
         return _usage_error("--timeout must be > 0, got %d" % args.timeout)
 
@@ -852,7 +1150,11 @@ def main(argv=None) -> int:
             try:
                 report["lint"] = lint_pdf(pdf_path, geometry=geometry,
                                           min_fill=args.min_fill,
-                                          max_orphan_chars=args.max_orphan_chars)
+                                          max_orphan_chars=args.max_orphan_chars,
+                                          gaps=args.gaps,
+                                          max_tail_gap=args.max_tail_gap,
+                                          tail_gap_skip_last=args.skip_last_page_gap,
+                                          header_band=not args.no_header_band)
             except PreviewError as exc:
                 return _cannot_process(str(exc))
             except Exception as exc:
@@ -891,6 +1193,18 @@ def _print_text(report: dict) -> None:
                  lint["content_width_mm"]))
         print("lint: sparse_pages=%s blank_pages=%s"
               % (lint["sparse_pages"], lint["blank_pages"]))
+        # `gap_pages` only exists when --gaps was passed; printing an empty
+        # list for a --lint run would imply the check ran and found nothing.
+        if "gap_pages" in lint:
+            print("gaps: max_tail_gap_mm=%.1f gap_pages=%s"
+                  % (lint["max_tail_gap_mm"],
+                     [row["page"] for row in lint["gap_pages"]]))
+            for row in lint["pages"]:
+                tail = row.get("tail_gap_mm")
+                print("  page %d: text_bottom_mm=%s tail_gap_mm=%s"
+                      " head_gap_mm=%s next_page_lead=%r"
+                      % (row["page"], row.get("text_bottom_mm"), tail,
+                         row.get("head_gap_mm"), row.get("next_page_lead", "")))
         for issue in lint["issues"]:
             print("  %s %s %s" % (issue["severity"], issue["code"],
                                   issue["detail"]))

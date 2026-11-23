@@ -217,10 +217,15 @@ def test_zip_without_word_document_part_is_a_usage_error(tmp_path: Path):
 # 反向保险：合法路径逐字段不变
 # ===========================================================================
 def test_valid_document_text_output_is_unchanged(tmp_path: Path):
-    """合法文档 `--text` 仍是 exit 0 + 纯 JSON + 四个既有键，一个不多一个不少。
+    """合法文档 `--text` 仍是 exit 0 + 纯 JSON，且既有四个键的取值一个字没变。
 
     加输入校验最容易的副作用是「顺手在校验里 print 点什么」或把 JSON 结构
     改掉；这条把 stdout 当 JSON 直接解析，钉住键集合与取值。
+
+    P19-B 起多了一个 ``textboxes`` 键（浮动文本框的文字，见
+    ``tests/test_read_textbox.py``）。那是**新增**键，不是改既有键：``body``
+    仍然只列 body 直属段落，无框文档里 ``textboxes`` 是空列表。所以这里钉的
+    仍是那条反向保险 —— 既有键一个不少、取值不变，只允许这一个新键。
     """
     src = good_docx(tmp_path)
     cp = run_read(src, "--text")
@@ -228,8 +233,9 @@ def test_valid_document_text_output_is_unchanged(tmp_path: Path):
     assert cp.stderr == ""
 
     out = json.loads(cp.stdout)
-    assert set(out) == {"body", "tables", "headers", "footers"}
+    assert set(out) == {"body", "tables", "headers", "footers", "textboxes"}
     assert out["body"] == ["hello"]
+    assert out["textboxes"] == [], "无框文档不许凭空多出条目"
 
 
 def test_valid_document_structure_and_styles_are_unchanged(tmp_path: Path):

@@ -155,8 +155,8 @@ from docx_section import (
     add_page_number_field, add_section_break, apply_page_to_section,
     configure_section, set_hdrftr_text,
 )
-from docx_crossref import check_crossref_anchors
-from docx_utils import next_bm_id, insert_ordered
+from docx_crossref import check_crossref_anchors, successors
+from docx_utils import PPR_ORDER, next_bm_id, insert_ordered
 
 # Keys every paragraph-producing block understands.
 PARA_FORMAT_KEYS = (
@@ -255,13 +255,12 @@ def _set_style_fonts(style, latin: str, east_asia: str | None) -> None:
         from docx.oxml import OxmlElement as _El
         rf = _El("w:rFonts")
         # CT_RPr is an xsd:sequence — rFonts may only sit after rStyle and
-        # before everything from b onwards.
-        rpr.insert_element_before(
-            rf, "w:b", "w:bCs", "w:i", "w:iCs", "w:noProof", "w:snapToGrid",
-            "w:color", "w:spacing", "w:w", "w:kern", "w:position", "w:sz",
-            "w:szCs", "w:highlight", "w:u", "w:effect", "w:bdr", "w:shd",
-            "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em", "w:lang",
-            "w:eastAsianLayout", "w:specVanish", "w:oMath")
+        # before everything from b onwards.  The successor list is derived
+        # from RPR_ORDER (the repo's single copy of that sequence) instead of
+        # being typed out here: a hand-typed suffix silently disagrees with the
+        # authority the moment either one gains a child, and the two insert
+        # different positions for the same element.
+        rpr.insert_element_before(rf, *successors("rFonts"))
     # A built-in style (``Heading 1`` and friends) binds its fonts through the
     # *theme* attributes -- ``w:asciiTheme="majorHAnsi"`` etc.  In ``CT_Fonts``
     # a theme attribute takes precedence over its explicit twin, so writing
@@ -323,9 +322,13 @@ def _apply_style_outline_level(style, outline_level) -> str:
     ``jc``/``textDirection``/``textAlignment``/``textboxTightWrap`` and before
     ``divId``.  Appending it at the end of ``w:pPr`` — the obvious thing to do
     — puts it after ``rPr``/``sectPr``, where **Word silently drops it**, and
-    the style then looks correct in the XML while behaving as body text.  The
-    successor chain below is the same one :func:`_apply_bottom_border` uses for
-    the predecessor side of that sequence.
+    the style then looks correct in the XML while behaving as body text.
+
+    This is a ``w:pPr`` position, not a ``w:rPr`` one: the successor list comes
+    from :data:`docx_utils.PPR_ORDER` (the pPr authority), the same one
+    :func:`_apply_bottom_border` derives from.  Deriving it here rather than
+    typing five names means a child inserted into ``PPR_ORDER`` ahead of
+    ``divId`` is honoured on both paths.
     """
     val = _outline_lvl_val(outline_level)
     pPr = style.element.get_or_add_pPr()
@@ -335,8 +338,7 @@ def _apply_style_outline_level(style, outline_level) -> str:
         return val
     el = OxmlElement("w:outlineLvl")
     el.set(qn("w:val"), val)
-    pPr.insert_element_before(el, "w:divId", "w:cnfStyle", "w:rPr",
-                              "w:sectPr", "w:pPrChange")
+    pPr.insert_element_before(el, *successors("outlineLvl", PPR_ORDER))
     return val
 
 
@@ -1024,15 +1026,10 @@ def _apply_bottom_border(para, spec) -> dict:
     if not applied:
         return {"removed": True}
     # CT_PPr is an xsd:sequence: pBdr sits after numPr/suppressLineNumbers and
-    # before shd/tabs/spacing/ind/jc.
-    pPr.insert_element_before(
-        pBdr, "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku",
-        "w:wordWrap", "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE",
-        "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid",
-        "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents",
-        "w:suppressOverlap", "w:jc", "w:textDirection", "w:textAlignment",
-        "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
-        "w:rPr", "w:sectPr", "w:pPrChange")
+    # before shd/tabs/spacing/ind/jc.  Derived from PPR_ORDER — the pPr
+    # authority — so this path and _apply_style_outline_level cannot disagree
+    # about where a later child belongs.
+    pPr.insert_element_before(pBdr, *successors("pBdr", PPR_ORDER))
     return applied
 
 
@@ -1140,6 +1137,16 @@ def _crossref_field_args(block: dict, index: int, prefix: str) -> _Ns:
     ``vert_align`` is the single source of truth; ``superscript`` is derived
     from it when not given, and both are always present so ``cmd_ref`` may read
     either one with ``getattr`` while it is being extended in parallel.
+
+    **Every key here must be the name ``cmd_ref`` actually reads.**  ``cmd_ref``
+    reads ``no_hyperlink`` (negative: "do not wrap"), not ``hyperlink`` (positive:
+    "do wrap"), and ``getattr(args, "no_hyperlink", False)`` cannot tell a
+    missing attribute from a false one.  Passing the positive spelling therefore
+    did nothing at all: ``{"hyperlink": false}`` in a spec produced a document
+    with the hyperlink still in it, ``exit 0`` and ``{"ok": true}`` -- a silent
+    no-op of exactly the kind this toolkit exists to stop.  The names below are
+    checked against ``cmd_ref``'s ``getattr`` calls in
+    ``tests/test_create_crossref_args.py``.
     """
     vert = block.get("vert_align")
     sup = block.get("superscript")
@@ -1155,7 +1162,12 @@ def _crossref_field_args(block: dict, index: int, prefix: str) -> _Ns:
                cached=block.get("cached"),
                superscript=bool(sup),
                vert_align=vert,
-               hyperlink=bool(block.get("hyperlink", True)),
+               # ``hyperlink`` is the *spec* vocabulary (positive, default true);
+               # ``no_hyperlink`` is what ``cmd_ref`` reads.  Translate, do not
+               # forward: the names are not interchangeable.
+               no_hyperlink=not bool(block.get("hyperlink", True)),
+               static=bool(block.get("static", False)),
+               no_mergeformat=bool(block.get("no_mergeformat", False)),
                # A spec is written top-to-bottom, so a body reference to the
                # reference list is necessarily forward: the bookmark appears
                # later in the document. Bookmarks are document-wide, so the
@@ -1514,7 +1526,8 @@ BLOCK_KEYS = {
                                        "drop_text"),
     "crossref": _with_para_format("target", "prefix", "suffix", "format",
                                   "cached", "superscript", "vert_align",
-                                  "hyperlink", "own_paragraph"),
+                                  "hyperlink", "static", "no_mergeformat",
+                                  "own_paragraph"),
     # ``table`` produces no paragraph of its own, and its ``style`` is the
     # *table* style, so the paragraph vocabulary does not apply to it.
     "table": {"header", "rows", "style", "header_bold", "caption",

@@ -166,6 +166,29 @@ RPR_ORDER = [
     "specVanish", "oMath",
 ]
 
+
+def successors(tag: str, order=RPR_ORDER, prefix: str = "w:") -> list:
+    """The ``w:``-prefixed children that must follow *tag* inside a sequence.
+
+    ``CT_RPr`` / ``CT_PPr`` and friends are ``xsd:sequence``: a child at the
+    wrong position is well-formed XML, passes ``docx_validate``, and is then
+    **silently dropped by Word**.  ``python-docx``'s
+    ``BaseOxmlElement.insert_element_before(elm, *tagnames)`` wants exactly
+    this list — "insert before the first of these that is present" — so the
+    correct argument is "every child that follows *tag* in schema order".
+
+    This is the single derivation used by every module that inserts into a
+    sequenced property element (``docx_create``, ``docx_edit``).  Hand-typed
+    copies of a suffix are how two call sites end up inserting the same element
+    at different positions: the lists look equivalent on the day they are
+    written and stop being equivalent the moment the authority gains a child.
+
+    *tag* is unprefixed (``"rFonts"``); an unknown name is a programming error
+    and raises ``ValueError`` from ``list.index`` rather than silently
+    returning "append at the end".
+    """
+    return [prefix + name for name in order[order.index(tag) + 1:]]
+
 # ``\* MERGEFORMAT`` tells Word to keep the field result's formatting when it
 # recalculates.  Without it a superscript reference silently becomes normal
 # text the first time Word updates fields (F9, print, or a PDF export) — the
@@ -179,6 +202,16 @@ RPR_ORDER = [
 # switch changes no result *text* for any flavour (verified for ``\h``, ``\p``,
 # ``\n``, ``\w`` and PAGEREF pairs), so it is on by default.
 MERGE_FORMAT = r" \* MERGEFORMAT"
+
+# ``--static`` writes literal text, so a format whose value only exists after
+# Word paginates (or is decided per occurrence) has nothing to write.  Refused
+# instead of guessed: a stale page number is a wrong document, not a stale one.
+_STATIC_UNSUPPORTED = {
+    "page": "the page number depends on pagination, which does not exist until "
+            "the document is rendered",
+    "above-below": r"Word decides 上方/下方 per occurrence from \p; there is no "
+                   r"value to freeze",
+}
 
 # Bookmark names may not start with a digit and are capped at 40 chars.
 _NAME_SAFE = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff]")
@@ -1182,7 +1215,13 @@ def cmd_ref(doc, args) -> dict:
     The field is wrapped in a real ``<w:hyperlink>`` so the number is clickable
     without Word ever recalculating anything, and every run of the field gets
     the requested ``<w:vertAlign>``.
+
+    Under ``--static`` the number is written as plain text inside the hyperlink
+    instead of a field.  See ``cmd_ref_static``.
     """
+    fmt = getattr(args, "format", None) or "default"
+    if getattr(args, "static", False):
+        return cmd_ref_static(doc, args, fmt)
     names = all_bookmarks(doc)
     # A forward reference is the normal shape of a citation: the body says
     # "[1]" and the reference list that owns ``ref_1`` sits further down, so
@@ -1220,8 +1259,78 @@ def cmd_ref(doc, args) -> dict:
     return {"ok": True, "index": args.index, "target": args.target,
             "cached": str(cached), "format": fmt, "field": field,
             "switch": switch, "merge_format": merge,
+            "mode": "field", "needs_field_update": True,
             "vert_align": vert or "normal",
             "hyperlink": use_hyperlink, "anchor": args.target if use_hyperlink else None}
+
+
+def cmd_ref_static(doc, args, fmt: str) -> dict:
+    """Write the reference number as literal text, not a field.
+
+    Why this exists
+    ---------------
+    A ``REF`` field keeps the number in sync with its caption for free, but the
+    number a reader sees is a *field result*: Word re-renders it from the
+    bookmark target on the next F9 / print / PDF export.  ``\\* MERGEFORMAT``
+    is what makes the raised look survive that re-render (measured: with the
+    switch the PDF carries ``sz 7.0`` raised by 2.5 pt, without it the same run
+    comes back ``sz 11.0`` at baseline).  MERGEFORMAT is written by default
+    precisely so this does not bite, but a caller who wants the superscript to
+    be *structurally* immune — not dependent on a switch Word may drop when the
+    field is recreated some other way — has no option in the field design.
+
+    ``--static`` is that option.  The result is a ``<w:hyperlink>`` holding
+    one plain ``<w:r>`` with the number as ``<w:t>``: still clickable, still
+    styled with the requested ``vertAlign``, and nothing for Word to
+    recalculate.
+
+    The trade
+    ---------
+    The number no longer tracks anything.  Add a figure above this reference
+    and it stays at the old value until this command is re-run.  That is the
+    whole difference: fields buy automatic renumbering at the cost of a
+    re-render step, static text buys a guaranteed look at the cost of re-running
+    the build.
+
+    Formats that cannot be static
+    -----------------------------
+    ``page`` (PAGEREF) and ``above-below`` (``\\p``) have no value to write:
+    the page number depends on pagination that does not exist at build time,
+    and above/below is decided by Word per occurrence.  Both are refused with a
+    usage error rather than written as a plausible-looking guess.
+    """
+    if fmt in _STATIC_UNSUPPORTED:
+        raise UsageError(
+            f"--static cannot express --format {fmt}: {_STATIC_UNSUPPORTED[fmt]}; "
+            f"drop --static (the field form is the only way to get it)")
+
+    names = all_bookmarks(doc)
+    if args.target not in names and not getattr(args, "allow_missing", False):
+        raise SystemExit(f"no such bookmark: {args.target} "
+                         f"(known: {sorted(names)[:8]})")
+
+    vert = _vert_from_args(args)
+    use_hyperlink = not getattr(args, "no_hyperlink", False)
+    target = paragraph_at(doc, args.index)
+    rpr = _para_rpr(target)
+    text = str(_cached_for(doc, args, fmt))
+
+    p = target._p
+    if args.prefix:
+        p.append(_text_run(args.prefix, rpr))
+    run = _text_run(text, with_vert_align(rpr, vert))
+    if use_hyperlink:
+        p.append(hyperlink_wrap(args.target, [run]))
+    else:
+        p.append(run)
+    if args.suffix:
+        p.append(_text_run(args.suffix, rpr))
+    return {"ok": True, "index": args.index, "target": args.target,
+            "text": text, "format": fmt, "mode": "static",
+            "needs_field_update": False,
+            "vert_align": vert or "normal",
+            "hyperlink": use_hyperlink,
+            "anchor": args.target if use_hyperlink else None}
 
 
 def check_crossref_anchors(doc) -> dict:
@@ -1447,6 +1556,13 @@ def main() -> int:
                    help="write the field even though the target bookmark does "
                         "not exist yet (forward reference to a reference list "
                         "that comes later); verify the anchors afterwards")
+    p.add_argument("--static", action="store_true",
+                   help="write the number as literal text instead of a REF "
+                        "field: no F9 needed and nothing Word can re-render, so "
+                        "the superscript is guaranteed to survive PDF export. "
+                        "The number stops tracking its caption: re-run after "
+                        "adding or removing a figure/table. Mutually exclusive "
+                        "with --format page")
 
     p = sub.add_parser("bookmark", help="put a bookmark on a paragraph")
     common(p)

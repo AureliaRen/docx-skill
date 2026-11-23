@@ -25,6 +25,17 @@ Chasing that one turned up a sixth, older and nastier: a spacing command was two
 tokens, so `1/2 m/s` came out with a denominator reading `2},`. Word opens it,
 it looks like a fraction from across the desk, and nothing anywhere reports it.
 
+A second round widened the same contract to the places the first could not
+reach. `docx_preview.py` decoded soffice's UTF-8 output with the console
+locale, so on a cp936 machine a document with CJK text raised
+`UnicodeDecodeError` inside a pipe-reader thread that Python silently reaps -
+`exit 0`, empty stderr, and a crash nobody logged. The reader could not see
+text boxes at all: `docx_read.py` walked only the body's direct `p`/`tbl`
+children, so 43 text boxes in a real annotated assignment read as zero, in
+every mode. And the validator judged run-property values by the XML schema
+instead of by Word: `darkMagenta` opens, `DARK_MAGENTA` does not, and both
+passed.
+
 ### Changed
 
 - **`docx_edit.py set-cell` keeps cell formatting by default** (was: clear and
@@ -148,6 +159,56 @@ it looks like a fraction from across the desk, and nothing anywhere reports it.
   zero entries). An outline of nothing is a mistake, not an answer; the refusal
   names the accepted forms (`1,2` / `1-3`). Non-numeric `--indent-chars` now
   fails as a single `error:` line instead of a bare traceback.
+- **`docx_read.py` reads text boxes** - `w:txbxContent` is enumerated wherever
+  it sits (drawn shape, VML pict, or `mc:AlternateContent`), with `mc:Choice`
+  preferred over its `mc:Fallback` twin so each box is reported once, not
+  twice. `--blocks` gains `textbox` blocks with a `flavor` field, `--text`
+  gains a `textboxes` key, `--runs` tags textbox paragraphs, `--md` renders
+  them as quoted blocks. Measured on a real 43-box document: every mode
+  reports 43 (the naive count is 86 - Choice and Fallback each carry a copy);
+  an independent lxml walk agrees, 43/43/43, zero empty branches.
+- **`docx_edit.py char-format`** - set `--highlight`, `--color`, `--bold`,
+  `--italic` on every run matching `--find`. The 17 legal highlight values
+  accept the names Word itself writes (`darkMagenta`) and the enum spellings
+  (`DARK_MAGENTA`, `dark_magenta`); anything else is a single `error:` line
+  and exit `2` - because Word refuses the file, not the style: measured with
+  Word COM, `darkMagenta` opens while `DARK_MAGENTA` / `purple` / `FF0000`
+  all raise the corrupt-file dialog (com_error 25272). Matching runs are
+  split and deep-copied, so text before and after the match keeps its
+  formatting. `docx_read.py --runs` now reports `highlight` and `color` per
+  run.
+- **`docx_validate.py` audits run-property values** - two new codes:
+  `invalid-run-property` (error - a value Word refuses to open the file for:
+  `w:highlight`, `w:vertAlign`, `w:effect`) and `nonstandard-run-property`
+  (warning - a value Word tolerates but reinterprets: `w:u`, `w:color`).
+  Severity comes from measured Word behaviour, not from the schema:
+  `vertAlign="normal"` opens fine, while `effect="ants"` is schema-legal and
+  Word still refuses it. Nine parts are scanned (document, styles,
+  stylesWithEffects, numbering, settings, comments, footnotes, endnotes,
+  headers/footers). Zero false positives across a 407-document healthy
+  corpus.
+- **Element order has one source** - the run- and paragraph-property
+  sequences live in `docx_utils._ORDER_MAP`, consumed through a
+  `successors()` helper in `docx_crossref`; the three hard-coded copies in
+  `docx_create.py` are gone (two of them had quietly drifted into paragraph
+  order). 40 parts re-saved byte-identical before and after the switch.
+
+### Fixed
+
+- **`docx_preview.py` reads soffice output as UTF-8 explicitly** -
+  `encoding="utf-8", errors="replace"` on the one bare `text=True`
+  subprocess call in production code. Measured: soffice emits UTF-8; under a
+  cp936 locale (`PYTHONUTF8=0`) the old call died on byte `0xaf` inside the
+  reaped reader thread - `exit 0`, nothing logged. Eight test-side calls were
+  measured safe under the same locale and left alone.
+- **README / SKILL / THIRD-PARTY-NOTICES re-aligned with the tree** - counts
+  had drifted three phases behind (scripts 27 -> 29, tests 47 -> 77,
+  references 6 -> 7), and the Hermes lineage list named `docx_common` and
+  `docx_template` as header-marked while the markers actually sit on
+  `docx_preview` and `docx_footer` (with `docx_template`'s evidence in its
+  docstring and `docx_common`'s in its family header). The notices table now
+  lists all fourteen derived files plus the two test modules carrying the
+  same marker.
 
 ## [1.1.0] - 2026-11-13
 

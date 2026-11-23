@@ -6,8 +6,9 @@ provenance of everything in the repository that is not original work, so that
 upstream attribution travels with the source.
 
 Scope of this file: **every file in the repository** is accounted for below —
-`scripts/` (27 files), `tools/` (2), `tests/` (47), `references/` (6),
-`examples/` (2), `.github/` (1), plus the top-level documents. Nothing is
+`scripts/` (28 `.py` + 1 `.ps1` — 29 files), `tools/` (2), `tests/` (77),
+`references/` (7), `examples/` (2), `.github/` (1), plus the top-level
+documents. Nothing is
 redistributed from a third party: there is no vendored library, no `.xsd` /
 `.xsl` copy, and no binary blob in the tree.
 
@@ -17,7 +18,7 @@ Files derived from [NousResearch/hermes-agent](https://github.com/NousResearch/h
 path `skills/productivity/microsoft-office/`, released under the MIT License,
 Copyright (c) 2026 Nous Research.
 
-**Twelve files under `scripts/`:**
+**Fourteen files under `scripts/`:**
 
 | File | Evidence of lineage in the file itself |
 |---|---|
@@ -31,6 +32,8 @@ Copyright (c) 2026 Nous Research.
 | `docx_numbering.py` | same header |
 | `docx_section.py` | same header |
 | `docx_toc.py` | same header |
+| `docx_footer.py` | same header |
+| `docx_preview.py` | same header |
 | `docx_template.py` | docstring documents the hermes CLI's positional-argument form (`fill` as `_with_default_subcommand()`), and records that upstream's `--fix-formulas` imported an `office/` module from the hermes tree that is **not** shipped here |
 | `docx_common.py` | shared helper surface of the CLIs above; header reads `# MIT License. Shared helpers for the docx skill scripts.` |
 
@@ -40,20 +43,20 @@ fixes recorded in the commit history, the merged behaviour taken from the other
 lineage of this toolkit, and — in `docx_common.py` — an added self-describing
 `--api` entry point plus a replacement-iteration budget that prevents an
 infinite loop when a replacement value contains the search token. The original
-MIT grant above applies to all of them unchanged.
+MIT grant above applies to all of them unchanged. Two test modules,
+`tests/test_edit_setcell.py` and `tests/test_read_runs.py`, carry the same
+header marker; they are adapted from the same base and are covered by the same
+grant.
 
-> Two notes for a future auditor, stated rather than hidden:
+> One note for a future auditor, stated rather than hidden:
 >
-> 1. The ten `scripts/` headers above are the author's own statement of
->    lineage and are the evidence used here. `README.zh-CN.md`'s「自研增量」
->    paragraph still lists `docx_numbering` / `docx_crossref` / `docx_toc` /
->    `docx_section` as this project's own work; that summary predates this
->    alignment and needs the same correction. Until it is fixed, treat this
->    file as authoritative for provenance and the README line as stale.
-> 2. The upstream directory listing could not be fetched while this list was
->    built (the GitHub contents API answered `429 Too Many Requests`), so the
->    set below is derived from in-repo evidence rather than from the upstream
->    tree. To confirm coverage, diff `git ls-tree` of
+> 1. The twelve `scripts/` headers above (and the two test modules carrying
+>    the same marker) are the author's own statement of lineage and are the
+>    evidence used here. The upstream directory listing could not be fetched
+>    while this list was built (the GitHub contents API answered `429 Too Many
+>    Requests`), so the set is derived from
+>    in-repo evidence rather than from the upstream tree. To confirm coverage,
+>    diff `git ls-tree` of
 >    `skills/productivity/microsoft-office/docx/scripts` upstream against
 >    `scripts/` here.
 
@@ -68,11 +71,11 @@ Everything else is original work for this project:
 - **Runtime plumbing** — `_bootstrap.py`, `encoding.py`, `minidom_compat.py`,
   `docx_utils.py`, `docx_pack.py`
 - **Acceptance tooling** — `tools/word_accept.py`, `tools/README.md`
-- **Tests** — `tests/` (47 files: test modules plus the `_omml.py` helper and
+- **Tests** — `tests/` (77 files: test modules plus the `_omml.py` helper and
   fixture generators)
-- **Reference documentation** — `references/` (6 documents: `font-scheme`,
+- **Reference documentation** — `references/` (7 documents: `font-scheme`,
   `formula-guide`, `merge-and-export`, `revisions-and-comments`,
-  `table-geometry`, `toc`)
+  `table-geometry`, `toc`, `editing-traps`)
 - **Examples** — `examples/basic.json`, `examples/formulas.json`
 - **CI** — `.github/workflows/ci.yml`
 - **Top-level documents** — `README.md`, `README.zh-CN.md`, `SKILL.md`,
@@ -126,12 +129,12 @@ Re-check that no proprietary text rode along, from the repository root:
 
 ```
 git grep -nE 'Anthropic|anthropic|All rights reserved|Proprietary'
-git grep -n 'Part of the Hermes docx skill'       # 10 scripts + the line in this file
+git grep -n 'Part of the Hermes docx skill'       # 12 scripts + 2 tests + doc mentions
 python -c "import importlib.metadata as m;print(m.metadata('latex2mathml')['License'])"
 ```
 
 At the time of writing the first command matches **nothing but the pattern line
 inside this file** — no `Anthropic`, no `Proprietary` text anywhere in the tree
-or in history — and the second matches exactly the ten `scripts/` files listed in
-the table (plus this file's own mention), with the other two documented from
-their docstrings.
+or in history — and the second matches exactly the twelve `scripts/` files and
+the two test modules noted above (plus the doc files that quote the header
+verbatim), with the other two derived files documented from their docstrings.

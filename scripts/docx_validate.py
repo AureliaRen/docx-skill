@@ -21,6 +21,20 @@ Checks (health-check tier, NOT full XSD schema validation):
     every reference in it still resolves, so the reference checks above cannot
     see them.  This is *not* XSD validation — it is only the two shapes that
     are cheap to detect and fatal in practice.
+  - **restricted run-property values** in every ``word/*.xml`` part: the
+    enumerated children of ``<w:rPr>`` whose ``w:val`` comes from a closed
+    value list.  Two severities, **decided by what Word 16.0 actually does with
+    each value rather than by the schema** (see the comment block above
+    ``_EFFECT_VALUES`` for the measurement table):
+    ``invalid-run-property`` (**error**) for the ones that make Word refuse to
+    open the file — ``w:highlight`` / ``w:vertAlign`` / ``w:effect`` — and
+    ``nonstandard-run-property`` (**warning**) for ``w:u`` / ``w:color``,
+    which Word opens happily and merely re-interprets.  A value outside the
+    schema but tolerated by Word must not become an error: this report is
+    consumed downstream, and a false error rejects a document that opens.
+    The rule cuts both ways, so the tolerances are recorded too: ``w:vertAlign
+    w:val="normal"`` opens (schema-illegal, so it is accepted) while
+    ``w:effect w:val="ants"`` is **refused** (schema-legal, so it is an error).
 
 ``word/document.xml`` (and ``word/styles.xml``) failing to parse is reported as
 one ``bad-document-xml`` / ``bad-styles-xml`` issue instead of a traceback: the
@@ -30,6 +44,26 @@ not a usage error.
 Output: {"ok": bool, "issues": [{"severity": "error"|"warning", ...}]}
 Exit code 1 when any error-severity issue is found (warnings exit 0).
 Exit code 2 when the path is not a readable .docx at all (one line on stderr).
+
+Footer semantics are delegated to :mod:`docx_footer` (one implementation, two
+entry points; ``docx_footer check`` is the detailed report).  Two codes come
+from there:
+
+* ``footer-textbox-overflow`` (**error**) — a floating text box holding the page
+  line is narrower than the line needs, so the number is clipped.  This is
+  content loss, not ugliness: a floating box does not re-flow, the glyphs are
+  drawn past the box and cut by the margin.  See the severity note in
+  :mod:`docx_footer` for why the estimate is allowed to raise an error at all.
+* ``footer-no-page-field`` (**warning**) — ``<w:pgNumType>`` is set on a section
+  that renders a non-empty footer, but that footer carries no PAGE field.  A
+  warning rather than an error because it is a legal intermediate state (the
+  counter is configured, the footer is filled later) and because the real corpus
+  has four such documents that are simply *without* a footer, not *with a
+  broken* one.
+
+A footer part that cannot be read reports ``footer-check-skipped`` (warning)
+instead of raising — this script must never trade its JSON report for a
+traceback.
 """
 from __future__ import annotations
 import _bootstrap  # noqa: F401
@@ -37,6 +71,7 @@ import _bootstrap  # noqa: F401
 import argparse
 import json
 import posixpath
+import re
 import sys
 import zipfile
 
@@ -74,6 +109,280 @@ IMAGE_MAGIC = (
 
 def _issue(issues, severity, code, detail):
     issues.append({"severity": severity, "code": code, "detail": detail})
+
+
+# ---------------------------------------------------------------------------
+# restricted run-property values
+# ---------------------------------------------------------------------------
+# ``<w:rPr>`` has children whose ``w:val`` comes from a **closed** value list
+# (wml.xsd enumerations).  An out-of-list value is not "ugly formatting": Word
+# 16.0 refuses to open the whole package with 「文件可能已经损坏」 (COM
+# ``Documents.Open`` → ``com_error 25272``, ``wdmain11.chm``).  Every reference
+# in such a file still resolves and python-docx still opens it, so nothing else
+# in this script can see it.
+#
+# --- the governing rule ----------------------------------------------------
+#
+# **severity follows Word's measured behaviour, not the schema.**  A value the
+# schema forbids but Word opens must not become an error: this report feeds
+# ``docx_edit`` / ``docx_template`` / ``docx_mathify``, and a false error makes
+# them reject a document that opens fine.  Conversely a schema-legal value that
+# Word refuses must be an error — the schema's opinion changes nothing about a
+# file the user cannot open.
+#
+# Measured has *two* dimensions, and the second one is not decoration:
+#
+#   (a) does ``Documents.Open`` succeed at all — decides error vs. not;
+#   (b) does the written value survive a Word round trip (``SaveAs2`` then read
+#       the part back) — decides whether the value is really a legal *spelling*
+#       (kept verbatim), a name for the default (dropped), or content Word
+#       silently replaces (a defect worth reporting even though the file opens).
+#
+# --- the measurements (Word 16.0, Windows, COM) ----------------------------
+#
+# One freshly built document per value: base ``_smoke/in.docx`` with a single
+# run's ``rPr`` patched.  ``save`` is what the value looked like after Word
+# re-saved the opened document.
+#
+#   <w:highlight w:val="darkMagenta">   opens   save darkMagenta
+#   <w:highlight w:val="DARK_MAGENTA">  REFUSED (com 0x800A1529 / -2147352567)
+#   <w:highlight w:val="Magenta">       REFUSED   <- the camel case is part of
+#   <w:highlight w:val="purple">        REFUSED      the value: only the exact
+#   <w:highlight w:val="FF0000">        REFUSED      `darkMagenta` spelling is
+#   <w:highlight w:val="darkMagento">   REFUSED      in ST_HighlightColor
+#   <w:highlight/>  (no w:val)          REFUSED
+#   <w:vertAlign w:val="baseline">      opens   save (dropped)
+#   <w:vertAlign w:val="subscript">     opens   save subscript  Subscript=-1
+#   <w:vertAlign w:val="superscript">   opens   save superscript  Super=-1
+#   <w:vertAlign w:val="normal">        opens   save (dropped)  Super=0 Sub=0
+#   <w:vertAlign w:val="Normal">        REFUSED  <- capital N is not it either
+#   <w:vertAlign w:val="SUPERSCRIPT">   REFUSED
+#   <w:vertAlign w:val="Baseline">      REFUSED  <- case, again
+#   <w:vertAlign w:val="bogus">         REFUSED
+#   <w:vertAlign/>  (no w:val)          REFUSED
+#   <w:effect w:val="blinkBackground">  opens   save blinkBackground
+#   <w:effect w:val="lights">           opens   save lights
+#   <w:effect w:val="sparkle">          opens   save none   <- re-interpreted
+#   <w:effect w:val="none">             opens   save none
+#   <w:effect w:val="ants">             REFUSED  <- schema-legal, Word refuses
+#   <w:effect w:val="blink">            REFUSED  <- not in ST_TextEffect at all
+#   <w:effect w:val="BlinkBackground">  REFUSED
+#   <w:effect/>     (no w:val)          REFUSED
+#
+#   <w:u w:val="SINGLE"> / "tripleWave" opens   save (dropped) <- re-interpreted
+#   <w:u/>           (no w:val)         opens   save (dropped) = single
+#   <w:color w:val="#FF0000">           opens   save FF0000    <- strips the #
+#   <w:color w:val="F00"> / "red" /
+#            "ZZZZZZ" / "" / missing     opens   <- re-interpreted
+#
+# --- what that buys, per element -------------------------------------------
+#
+#   error   — ``w:highlight`` / ``w:vertAlign`` / ``w:effect``: an out-of-list
+#             value makes Word refuse the file (dimension (a)).  ``error``
+#             matches the ``empty-drawing`` / ``invalid-nesting`` precedent: the
+#             same class of "the file does not open".
+#   warning — ``w:u`` / ``w:color``: out-of-schema, Word opens and merely
+#             re-interprets.  Still worth naming — a validator silent about a
+#             hand-written ``w:color="red"`` teaches the wrong lesson — but it
+#             must not change ``ok`` or the exit code.
+#
+# Two values moved *into* the legal sets on the strength of dimension (a) alone,
+# because Word opening them is the fact the contract cares about:
+#
+#   * ``w:vertAlign w:val="normal"`` — **not** in ST_VerticalAlignRun, yet Word
+#     opens it and treats it exactly like baseline (Superscript=0, Subscript=0),
+#     then drops the element on save.  It is also ``docx_crossref.VERT_ALIGN``'s
+#     spelling of "no offset at all" and therefore the default of
+#     ``--vert-align``: reporting it as an error rejected the repo's own
+#     documented default.  It is legal here for that reason, not because the
+#     schema grew a member.  (P21; the comment block used to *say* it opens
+#     while the rule table said error — comment and code disagreed.)
+#   * ``w:effect w:val="ants"`` — the reverse case: it **is** in ST_TextEffect
+#     and Word still refuses the package.  It is therefore *not* in the legal
+#     set.  Under-reporting a value Word opens is the accepted trade; quietly
+#     accepting a value Word refuses is not, so this one is an error by
+#     measurement even though the schema disagrees.  (The old code listed
+#     ``ants`` as legal and explained the gap in prose instead — the review was
+#     right that "deliberately missed" has to look different from "legal".)
+#
+# --- one neighbouring check, measured, deliberately left as an error ---------
+#
+# ``missing-style`` (an undefined ``w:pStyle`` / ``w:rStyle``) also opens — but
+# Word *substitutes* a different style id on save (measured: ``NoSuchStyleXyz``
+# came back as ``aa``), i.e. the page is silently re-formatted.  That is
+# dimension (b) failing, not a value Word merely re-spells, so it stays an
+# error and is out of scope for the two fingerprinted sets above.
+#
+# --- where the value lists come from (none re-typed here) -------------------
+#
+#   * ``ST_HighlightColor`` — ``docx_edit.HIGHLIGHT_VALUES`` (the authority the
+#     ``char-format`` command validates against; 17 values, and its comment
+#     explains why ``WD_COLOR_INDEX`` is an alias source rather than the gate).
+#     Note that ``w:val="none"`` is a member: it means "explicitly no
+#     highlight", which is why ``none`` is legal here and *absent* ``w:val``
+#     is not.
+#   * ``ST_Underline`` — ``WD_UNDERLINE``'s ``xml_value``s from python-docx,
+#     the same library the writer commands use.
+#   * ``ST_VerticalAlignRun`` **plus** Word's tolerated ``normal`` —
+#     ``docx_crossref.VERT_ALIGN``, the repo's single table for ``w:vertAlign``.
+#     Both its keys and its non-``None`` values are ``w:val`` strings Word
+#     opens; ``normal`` maps to ``None`` (no element) on the write side, which
+#     is why taking only the values used to lose it.
+#   * ``ST_TextEffect`` — not modelled anywhere in the repo, so it is spelled
+#     out below, **minus** ``ants`` (measured refusal above).
+#
+# ``RPR_ORDER`` is imported from ``docx_crossref`` only to assert that every
+# element named below is really an ``rPr`` child — the repo's single order table
+# is also the single list of what an ``rPr`` may contain, so a typo such as
+# ``w:higlight`` fails loudly at import time instead of silently checking a
+# element that never exists.
+#: ST_TextEffect minus the one value Word refuses to open (``ants``).  The
+#: schema list is longer than this on purpose: see the measurement table above.
+_EFFECT_VALUES = ("blinkBackground", "lights", "sparkle", "none")
+
+_COLOR_STRICT = re.compile(r"^(?:auto|[0-9A-Fa-f]{6})$")
+
+
+def _legal_highlight() -> tuple:
+    """``ST_HighlightColor``, taken from `docx_edit`, never re-typed here."""
+    from docx_edit import HIGHLIGHT_VALUES
+    return tuple(HIGHLIGHT_VALUES)
+
+
+def _legal_underline() -> tuple:
+    """``ST_Underline`` from python-docx's ``WD_UNDERLINE.xml_value``s."""
+    from docx.enum.text import WD_UNDERLINE
+    vals = {getattr(m, "xml_value", None) for m in WD_UNDERLINE}
+    return tuple(sorted(v for v in vals if v))
+
+
+def _legal_vert_align() -> tuple:
+    """``ST_VerticalAlignRun`` **as Word accepts it**: keys + values of ``VERT_ALIGN``.
+
+    Both sides of that table are ``w:val`` spellings Word opens, and they are
+    not the same set: ``baseline`` / ``superscript`` / ``subscript`` are the
+    schema members (they appear on both sides), while ``normal`` appears only as
+    a key — the write side maps it to ``None`` ("no element at all"), because
+    baseline is the OOXML default.  A hand-written ``<w:vertAlign w:val="normal"/>``
+    is nonetheless measured to open (Word reads it as baseline, then drops it on
+    save), and ``normal`` is ``--vert-align``'s default value in
+    :mod:`docx_crossref`, so taking only the table's *values* rejected the
+    repo's own default spelling.  Measured, not assumed: see the block above
+    ``_EFFECT_VALUES``.
+    """
+    from docx_crossref import VERT_ALIGN
+    return tuple(sorted({v for v in VERT_ALIGN.values() if v} | set(VERT_ALIGN)))
+
+
+def _restricted_run_rules():
+    """``tag`` -> ``(severity, legal values, needs w:val)``.
+
+    Built lazily so that a sibling module that will not import degrades to
+    "this one check is skipped" instead of killing the whole report — the same
+    contract the footer wiring below already has.
+    """
+    rules = {}
+    try:
+        rules["highlight"] = ("error", _legal_highlight(), True)
+    except Exception:                              # noqa: BLE001 - by design
+        pass
+    try:
+        rules["vertAlign"] = ("error", _legal_vert_align(), True)
+    except Exception:                              # noqa: BLE001 - by design
+        pass
+    rules["effect"] = ("error", _EFFECT_VALUES, True)
+    try:
+        rules["u"] = ("warning", _legal_underline(), False)
+    except Exception:                              # noqa: BLE001 - by design
+        pass
+    rules["color"] = ("warning", None, False)      # value checked by regex
+    try:
+        from docx_crossref import RPR_ORDER
+    except Exception:                              # noqa: BLE001 - by design
+        return rules
+    for tag in list(rules):
+        if tag not in RPR_ORDER:                   # pragma: no cover - typo guard
+            del rules[tag]
+    return rules
+
+
+_RUN_PROPERTY_CODE = {
+    "error": "invalid-run-property",
+    "warning": "nonstandard-run-property",
+}
+
+#: ``word/*.xml`` parts whose ``<w:rPr>`` children reach Word's parser.
+#: Measured: an illegal ``w:highlight`` in *any* of these makes ``Documents.Open``
+#: fail — ``stylesWithEffects.xml`` and ``numbering.xml`` included.  Parts are
+#: picked by name rather than by "every word/*.xml" so that ``word/comments.xml``,
+#: ``word/footnotes.xml`` and the header/footer parts are covered too (they are
+#: named ``word/header1.xml`` … and do carry ``rPr``), while theme/fontTable,
+#: which cannot hold run properties, are skipped without a parse.
+_RUN_PROPERTY_PARTS = re.compile(
+    r"^word/(?:document|styles|stylesWithEffects|numbering|settings|"
+    r"comments|commentsExtended|footnotes|endnotes|"
+    r"header\d*|footer\d*|glossary/document)\.xml$")
+
+
+def _check_run_property_values(zf, names, issues) -> None:
+    """Report out-of-list ``w:val`` on restricted ``<w:rPr>`` children.
+
+    Two decisions worth keeping:
+
+    * **A missing ``w:val`` is not automatically a problem.**  ``<w:u/>`` means
+      ``single`` (measured: Word opens it) and ``<w:color/>`` means ``auto``
+      (also fine), so for those two the element is only checked when a value is
+      present.  ``<w:highlight/>`` / ``<w:vertAlign/>`` / ``<w:effect/>`` have no
+      schema default (each ``w:val`` is ``use="required"``) and Word refuses the
+      file, so for them absence is the error.
+    * **Only the element's own name is inspected.**  ``w:u`` carries ``w:color``
+      too; that attribute is a *colour*, not the underline kind, so it is not
+      looked up in ``ST_Underline``.
+    """
+    rules = _restricted_run_rules()
+    if not rules:
+        return
+    for part in sorted(names):
+        if not _RUN_PROPERTY_PARTS.match(part):
+            continue
+        try:
+            root = etree.fromstring(zf.read(part))
+        except etree.XMLSyntaxError:
+            # Already reported as bad-document-xml / bad-styles-xml where it
+            # matters; a second complaint about the same broken part is noise.
+            continue
+        val_attr = f"{{{W}}}val"
+        for rpr in root.iter(f"{{{W}}}rPr"):
+            for child in rpr:
+                if not isinstance(child.tag, str):
+                    continue                     # comment / PI node
+                tag = child.tag
+                if not tag.startswith(f"{{{W}}}"):
+                    continue
+                local = tag.split("}")[1]
+                rule = rules.get(local)
+                if rule is None:
+                    continue
+                severity, legal, needs_val = rule
+                code = _RUN_PROPERTY_CODE[severity]
+                value = child.get(val_attr)
+                if value is None:
+                    if needs_val:
+                        _issue(issues, severity, code,
+                               f"{part}: <w:{local}> has no w:val, which Word "
+                               f"refuses to open")
+                    continue
+                if legal is None:                 # w:color
+                    if not _COLOR_STRICT.match(value):
+                        _issue(issues, severity, code,
+                               f"{part}: <w:{local} w:val={value!r}> is not six "
+                               f"hex digits or 'auto'; Word opens the file but "
+                               f"re-interprets the colour")
+                    continue
+                if value not in legal:
+                    _issue(issues, severity, code,
+                           f"{part}: <w:{local} w:val={value!r}> is not a legal "
+                           f"value; legal: {', '.join(legal)}")
 
 
 def _rel_target(base_part: str, target: str) -> str:
@@ -249,6 +558,36 @@ def validate(path: str) -> dict:
             if sid and sid not in defined:
                 _issue(issues, "error", "missing-style",
                        f"style id referenced but not defined: {sid}")
+
+    # --- restricted run-property values -----------------------------------
+    # Runs after the structural checks and before the footer wiring: it needs
+    # the package's part list only, so it works even when document.xml parsed
+    # but a header did not (those parts are skipped individually above).
+    _check_run_property_values(zf, names, issues)
+
+    # --- footer semantics -------------------------------------------------
+    # Everything above asks "does this name resolve to a part" and "is this
+    # markup shaped legally".  None of it asks whether the *content* of a
+    # footer survives being rendered, and a footer pushed into a 4.56 pt wide
+    # floating text box passes every check in this file: legal XML, resolving
+    # rels, a real PAGE field.  Measured on the document that started P17:
+    # ``{"ok": true, "issues": []}`` while the page number was clipped at two
+    # digits.  So the whole footer semantics live in `docx_footer` and this is
+    # only the wiring — one implementation, two entry points.
+    #
+    # "Cannot read it" must not become a traceback: `footer_issues` swallows
+    # its own failures into a warning, so a broken footer part degrades to
+    # ``footer-check-skipped`` instead of losing the report.  The import is
+    # guarded for the same reason — a sibling module that will not import (an
+    # incomplete install, a name that moved) must not turn every document into
+    # a crash of *this* script.
+    try:
+        from docx_footer import footer_issues
+    except Exception as exc:                       # noqa: BLE001 - by design
+        _issue(issues, "warning", "footer-check-skipped",
+               "docx_footer unavailable (%s: %s)" % (type(exc).__name__, exc))
+    else:
+        issues.extend(footer_issues(path))
 
     # --- python-docx can open it ------------------------------------------
     try:
