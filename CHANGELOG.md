@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
 A patch round that is almost entirely about *silent* damage: four ways an edit
 could finish with `exit 0`, an empty stderr and `{"ok": true}`, and still leave
 the document wrong. `set-cell` was the worst of them - filling a template cell
