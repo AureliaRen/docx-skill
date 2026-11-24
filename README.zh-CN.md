@@ -330,9 +330,10 @@ python -X utf8 -m pytest tests -q
 | 环境 | 结果 |
 |---|---|
 | 开发机，本机装了 Office，2026-11-24 实跑 | **2498 passed / 239 skipped / 0 failed**（collected 2737） |
-| 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件，**且必须在开发树之外的 clone 里跑**——上层目录若有 `_smoke/`，有 95 条用例会从 skip 变成 pass）——`ci.yml` 门禁的形状就是这一行 | **2220 passed / 477 skipped / 0 failed**（collected 2697） |
+| GitHub Actions，ubuntu-latest（py3.10 与 py3.12 同值），2026-11-24 在 PR #5 上实测 | **2231 passed / 506 skipped / 0 failed**（collected 2737） |
+| GitHub Actions，windows-latest（py3.10 与 py3.12 同值），同一次跑 | **2234 passed / 503 skipped / 0 failed**（collected 2737） |
 
-差的就是那 238 条：143 条需要 `latex2mathml` **加** `MML2OMML.XSL`，另 95 条要读 `_smoke/` 基线。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 2206` 与 `skipped <= collected / 4`。第二行是 P23 新增用例之前测的，本轮没重测，所以它的 collected 还是旧的 2697，第一行是现测值。
+开发机那一行和 ubuntu 那一行差 267 条：需要 `latex2mathml` **加** `MML2OMML.XSL` 的用例，加上要读 `_smoke/` 基线的用例。任何一行都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 2231`（取两条 runner 腿里低的那个）与 `skipped <= collected / 4`。门禁数是实测量，只有新用例真的在 runner 上**跑起来**才会抬；在 runner 上 skip 的用例不改变它。
 
 `tests/` 里是 80 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 

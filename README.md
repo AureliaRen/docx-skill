@@ -477,14 +477,16 @@ runs, same commit, different machines; the numbers differ only because the skips
 | Where | Result |
 |---|---|
 | Developer machine, local Office installed, measured 2026-11-24 | **2498 passed / 239 skipped / 0 failed** (2737 collected) |
-| Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file, **run on a clone of this repository outside the development tree**) — the row whose shape `ci.yml` gates on | **2220 passed / 477 skipped / 0 failed** (2697 collected) |
+| GitHub Actions, ubuntu-latest (py3.10 and py3.12 alike), measured 2026-11-24 on PR #5 | **2231 passed / 506 skipped / 0 failed** (2737 collected) |
+| GitHub Actions, windows-latest (py3.10 and py3.12 alike), same run | **2234 passed / 503 skipped / 0 failed** (2737 collected) |
 
-The gap is 238 tests: 143 that need `latex2mathml` **and** `MML2OMML.XSL`, plus
-95 that read the `_smoke/` baseline kept above a development checkout. Neither row
-is a number to chase by editing a constant; `ci.yml` gates `passed >= 2206` and
-`skipped <= collected / 4`. The second row was measured before the P23 test
-additions and has not been re-measured since, so its `collected` count is the old
-2697 while the developer row above is current.
+The gap between the developer row and a runner row is 267 tests on ubuntu: those
+that need `latex2mathml` **and** `MML2OMML.XSL`, plus those that read the
+`_smoke/` baseline kept above a development checkout. No row is a number to chase
+by editing a constant; `ci.yml` gates `passed >= 2231` (the lower of the two
+runner legs) and `skipped <= collected / 4`. The floor is a measured value, so it
+moves only when a new test actually *runs* on a runner — a test that skips there
+changes nothing.
 
 `tests/` holds 80 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
 backs the PDF text-layer assertions and `pytest` is the runner; neither is a runtime
