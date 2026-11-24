@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """表格几何 + ``w:zoom`` 补丁的回归（不需要真 docx 二进制）。
 
-来源：``source-snapshot/scripts/office/test_table_layout.py``（原属上游 office
-脚本目录，import 走 ``helpers.docx_utils``）。平铺进本仓库后只改 import 两处：
+来源：上游 office 时代的 ``source-snapshot`` 快照（旧 office 子包已并入
+``scripts/`` 平铺结构），import 当时走 ``helpers.docx_utils``。平铺进本仓库后只改 import 两处：
 ``helpers.docx_utils`` → ``docx_utils``，路径指向同级 ``../scripts``。
 测试类与断言原样保留（unittest 类 pytest 能直接收）。
 

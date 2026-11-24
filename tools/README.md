@@ -58,8 +58,10 @@ $py = (Get-Command python).Source
 | Word | `probe_word(...) -> dict` | `pywin32` + Office | 只有 Word 才知道的：页数、节几何、渲染后的编号串、超链接**目标**、域**结果**、PDF、PNG |
 
 `probe_xml` **刻意不 import `scripts/` 下任何东西**（含 `_bootstrap`），
-`tools/word_accept.py` 里自带一份 6 行的 `_fix_stdio`。这样即使 `scripts/` 正在被并行改写，
-验收器照常可用。同理 `win32com` / `fitz` 都只在函数内延迟导入——
+`tools/word_accept.py` 里自带一份 stdio 硬化（`_harden_stream` / `STDIO_MODE`，
+与 `scripts/encoding.py` 同一套策略：reconfigure 到 UTF-8 + `backslashreplace`、
+按 codec 归一化名复核、不通过才 `TextIOWrapper` 重绑），仍是**独立副本、不 import**。
+这样即使 `scripts/` 正在被并行改写，验收器照常可用。同理 `win32com` / `fitz` 都只在函数内延迟导入——
 `tests/test_word_accept_xml.py` 用 `ast` 把这条钉死了。
 
 `main()` 把两层合并。**顶层契约字段永远存在且已填值**：Word 没跑时回退到 XML 的值，

@@ -30,6 +30,8 @@ Spec (JSON object):
      "header_bold": true},
     {"type": "image", "path": "pic.png", "width_mm": 60, "alignment": "center"},
     {"type": "page_break"},
+    {"type": "latex", "latex": "E = mc^2"},
+    {"type": "latex", "latex": "\\frac{a}{b} = c", "display": true},
     {"type": "toc"},
     {"type": "caption", "label": "图", "text": "系统架构"},
     {"type": "crossref", "target": "图_1", "prefix": "如图",
@@ -44,7 +46,7 @@ Spec (JSON object):
 
 Paragraph format keys — accepted by every block that produces paragraphs
 (``heading``, ``paragraph``, ``bullet_list``, ``numbered_list``, ``caption``,
-``crossref``, ``toc``, ``image``, ``page_break``):
+``crossref``, ``toc``, ``image``, ``page_break``, ``latex``):
 
   ``indent_left_mm`` / ``indent_right_mm``    left/right indent
   ``first_line_indent_chars``                 first-line indent in *characters*
@@ -115,6 +117,37 @@ full-width space (U+3000) between ``页`` and ``共``; ``custom`` interpolates
 ``{page}`` and ``{total}`` inside ``prefix``/``suffix``, so a non-English layout
 does not need a template of its own.
 
+``latex`` builds a paragraph whose content is one **native Office Math** equation,
+so a document that is mostly formulas can be written from a spec instead of
+hand-driving python-docx.  ``latex`` is required and must be a non-empty string;
+``display`` is optional and defaults to ``false``:
+
+  {"type": "latex", "latex": "E = mc^2"}                       → inline
+  {"type": "latex", "latex": "\\frac{a}{b} = c", "display": true}  → own line
+
+``display: true`` produces an ``m:oMathPara`` — Word's display layout, on a line
+of its own.  ``display: false`` produces an inline ``m:oMath`` **plus a
+zero-width-space run**: an equation that is the only content of its paragraph is
+otherwise *promoted* by Word to a display equation and the layout moves under the
+author.  That is the same trap ``insert_formula`` documents as rule 2, and the
+same zero-width space (U+200B) run ``docx_mathify`` appends inside table cells.
+
+Conversion goes through ``math_omml.latex_to_omml_safe()`` — LaTeX → OMML, then
+``fix_phasor_dots`` (``m:limUpp`` → ``m:acc``; without it ``\\dot{I}`` renders as a
+large glyph with a floating dot), then a structural self-check.  ``math_omml`` is
+imported **inside** the block handler on purpose: it needs ``latex2mathml`` and
+``MML2OMML.XSL`` (shipped with Office), and a spec with no formula must keep
+working on a machine that has neither.
+
+A single equation that fails to convert does **not** abort the document.  The
+failure is recorded with its block index, LaTeX and error; the LaTeX source is
+left in that paragraph as plain text (the same fallback ``docx_mathify`` uses);
+the document is still written; every failure is listed as ``formula_failures``
+on stdout; one ``warning:`` line goes to stderr; and the exit code is **3** — a
+product exists, but a formula did not convert.  ``ok`` is ``false`` in that payload
+while ``output`` still names the file that was written, so a caller that sees
+``ok: false`` must look at ``output`` before deciding nothing exists.
+
 Extras: `"footer_page_numbers": true` at the top level adds a
 "Page X of Y" footer built from PAGE/NUMPAGES fields to the first section,
 and a `toc` block inserts a Table of Contents field. Field results are
@@ -122,13 +155,15 @@ computed by Word/LibreOffice when the file is opened, not by python-docx;
 every field is written with a cached result so the file reads correctly
 before anyone recalculates.
 
-Exit codes — ``0`` the document was written (JSON on stdout); ``1`` it was
-built but is not deliverable (a dangling cross-reference target, an invalid
-or duplicate bookmark name); ``2`` the *spec itself* was rejected **before
-anything was written**.  Code ``2`` prints one readable line to stderr and
-never a traceback: it names the offending key and the nearest legitimate
-spelling, because a misspelt key used to be dropped in silence — the spec
-then built a document with the content missing and still exited ``0``.
+Exit codes — ``0`` the document was written (JSON on stdout); ``3`` the
+document was written but at least one ``latex`` block did not convert (see
+``formula_failures``); ``1`` it was built but is not deliverable (a dangling
+cross-reference target, an invalid or duplicate bookmark name); ``2`` the
+*spec itself* was rejected **before anything was written**.  Code ``2`` prints
+one readable line to stderr and never a traceback: it names the offending key
+and the nearest legitimate spelling, because a misspelt key used to be dropped
+in silence — the spec then built a document with the content missing and still
+exited ``0``.
 A genuine run-time failure of the builder keeps its exit ``1`` and its
 traceback, so a bug can still be located.
 """
@@ -1264,8 +1299,25 @@ def _caption_glues_to_next_table(blocks: list, index: int) -> bool:
     return isinstance(nxt, dict) and nxt.get("type") == "table"
 
 
+def _latex_element(latex: str, display: bool):
+    """One LaTeX string → the OMML element that carries it.
+
+    ``math_omml`` is imported here, not at module level, on purpose: it needs
+    ``latex2mathml`` and Microsoft's ``MML2OMML.XSL`.  A top-level import would
+    make ``docx_create`` itself unimportable on a machine without Office, so a
+    spec with no formula at all would stop working for an unrelated reason.
+
+    ``latex_to_omml_safe`` is the wrapper that also repairs phasor dots
+    (``\\dot{I}`` → ``m:acc``); the bare ``latex_to_omml_lxml`` would leave
+    ``m:limUpp`` in place and Word would render a large glyph with a floating dot.
+    """
+    from math_omml import latex_to_omml_safe
+    return latex_to_omml_safe(latex, display=display)
+
+
 def add_block(doc, block: dict, blocks: list | None = None,
-              index: int | None = None) -> list:
+              index: int | None = None,
+              formula_failures: list | None = None) -> list:
     """Add one block; return the body paragraphs it created or attached to.
 
     Every paragraph-producing block then runs through
@@ -1276,6 +1328,13 @@ def add_block(doc, block: dict, blocks: list | None = None,
     has to look at what comes *next* in the spec to know whether it belongs to
     a table.  A caller that builds blocks one at a time (as the tests do) may
     omit them and simply gets no automatic caption-to-table link.
+
+    *formula_failures*, when a list is given, is where a ``latex`` block reports
+    an equation it could not convert instead of raising: the document keeps
+    building (one broken formula must not cost the author every other block),
+    the LaTeX source is left in the paragraph as plain text, and ``main`` turns
+    a non-empty list into exit 3.  Passing ``None` (the default) keeps the old
+    behaviour of letting the exception escape.
     """
     btype = block["type"]
     made: list = []
@@ -1424,6 +1483,38 @@ def add_block(doc, block: dict, blocks: list | None = None,
             width = None
         doc.add_picture(block["path"], width=width)
         made = [doc.paragraphs[-1]]
+    elif btype == "latex":
+        # One paragraph per equation.  ``made`` is set before the conversion so
+        # the paragraph-format vocabulary (alignment, spacing, bookmark) applies
+        # to the failed case too — the block still produced a paragraph, it just
+        # carries LaTeX source instead of an equation.
+        para = doc.add_paragraph()
+        made = [para]
+        try:
+            el = _latex_element(block["latex"], bool(block.get("display", False)))
+        except Exception as exc:
+            if formula_failures is None:
+                raise                       # library caller: keep the traceback
+            # A single un-convertible equation must not take the document down
+            # with it.  Record it, leave the source readable, and let ``main``
+            # report exit 3 (a product exists, but a formula did not convert) —
+            # the same shape ``docx_mathify`` uses for a failed segment.
+            formula_failures.append({
+                "block": index,
+                "latex": block["latex"],
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}"[:200],
+            })
+            para.add_run(block["latex"])
+        else:
+            para._p.append(el)
+            if not block.get("display"):
+                # An inline equation that is the only content of its paragraph
+                # gets promoted by Word to a *display* equation — centred, with
+                # \sum stacked vertically — and the layout moves under the
+                # author.  U+200B pins it inline; same trick as
+                # insert_formula.build_para (rule 2) and docx_mathify's cell
+                # branch.
+                para.add_run("\u200b")
     elif btype == "page_break":
         para = doc.add_paragraph()
         para.add_run().add_break(WD_BREAK.PAGE)
@@ -1533,6 +1624,10 @@ BLOCK_KEYS = {
     "table": {"header", "rows", "style", "header_bold", "caption",
               "caption_label", "caption_bookmark", "keep_together"},
     "image": _with_para_format("path", "width_mm", "width_frac"),
+    # ``latex`` produces a paragraph that carries one OMML equation.  It takes the
+    # paragraph-format vocabulary too, because the equation's paragraph is a
+    # paragraph like any other (alignment, spacing, bookmark).
+    "latex": _with_para_format("latex", "display"),
     "page_break": _with_para_format(),
     "toc": _with_para_format("instr"),
     # ``section_break`` has its own ``header``/``footer`` keys, so a paragraph
@@ -1763,6 +1858,30 @@ def _check_image(where: str, block: dict, problems: list) -> None:
     _check_width_frac(where, block, problems)
 
 
+def _check_latex(where: str, block: dict, problems: list) -> None:
+    """``latex`` block: the equation is required, ``display`` is a real bool.
+
+    Both checks exist for the same reason as every other check here: a missing
+    ``latex`` used to be the kind of mistake that silently builds an *empty*
+    paragraph (the block would reach ``block["latex"]`` and raise ``KeyError``,
+    which is exit 2 but names no block).  ``"display": "yes"`` is worse — it is
+    truthy, so the equation would silently become a display equation.
+    """
+    latex = block.get("latex")
+    if latex is None:
+        problems.append('%s: latex blocks need "latex" (the LaTeX source, a '
+                        "non-empty string)" % where)
+    elif not isinstance(latex, str):
+        problems.append('%s: "latex" must be a string, got %s'
+                        % (where, type(latex).__name__))
+    elif not latex.strip():
+        problems.append('%s: "latex" is empty; a latex block exists to carry '
+                        "one equation" % where)
+    if "display" in block and not isinstance(block["display"], bool):
+        problems.append('%s: "display" must be true or false, got %r'
+                        % (where, block["display"]))
+
+
 def _check_block(index: int, block, problems: list) -> None:
     where = "blocks[%d]" % index
     if not isinstance(block, dict):
@@ -1793,6 +1912,8 @@ def _check_block(index: int, block, problems: list) -> None:
         _check_keep_together(where, block, problems)
     elif btype == "image":
         _check_image(where, block, problems)
+    elif btype == "latex":
+        _check_latex(where, block, problems)
     elif btype == "crossref":
         if not block.get("target"):
             problems.append('%s: crossref blocks need "target" (a bookmark '
@@ -1935,6 +2056,10 @@ def main() -> int:
         return _input_error(str(exc))
 
     doc = Document()
+    # Equations that did not convert.  A list (not an exception) because one bad
+    # formula must not cost the author the rest of the document; ``add_block``
+    # appends here and ``main`` turns a non-empty list into exit 3.
+    formula_failures: list = []
     try:
         if spec.get("page"):
             apply_page(doc, spec["page"])
@@ -1959,7 +2084,8 @@ def main() -> int:
             # very next block is its table — that adjacency is what decides the
             # automatic keep-with-table link, and it cannot be recovered once
             # the blocks have been built.
-            add_block(doc, block, blocks=blocks, index=i)
+            add_block(doc, block, blocks=blocks, index=i,
+                      formula_failures=formula_failures)
         if spec.get("footer_page_numbers"):
             fpn = spec["footer_page_numbers"]
             add_page_number_field(
@@ -2018,10 +2144,23 @@ def main() -> int:
         zoom_code = fix_docx(Path(args.output))
     if zoom_code:
         return zoom_code
-    print(json.dumps({"ok": True, "output": args.output,
+    # ``ok`` is false when a formula failed even though a file *was* written, so
+    # ``output`` — not ``ok`` alone — is what tells a caller the deliverable
+    # exists.  Same contract as the dangling-cross-reference refusal (exit 1).
+    print(json.dumps({"ok": not formula_failures, "output": args.output,
                       "blocks": len(spec.get("blocks", [])),
                       "sections": len(doc.sections),
-                      "crossrefs": dangling["resolved"]}))
+                      "crossrefs": dangling["resolved"],
+                      "formula_failures": formula_failures}))
+    if formula_failures:
+        # Exit 3, D-024: a product exists but a formula did not convert.  The
+        # stderr line is one line and does *not* start with ``error:`` — that
+        # prefix is reserved for exit 2 refusals, which promise nothing was
+        # written.  The details (block index, LaTeX, error) are in the JSON.
+        print("warning: %d latex block(s) did not convert; the document was "
+              "written with the LaTeX source left as plain text"
+              % len(formula_failures), file=sys.stderr)
+        return 3
     return 0
 
 

@@ -105,7 +105,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import codecs
+import io
 import json
+import os
 import re
 import sys
 import zipfile
@@ -173,20 +176,119 @@ def qm(local: str) -> str:
     return "{%s}%s" % (NS_M, local)
 
 
-def _fix_stdio() -> None:
-    """Reconfigure stdout/stderr to UTF-8 on Windows.
+# ===========================================================================
+# stdio hardening -- a standalone copy, on purpose
+# ===========================================================================
+# ``scripts/encoding.py`` carries the same policy and this block mirrors it
+# step for step.  It stays a *copy* because the probe must keep working while
+# ``scripts/`` is mid-edit, so nothing here is imported from that tree (see
+# ``tools/README.md``).
+#
+# Policy:
+#   1. reconfigure to UTF-8 with ``backslashreplace`` -- never a lossy policy
+#      that silently turns an unwritable character into a question mark;
+#   2. re-read ``stream.encoding`` (codec-normalised) to confirm the switch
+#      actually happened: a wrapper may accept ``reconfigure(**kwargs)`` and
+#      ignore it, and a stream may lack the method entirely;
+#   3. if it did not take, rewrap ``stream.buffer`` in a UTF-8
+#      ``TextIOWrapper``; a stream with no ``.buffer`` cannot be rewrapped and
+#      is left alone.
+# ``STDIO_MODE`` records which branch ran (``reconfigure`` / ``rewrapped`` /
+# ``untouched``), so a future "why is the output mojibake" question can be
+# answered without guessing.
+_TARGET_ENCODING = "utf-8"
+_TARGET_ERRORS = "backslashreplace"
+_LOSSY_ERRORS = ("replace", "ignore")
 
-    A standalone copy of the stdio fix from ``scripts/_bootstrap.py``: this tool
-    must keep
-    working when ``scripts/`` is mid-edit, so it imports nothing from there.
-    """
-    if __import__("os").name != "nt":
-        return
-    for stream in (sys.stdout, sys.stderr):
+#: Which hardening branch ran: "reconfigure", "rewrapped" or "untouched".
+STDIO_MODE = "untouched"
+
+
+def _stdio_encoding_name(stream):
+    """Codec-normalised name of a text stream's encoding, or ``None``."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return None
+    try:
+        return codecs.lookup(encoding).name
+    except (LookupError, TypeError):
+        return None
+
+
+def _stdio_needs_fix(stream) -> bool:
+    """True when the encoding is not UTF-8, or the error policy would drop text."""
+    if _stdio_encoding_name(stream) != _TARGET_ENCODING:
+        return True
+    return getattr(stream, "errors", None) in _LOSSY_ERRORS
+
+
+def _stdio_rewrap(stream):
+    """Rebuild the stream as UTF-8 over ``stream.buffer``; ``None`` if impossible."""
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        return None
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, OSError, ValueError):
-            pass
+            flush()
+        except (OSError, ValueError):
+            return None
+    try:
+        return io.TextIOWrapper(
+            buffer,
+            encoding=_TARGET_ENCODING,
+            errors=_TARGET_ERRORS,
+            line_buffering=True,
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _harden_stream(stream):
+    """Harden one text stream; returns ``(stream, mode)``.
+
+    ``mode`` is ``"reconfigure"`` (fixed in place), ``"rewrapped"`` (a new
+    stream -- the caller must assign it back) or ``"untouched"`` (already fine,
+    or unfixable).
+    """
+    if stream is None or not _stdio_needs_fix(stream):
+        return stream, "untouched"
+    try:
+        stream.reconfigure(encoding=_TARGET_ENCODING, errors=_TARGET_ERRORS)
+    except (AttributeError, OSError, ValueError):
+        pass
+    else:
+        if not _stdio_needs_fix(stream):
+            return stream, "reconfigure"
+    replacement = _stdio_rewrap(stream)
+    if replacement is None:
+        return stream, "untouched"
+    return replacement, "rewrapped"
+
+
+def _fix_stdio() -> None:
+    """Harden stdout/stderr on Windows so Chinese output reaches the bytes.
+
+    A standalone copy of the policy in ``scripts/encoding.py``: this tool must
+    keep working when ``scripts/`` is mid-edit, so it imports nothing from
+    there.  Non-Windows is left untouched (CPython's PEP 538/540 already
+    coerces the C locale to UTF-8; forcing it would only hurt a latin-1
+    terminal).
+    """
+    global STDIO_MODE
+    if os.name != "nt":
+        return
+    modes = []
+    for name in ("stdout", "stderr"):
+        original = getattr(sys, name, None)
+        hardened, mode = _harden_stream(original)
+        if hardened is not original:
+            setattr(sys, name, hardened)
+        modes.append(mode)
+    if "rewrapped" in modes:
+        STDIO_MODE = "rewrapped"
+    elif "reconfigure" in modes:
+        STDIO_MODE = "reconfigure"
 
 
 _fix_stdio()

@@ -392,9 +392,9 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 2206                        # monotone floor, measured on a clean clone
-                                                    # 2026-11-23 PR#4 four legs: ubuntu 2206/491
-                                                    # (both pythons), windows 2209/488 (both)
+          MIN_PASSED = 2231                        # monotone floor, measured on a clean clone
+                                                    # 2026-11-24 PR#5 four legs: ubuntu 2231/506
+                                                    # (both pythons), windows 2234/503 (both)
           SKIP_RATIO_NUM, SKIP_RATIO_DEN = 1, 4    # skipped <= collected / 4
 
           run_log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")

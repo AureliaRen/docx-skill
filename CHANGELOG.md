@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-24
+
+A documentation-and-entry-point round driven by a real delivery that hit five
+walls. Two of them were code: there was no supported way to write a document
+whose equations start as LaTeX, and a hand-written caller could skip the
+phasor-dot repair while every documented example looked fine. The other three
+were the manual telling the truth late: no section on importing the scripts from
+your own code, no warning that preview output is LibreOffice rather than Word,
+and a stdio note that described the intent rather than the measured behaviour.
+
+### Added
+
+- **A `latex` block in a `docx_create` spec.** `{"type": "latex", "latex":
+  "\\frac{a}{b}=c", "display": true}` writes one native Office Math equation:
+  required non-empty `latex`, optional boolean `display` (default `false`), the
+  usual paragraph format keys, and the block converts through
+  `latex_to_omml_safe()`. An inline equation leaves a U+200B run beside it so
+  Word does not promote a paragraph-wide inline equation to a display one.
+  `display` that is not a real boolean is a spec error (exit `2`, nothing
+  written). A formula that fails to convert does not abort the document: the
+  LaTeX source stays in the paragraph, `formula_failures` lists it on stdout,
+  one `warning:` line goes to stderr, and the exit code is `3` — the JSON says
+  `"ok": false` while `output` still names the file that exists, so branch on
+  `output`.
+- **`math_omml.latex_to_omml_safe()`** — conversion + `fix_phasor_dots` + a
+  second `assert_legal` in one call, with optional `stats` counters. Hand-written
+  callers no longer have to remember the phasor-dot pass. `latex_to_omml_lxml`
+  stays as the pure converter and now opens its docstring with a warning that it
+  repairs nothing.
+- **Documentation: importing the scripts from your own code.** `scripts/` is
+  flat, so a sibling import resolves only when that directory is on `sys.path`;
+  a script of your own hit `ModuleNotFoundError` with nothing in the manual to
+  explain it. There is now a section with both copyable forms (`sys.path.insert`
+  and `import _bootstrap`), a runnable pair, and a new walkthrough for writing a
+  document that contains formulas from scratch — spec route and hand-written
+  route, with the three behaviours that surprise people (the zero-width run,
+  one failed formula not aborting the run, the `latex2mathml` + `MML2OMML.XSL`
+  requirement and the fact that a missing closing brace still converts).
+
+### Changed
+
+- **Windows stdio hardening is verified, not assumed.** `encoding._fix_stdio()`
+  now reconfigures to UTF-8 with `errors="backslashreplace"`, re-reads the
+  stream's codec-normalised encoding and `errors` (a stream still on `replace` /
+  `ignore` counts as unfinished), and rebinds through `io.TextIOWrapper` only
+  when that check fails; non-Windows is untouched. `STDIO_MODE` / `STDIO_MODES`
+  expose which branch ran, and `tools/word_accept.py` carries the same policy in
+  its own standalone copy.
+- **The manual no longer claims preview output equals Word's.** `docx_preview.py`
+  renders through headless LibreOffice, so line breaks, page fill and sometimes
+  page count differ from a Word COM export; the delivered layout is judged from
+  `pdf_export.ps1`'s PDF, and preview is for a fast look plus the structural
+  lint.
+
 ## [1.2.0] - 2026-11-23
 
 A patch round that is almost entirely about *silent* damage: four ways an edit
@@ -499,5 +553,7 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 - An existing `X.bak` is overwritten on the next in-place apply. The command
   says so on stdout; it does not rotate backups.
 
+[1.2.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.1
+[1.2.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.1.0
 [1.0.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.0.0
