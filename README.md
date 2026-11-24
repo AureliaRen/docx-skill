@@ -57,8 +57,14 @@ path:
   absent from most bundled interpreters, and then every script dies at *import*
   time. `minidom_compat` supplies a stdlib stand-in; `_bootstrap` is the single
   line that wires `sys.path`, that fallback, and UTF-8 stdio together.
-- **`encoding`** — switches stdout and stderr to UTF-8 on Windows, where the
-  default console codec mangles CJK output into unreadable bytes.
+- **`encoding`** — puts stdout and stderr on UTF-8 on Windows, where the default
+  console codec mangles CJK output, and then **checks its own work**:
+  `reconfigure(encoding="utf-8", errors="backslashreplace")`, a codec-normalised
+  re-read of `encoding` and `errors` (a stream still on `replace` / `ignore`
+  counts as unfinished), and a `io.TextIOWrapper(stream.buffer, …)` rebind only
+  when that check fails. Non-Windows returns untouched — PEP 538/540 already
+  lifted the C locale there. `STDIO_MODE` / `STDIO_MODES` report which branch
+  ran, which is what separates "the switch worked" from "it never ran".
 
 One more is an **additional capability** rather than a core operation.
 `pdf_export.ps1` gives a document this toolkit produced a PDF export path that
@@ -307,12 +313,14 @@ worth branching on rather than testing against zero:
 | `0` | success |
 | `1` | expected failure — marker not found, bad spec |
 | `2` | usage error — argparse, a required mode flag missing, an `--index` / `--insert-at` outside the legal range, or an input path that is missing, a directory, or not a Word package |
-| `3` | partial success — `docx_mathify` wrote the document but at least one formula is still linear text |
+| `3` | partial success — the document was written but at least one formula did not convert: `docx_mathify` (still linear text), `docx_create` (a `latex` block, listed in `formula_failures`), and `docx_template apply --fix-formulas` by pass-through |
 
 `3` comes from `docx_mathify`, and `docx_template apply --fix-formulas` passes it
 through unchanged, because it runs mathify in place; `--no-fix-formulas` never
 calls mathify. Either way it is deliberate: the output file is valid and mostly
-converted, so check the code before you deliver it.
+converted, so check the code before you deliver it. `docx_create` reaches `3` the
+same way when a `latex` block fails, and it is the one payload whose JSON says
+`"ok": false` while `output` still names a file that exists — read `output`.
 
 A usage error writes one line to stderr, leaves stdout empty, and touches nothing —
 the input file is byte-for-byte as it was. `docx_read` is where that matters most:
@@ -378,9 +386,9 @@ self-check. `_bootstrap.py` is the one pure library and is documented last.
 | `docx_pack.py` | `unpack` / `pack` — round-trips a `.docx` through a directory, restoring the original entry order and per-entry compression. `table_width.py` and `insert_formula.py` operate on a directory produced by it, though neither imports it. |
 | `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`, `FONT_HEITI`, `FONT_SONG` |
 | `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts`, plus the `UNITS` whitelist |
-| `math_omml.py` | LaTeX → MathML → OMML: `latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
+| `math_omml.py` | LaTeX → MathML → OMML: `latex_to_omml_safe` (convert + phasor-dot repair + self-check — the entry point to use) / `latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
 | `fix_phasor_dot.py` | `m:limUpp` → `m:acc`, so a phasor dot stops rendering oversized; `python scripts/fix_phasor_dot.py` runs its self-check |
-| `encoding.py` | `_fix_stdio()` — stdout and stderr to UTF-8 on Windows |
+| `encoding.py` | `_fix_stdio()` / `harden_stream()` — UTF-8 stdio on Windows with a verification step and a `TextIOWrapper` fallback; `STDIO_MODE` / `STDIO_MODES` report the branch that ran |
 | `minidom_compat.py` | `defusedxml.minidom` with a stdlib fallback when the package is absent |
 
 And the one file that is a **pure library**:
@@ -403,6 +411,9 @@ That is Python, not a shell line: `docx_pack` lives in `scripts/`, so pasting it
 into an interpreter at the repo root gives `ModuleNotFoundError`. Either `cd scripts`
 first, or put the directory on `sys.path` — as a one-liner,
 `python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`.
+That caveat covers every module in `scripts/`, not just `docx_pack`; the two
+importable forms and a runnable snippet are in
+[SKILL.md](SKILL.md#importing-the-scripts-from-your-own-code).
 
 Passing `original` is what lets `pack` reuse the source archive's entry order and
 compression, so a no-op round trip produces an equivalent archive rather than a
@@ -465,15 +476,17 @@ runs, same commit, different machines; the numbers differ only because the skips
 
 | Where | Result |
 |---|---|
-| Developer machine, local Office installed | **2458 passed / 239 skipped / 0 failed** (2697 collected) |
+| Developer machine, local Office installed, measured 2026-11-24 | **2498 passed / 239 skipped / 0 failed** (2737 collected) |
 | Runner simulation, no Office at all (`MML2OMML_XSL` pointed at a nonexistent file, **run on a clone of this repository outside the development tree**) — the row whose shape `ci.yml` gates on | **2220 passed / 477 skipped / 0 failed** (2697 collected) |
 
 The gap is 238 tests: 143 that need `latex2mathml` **and** `MML2OMML.XSL`, plus
 95 that read the `_smoke/` baseline kept above a development checkout. Neither row
-is a number to chase by editing a constant; `ci.yml` gates `passed >= 1974` and
-`skipped <= collected / 4`.
+is a number to chase by editing a constant; `ci.yml` gates `passed >= 2206` and
+`skipped <= collected / 4`. The second row was measured before the P23 test
+additions and has not been re-measured since, so its `collected` count is the old
+2697 while the developer row above is current.
 
-`tests/` holds 76 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
+`tests/` holds 80 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
 backs the PDF text-layer assertions and `pytest` is the runner; neither is a runtime
 dependency. Word COM tests skip exactly the same way when Word is absent.
 

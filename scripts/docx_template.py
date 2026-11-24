@@ -34,12 +34,14 @@ Usage:
 
 坑（从 source-snapshot 原版踩过来后改的架构）
 --------------------------------------------
-1. **原版靠 subprocess 调 ``scripts/office/unpack.py`` / ``pack.py``**——那两个
+1. **原版靠 subprocess 调旧 office 子包（已并入 ``scripts/`` 平铺结构）里的
+   ``unpack.py`` / ``pack.py``**——那两个
    脚本及其 validators 子包不入仓，subprocess 链一断整条 extract/apply 路径就死。
    本版改为**进程内 zipfile 直读直写**：extract 直接从 zip 里读
    ``word/styles.xml`` / ``word/document.xml``；apply 用"临时文件 + shutil.move"
    就地改写（同 fix_fonts v2 的模式）。zip 重写保持原条目顺序，新条目追加在尾。
-2. **``--fix-formulas`` 原版 import 的是 ``scripts/office/fix_formulas.py``**，
+2. **``--fix-formulas`` 原版 import 的是旧 office 子包（已并入``scripts/``平铺
+   结构）里的 ``fix_formulas.py``**，
    同样不入仓。本版内置一个最小实现：单个 ``w:t`` 内成对 ``_xx_`` → subscript、
    ``^xx^`` → superscript。只用**成对包裹制**——不碰孤立的下划线/尖号，避免把
    LaTeX 式 ``x_i`` 的裸下划线误伤。**注意名字漂移**：原版这个 flag 指的就是这条

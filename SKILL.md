@@ -1,6 +1,6 @@
 ---
 name: docx
-description: "Create, read, edit, validate, comment on, and rewrite Word documents (.docx/.dotx) with a set of small Python CLIs. Use whenever the task involves a Word file: generating a report/memo/letter from a spec, extracting or inspecting existing content, find-and-replace across a document, editing tables, managing comments and tracked changes, filling {{token}} templates, extracting/applying formatting templates, fixing table column widths, or converting linear formulas into native Office Math (OMML). Also use when a deliverable should be a .docx. Do NOT use for PDF, spreadsheets (XLSX/CSV), slide decks, or plain one-shot text extraction (use markitdown)."
+description: "Create, read, edit, validate, comment on, and rewrite Word documents (.docx/.dotx) with a set of small Python CLIs. Use whenever the task involves a Word file: generating a report/memo/letter from a spec, extracting or inspecting existing content, find-and-replace across a document, editing tables, managing comments and tracked changes, filling {{token}} templates, extracting/applying formatting templates, fixing table column widths, converting linear formulas into native Office Math (OMML), or writing a document whose equations start as LaTeX. Also use when a deliverable should be a .docx. Do NOT use for PDF, spreadsheets (XLSX/CSV), slide decks, or plain one-shot text extraction (use markitdown)."
 license: MIT
 ---
 
@@ -50,6 +50,50 @@ create / read / edit / validate / comments / revisions / numbering /
 cross-references / static TOC / sections / table geometry / fonts / merge /
 templates / `docx_pack` — is pure `python-docx` + `lxml` and needs no Office.
 
+### Importing the scripts from your own code
+
+`scripts/` is flat on purpose: no package, no `__init__.py`. A sibling import
+(`from math_omml import …`) therefore resolves **only** when that directory is
+itself on `sys.path`. Every script in the tree bootstraps its own directory
+before importing anything, which is why `python scripts/docx_read.py` runs from
+any working directory; a script of your own, or a `python -c` line at the
+repository root, has no such bootstrap and stops at the first sibling import:
+
+```
+ModuleNotFoundError: No module named 'math_omml'
+```
+
+Two copyable forms. Put the directory on the path yourself:
+
+```python
+import sys
+sys.path.insert(0, r"<path-to-skill>/scripts")   # the flat directory itself
+import _bootstrap                                # noqa: F401
+```
+
+or, when `scripts/` is already reachable (a `PYTHONPATH` entry, or a script that
+lives there), one line — `_bootstrap` re-inserts its own directory idempotently,
+installs the `minidom` fallback and switches stdio to UTF-8:
+
+```python
+import _bootstrap  # noqa: F401 — sys.path + minidom fallback + UTF-8 stdio
+```
+
+Either way, sibling modules then import by bare name. A minimal runnable pair,
+measured on this tree (both imports resolve, and `\dot{I}` comes out with
+`limUpp=0`):
+
+```python
+from math_omml import latex_to_omml_safe    # convert + fix phasor dots + self-check
+from fix_phasor_dot import fix_phasor_dots  # only for a hand-rolled pass, or to assert limUpp == 0
+
+el = latex_to_omml_safe(r"\dot{I} = \frac{U}{Z}")
+paragraph._p.append(el)     # paragraph is a python-docx Paragraph
+```
+
+Without the `sys.path.insert` line the same import raises `ModuleNotFoundError`
+— measured from the repository root with no `scripts/` on the path.
+
 ## Working on an unpacked document
 
 Two commands (`table_width.py`, `insert_formula.py`) operate on an **unpacked**
@@ -65,13 +109,18 @@ python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpac
 python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import pack; pack('unpacked/','out.docx',original='in.docx')"
 ```
 
-Or import it where you already have Python:
+Or import it where you already have Python — with the same one line the command
+above has, because `scripts/` is flat and nothing puts it on `sys.path` for you:
 
 ```python
+import sys; sys.path.insert(0, r"<skill>/scripts")   # or: import _bootstrap
 from docx_pack import unpack, pack
 unpack("in.docx", "unpacked/")
 pack("unpacked/", "out.docx", original="in.docx")
 ```
+
+That caveat is general, not specific to `docx_pack`; it has its own section —
+[Importing the scripts from your own code](#importing-the-scripts-from-your-own-code).
 
 `pack` reuses the original's entry order and compression method, so a
 round-trip that changes nothing produces an equivalent archive. Pass
@@ -104,6 +153,7 @@ anything is written. The refused shapes, each one exercised by the test suite:
 | Task | Command |
 |------|---------|
 | Create from a JSON spec | `python scripts/docx_create.py spec.json out.docx` |
+| Write a document with equations | a `{"type": "latex", "latex": "\\frac{a}{b}=c", "display": true}` block — see [Writing a document that contains formulas](#writing-a-document-that-contains-formulas) |
 | Read text / outline / styles | `python scripts/docx_read.py in.docx --text` |
 | Extract images | `python scripts/docx_read.py in.docx --images DIR` |
 | Inspect tracked changes | `python scripts/docx_read.py in.docx --revisions` |
@@ -310,6 +360,7 @@ bold".)
 | `table` | `header`, `rows`, optional `style` (default `Table Grid`), `header_bold`, `keep_together` |
 | `image` | `path`, and `width_mm` **or** `width_frac` (mutually exclusive) |
 | `page_break` | — |
+| `latex` | `latex` (required, a non-empty string), `display` (bool, default `false`) — one native Office Math equation per block; see [Writing a document that contains formulas](#writing-a-document-that-contains-formulas) |
 | `section_break` | `start_type`, optional `page`, `header` / `footer` (+ their `_align` / `_font` / `_size_pt` / `_bold`), `footer_page_numbers` (`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`, plus `font` / `size_pt` / `bold` for the page-number runs — see the `bold` table above, `false` reaches the literal runs but not the field runs), `different_first_page`, `cols`, `no_footer`, `reuse_last_paragraph`, `apply_to` |
 | `toc` | optional `instr` — default `TOC \o "1-3" \h \z \u`; pass `TOC \h \c "图"` for a table of figures. **A field**: Word must update it (F9) before any entry exists |
 
@@ -321,7 +372,7 @@ naming the offending key and, when it is close enough, a "did you mean" hint:
 
 ```
 spec: unknown key "blockz" (did you mean "blocks"?); valid keys here: blocks, footer, footer_page_numbers, header, page, styles
-blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one of: bullet_list, caption, crossref, heading, image, numbered_list, page_break, paragraph, section_break, table, table_caption, toc
+blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one of: bullet_list, caption, crossref, heading, image, latex, numbered_list, page_break, paragraph, section_break, table, table_caption, toc
 ```
 
 Exit `2` promises that **nothing was written**, so you can fix the spec and
@@ -372,6 +423,109 @@ body text" (`val="9"`), for a style that must never be collected.
 `heading.level` is `0`–`9`, not `1`–`9`: python-docx's `add_heading` treats `0`
 as Word's **Title** style and `1`–`9` as Heading 1–9. `10` is a spec error, not
 a clamp.
+
+### Writing a document that contains formulas
+
+Two routes. The first is a spec key; the second is a few lines of `python-docx`
+when you already own the paragraph handling.
+
+**Route 1 — a `latex` block.** One block, one equation, native Office Math:
+
+```json
+{"blocks": [
+  {"type": "heading", "text": "Ohm's law", "level": 1},
+  {"type": "latex", "latex": "E = mc^2"},
+  {"type": "latex", "latex": "\\frac{a}{b} = c", "display": true}
+]}
+```
+
+`latex` is required and must be a non-empty string; `display` is optional and
+must be a real JSON boolean — `"display": "yes"` is a spec error (exit `2`, one
+`error:` line, nothing written), because it is truthy and would otherwise turn an
+inline equation into a display one without a word. The block also accepts the
+paragraph format keys listed above (`alignment`, `space_before_pt`,
+`keep_with_next`, …), and it converts through `latex_to_omml_safe()`, so
+`\dot{I}` arrives as `m:acc` instead of the `m:limUpp` Word draws as a large
+glyph with a floating dot.
+
+**Route 2 — hand-written `python-docx`.** The same conversion, with your own
+paragraph handling. This skeleton runs as written (the imports come from
+[Importing the scripts from your own code](#importing-the-scripts-from-your-own-code)):
+
+```python
+import sys
+sys.path.insert(0, r"<path-to-skill>/scripts")
+import _bootstrap  # noqa: F401 — sys.path + minidom fallback + UTF-8 stdio
+
+from docx import Document
+from math_omml import latex_to_omml_safe
+
+FAILS = []
+doc = Document()
+for tex, display in [(r"E = mc^2", False), (r"\frac{a}{b} = c", True)]:
+    p = doc.add_paragraph()
+    try:
+        p._p.append(latex_to_omml_safe(tex, display=display))
+        if not display:
+            p.add_run("\u200b")      # see (a) below
+    except Exception as exc:          # log it, then fall back to text
+        FAILS.append((tex, str(exc)[:150]))
+        p.add_run(tex)
+doc.save("out.docx")
+print("FAILS:", FAILS)                # never let a formula vanish silently
+```
+
+Three behaviours belong to both routes and cost an hour each when they surprise
+you:
+
+**(a) `display: false` is an inline equation *plus* a zero-width run.** The
+paragraph that carries an inline equation holds `m:oMath` **and** one U+200B run.
+Without it, an equation that is the only content of its paragraph is *promoted*
+by Word to a display equation — centred, `\sum` stacked — and the layout moves
+under the author. `docx_read.py --blocks` then reports a paragraph whose `text`
+is a single invisible character, which is the expected reading, not damage. Same
+trick and same reason as `insert_formula` rule 2 and the `docx_mathify` cell
+branch.
+
+**(b) One equation that fails does not abort the document.** Measured on a spec
+whose third formula is `\frac`:
+
+```json
+{"ok": false,
+ "output": "…/out.docx",
+ "blocks": 4,
+ "formula_failures": [{"block": 2, "latex": "\\frac",
+                       "error": "RuntimeError: latex2mathml 转换失败: '\\\\frac' -> "}]}
+```
+
+(Shown decoded: in the bytes on the wire every non-ASCII character inside a JSON
+string is `\u`-escaped, which changes nothing about the shape.)
+
+One line goes to stderr —
+
+```
+warning: 1 latex block(s) did not convert; the document was written with the LaTeX source left as plain text
+```
+
+— the exit code is **3**, and the paragraph that failed holds the LaTeX source
+as ordinary text rather than an empty gap. `ok` is `false` in that payload while
+`output` still names the file that exists: **branching on `ok` alone will
+conclude nothing was written, so read `output`.**
+
+**(c) Conversion needs `latex2mathml` *and* `MML2OMML.XSL`.** `math_omml` is
+imported inside the block handler on purpose, so `docx_create` still imports and
+every formula-free spec still works on a machine that has neither. Measured with
+`MML2OMML_XSL` pointing at a nonexistent file: three `latex` blocks, three
+entries in `formula_failures`, the document written with all three equations left
+as LaTeX text, exit `3` — the same outcome `docx_mathify` gives when the XSL is
+missing.
+
+One calibration, because it costs an hour otherwise: **`latex2mathml` tolerates a
+missing closing brace.** `\frac{a` converts into a perfectly normal `m:oMath`;
+what actually raises is `\frac`, `\sqrt`, `\left(`, `x^{`, `\mathrm`,
+`\overline{`, and the empty string. Do not use `\frac{a` as the broken sample in
+a test or a validation step — it passes, and the test that uses it is green for
+the wrong reason.
 
 ### Headings are black by default
 
@@ -827,9 +981,15 @@ Three layers, so nothing is misread:
    `docx_mathify.py`'s `_to_omml()` is the single exit for every conversion, and
    `insert_formula.py` fixes inside `_omml_stdlib()`. Both count their work and
    report `修正相量点 N 处` on the summary line.
-3. **Only hand-written callers** — code that imports `math_omml` and converts
-   directly — have to add the pass themselves. The upside of doing it yourself is
-   that you can then assert `limUpp == 0` as a self-check.
+3. **Hand-written callers use `latex_to_omml_safe()` and add nothing.** That
+   wrapper is conversion + `fix_phasor_dots` + a second `assert_legal`, so
+   `\dot{I}` arrives as `m:acc` and `limUpp == 0` holds; `docx_mathify`,
+   `insert_formula` and the `docx_create` `latex` block all go through it.
+   Reaching for the bare `latex_to_omml_lxml` is now a deliberate choice, and its
+   docstring opens with a ⚠️ saying so: pure conversion, no dot repair, no
+   post-processing. Take that path only when you want the untouched OMML for a
+   pass of your own — and then run `fix_phasor_dots(el)` yourself, which is also
+   where you can assert `limUpp == 0` as a self-check.
 
 Measured baselines:
 
@@ -1419,6 +1579,17 @@ page 4 look right?** It renders the document through a headless LibreOffice,
 writes a PDF and one PNG per page, and reports what it sees about the page fill.
 No Word, no COM, no Office licence:
 
+> **LibreOffice is not Word at delivery time.** The same `.docx` breaks lines at
+> different words, fills a page differently, and can even change page count
+> between the two renderers. Measured when this gap was reported: one delivered
+> document came out **6 pages** through `docx_preview.py` and **5 pages** through
+> `pdf_export.ps1`. Measured again while writing this line on a fresh sample:
+> page count agreed at 3, but page 1 held **36 text lines under LibreOffice
+> against 31 under Word** — the breaks moved. **Judge the delivered layout from
+> the `pdf_export.ps1` PDF** — page breaks, page count, fill — and use preview to
+> look at layout fast and to run the structural lint, which measures geometry
+> instead of trusting a renderer.
+
 ```bash
 # all three capabilities in one conversion
 python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json
@@ -1516,15 +1687,18 @@ to be imported — six ship a one-line `__main__` self-description and
 `fix_phasor_dot` ships a self-check, so all seven answer a bare run without doing
 any work. Scripts reach them all by bare name, which works because every script
 bootstraps its own directory onto `sys.path` (see [Conventions](#conventions)).
+**Your own script needs that bootstrap once** — a bare `from math_omml import …`
+outside `scripts/` is a `ModuleNotFoundError`, not a typo; see
+[Importing the scripts from your own code](#importing-the-scripts-from-your-own-code).
 
 | Module | What it provides |
 |---|---|
 | `linear_to_latex.py` | `find_math_spans` / `atoms_to_linear` / `linear_to_latex` / `repair_merged_scripts`, plus the `UNITS` whitelist |
-| `math_omml.py` | `latex_to_omml_lxml` / `latex_to_omml_string` / `assert_legal` / `apply_math_font` / `find_xslt` |
+| `math_omml.py` | `latex_to_omml_safe` (convert + phasor-dot repair + self-check — the entry point to use) / `latex_to_omml_lxml` / `latex_to_omml_string` / `assert_legal` / `apply_math_font` / `find_xslt` |
 | `fix_phasor_dot.py` | `fix_phasor_dots(omml) -> int`; `python scripts/fix_phasor_dot.py` runs its self-check |
 | `docx_pack.py` | `unpack` / `pack` — the round-trip described under [Working on an unpacked document](#working-on-an-unpacked-document) |
 | `docx_utils.py` | `wtag` / `register_all` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`, `FONT_HEITI`, `FONT_SONG` |
-| `encoding.py` | `_fix_stdio()` — switches stdout and stderr to UTF-8 on Windows |
+| `encoding.py` | `_fix_stdio()` / `harden_stream()` — UTF-8 stdio on Windows, with a verification step and a `TextIOWrapper` fallback; `STDIO_MODE` / `STDIO_MODES` report the branch that ran |
 | `minidom_compat.py` | `defusedxml.minidom` with a stdlib fallback |
 
 `docx_common.py` deliberately is **not** in that table: it has a real argparse
@@ -1565,7 +1739,7 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 scripts/     flat, imported by bare module name — 28 .py + 1 .ps1 = 29 files (27 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 7 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 77 .py (76 test_*.py + _omml.py helper)
+tests/       pytest suite — 81 .py (80 test_*.py + _omml.py helper)
 ```
 
 ## Where a write lands, and what protects it
@@ -1702,7 +1876,7 @@ probe that must observe what the file says, not what Word would make of it.
 | `0` | success |
 | `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception |
 | `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package, an `image` block whose `path` points at nothing on disk or is not a string |
-| `3` | **`docx_mathify` only** (and `docx_template apply --fix-formulas`, which passes it through): the document was written, but at least one formula failed to convert |
+| `3` | the document was written, but at least one formula did not convert — `docx_create` (a `latex` block, listed in `formula_failures`), `docx_mathify`, and `docx_template apply --fix-formulas`, which passes mathify's code through |
 
 A usage error is a **refusal, not a repair**: it is decided before anything is read
 or written, the input file is byte-for-byte untouched, the message is one
@@ -1722,6 +1896,11 @@ you are delivering the result. "Missing XSL" does not always mean `3` — a
 document whose spans are all degradable (text runs, text scripts) never touches
 the XSL and still exits `0`.
 
+`docx_create` reuses `3` for a `latex` block that did not convert, and it is the
+one payload in the toolkit where `"ok": false` still means a file exists:
+`output` is non-null there and names the document that was written. Judge it by
+`output`, not by `ok`.
+
 `docx_read` is the sharpest case of the stdout rule, because *every* one of its
 success modes writes JSON: on a missing file, a directory, a non-ZIP, or a ZIP
 that is not a Word package it exits `2` with one line on stderr and **nothing at
@@ -1732,12 +1911,27 @@ has a problem" is `docx_validate`'s job and exits `1` instead.
 ## Conventions
 
 - Every script bootstraps its own directory onto `sys.path`, so it runs from any
-  working directory — `python scripts/x.py` and `python x.py` both work.
+  working directory — `python scripts/x.py` and `python x.py` both work. Your own
+  script needs the same line once; see
+  [Importing the scripts from your own code](#importing-the-scripts-from-your-own-code).
 - Machine-readable scripts write JSON to stdout; human-facing ones write prose.
   Diagnostics and errors always go to stderr.
 - Exit code reflects the outcome; check it before parsing.
-- Files are read and written as UTF-8 explicitly; stdio is reconfigured to UTF-8
-  on Windows (`_bootstrap.py`).
+- Files are read and written as UTF-8 explicitly. On Windows `_bootstrap` →
+  `encoding._fix_stdio()` puts stdout and stderr on UTF-8 **and verifies it**:
+  `reconfigure(encoding="utf-8", errors="backslashreplace")`, then a
+  codec-normalised re-read of `stream.encoding` and of `errors` (a stream still
+  on `replace` / `ignore` counts as not done), and only when that check fails an
+  `io.TextIOWrapper(stream.buffer, …)` rebind. Non-Windows is left exactly as it
+  was — PEP 538/540 already lift the C locale there. `encoding.STDIO_MODE` and
+  `STDIO_MODES` say which branch ran; read them first when someone reports
+  mojibake, because they separate "the switch worked" from "it never ran".
+- **The bytes are UTF-8; the display is not this toolkit's call.** A reader that
+  decodes those bytes as GBK/cp936 — a Windows PowerShell 5.1 pipeline, a
+  `chcp 936` console, a parent `subprocess(text=True)` with no `encoding=` —
+  shows mojibake from a perfectly correct stream, and the fix belongs on that
+  side (`[Console]::OutputEncoding`, `encoding="utf-8"`). This skill guarantees
+  the bytes, not every terminal.
 - `requirements.txt` is pure ASCII on purpose — pip reads it with the system
   locale encoding, and a stray em dash breaks the install on a CJK Windows.
 
@@ -1746,7 +1940,10 @@ has a problem" is `docx_validate`'s job and exits `1` instead.
 - Formulas in reports and formal documents go through LaTeX→OMML. Only
   `H₂O`-level sub/superscripts use a `vertAlign` run instead.
 - Every script runs under `python -X utf8`. On Windows `_bootstrap` already
-  switches stdio to UTF-8 — do not add a second `reconfigure()`.
+  hardens stdio (see [Conventions](#conventions)) — do not add a second
+  `reconfigure()`. If `encoding.STDIO_MODE` still reads `untouched` on Windows,
+  the stream had no `.buffer` to rebind; that is a caller's stream, not this
+  toolkit's.
 - Back up before an in-place rewrite. `docx_mathify --inplace` writes
   `<name>.bak.docx` and `docx_template.py apply --to` without `-o` writes
   `<file>.bak`; `fix_fonts.py`, `fix_zoom.py`, and `merge_docs.py` keep no copy,

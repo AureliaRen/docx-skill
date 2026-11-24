@@ -1,6 +1,6 @@
 ---
 name: docx
-description: "纯离线 Word .docx 工具集：创建/编辑/读取/校验/批注/修订/模板套用，外加 LaTeX→OMML 原生公式链与表格几何三处一致。当用户要生成或改 Word 文档、批量替换文档里的公式、修表格列宽/字体、合并 docx 或导出 PDF 时使用。另有自动编号、题注与交叉引用、静态目录、分节页码四组能力，供需要交付即正确（打开就看得见、F9 前后一致）的正式文档使用。"
+description: "纯离线 Word .docx 工具集：创建/编辑/读取/校验/批注/修订/模板套用，外加 LaTeX→OMML 原生公式链（含从零写一篇含公式的文档）与表格几何三处一致。当用户要生成或改 Word 文档、批量替换文档里的公式、修表格列宽/字体、合并 docx 或导出 PDF 时使用。另有自动编号、题注与交叉引用、静态目录、分节页码四组能力，供需要交付即正确（打开就看得见、F9 前后一致）的正式文档使用。"
 license: MIT
 ---
 
@@ -35,6 +35,40 @@ Linux / macOS 上必抛 `FileNotFoundError`，除非自己放一份并设 `MML2O
 走 Word COM。其余全部（创建 / 读取 / 编辑 / 校验 / 批注 / 修订 / 编号 / 交叉引用 / 静态目录 /
 分节 / 表格几何 / 字体 / 合并 / 模板 / `docx_pack`）是纯 `python-docx` + `lxml`，不用装 Office。
 
+### 在自己的脚本里 import 这套脚本
+
+`scripts/` 是刻意平铺的：没有包，也没有 `__init__.py`。所以同级 import（`from math_omml import …`）**只在**那个目录本身位于 `sys.path` 上时才解析得出来。树里每个脚本在 import 任何东西之前都先把自己所在目录自举上去，这正是 `python scripts/docx_read.py` 在任何工作目录下都能跑的原因；而你自己写的脚本、或在仓库根上敲的一句 `python -c`，没有这道自举，会停在第一个同级 import 上：
+
+```
+ModuleNotFoundError: No module named 'math_omml'
+```
+
+两种可复制写法。自己把目录放上去：
+
+```python
+import sys
+sys.path.insert(0, r"<skill 路径>/scripts")   # 平铺目录本身
+import _bootstrap                              # noqa: F401
+```
+
+或者当 `scripts/` 已经可达时（`PYTHONPATH` 里有它，或脚本本身就在里面），一行就够 —— `_bootstrap` 会把它的目录幂等地再插一次、装好 `minidom` 兜底、并把 stdio 切到 UTF-8：
+
+```python
+import _bootstrap  # noqa: F401 —— sys.path + minidom 兜底 + UTF-8 stdio
+```
+
+两种都行，之后同级模块一律按裸名 import。最小可跑的一段（在本树上实测：两个 import 都解析成功，`\dot{I}` 出来 `limUpp=0`）：
+
+```python
+from math_omml import latex_to_omml_safe    # 转换 + 修相量点 + 自检
+from fix_phasor_dot import fix_phasor_dots  # 只在要自己补一遍、或要断言 limUpp == 0 时用
+
+el = latex_to_omml_safe(r"\dot{I} = \frac{U}{Z}")
+paragraph._p.append(el)     # paragraph 是 python-docx 的 Paragraph
+```
+
+去掉那行 `sys.path.insert`，同一个 import 就会抛 `ModuleNotFoundError` —— 在仓库根、`scripts/` 不在路径上时实测过。
+
 ## 在解包目录上工作
 
 两个命令（`table_width.py`、`insert_formula.py`）吃**解包目录**——把 `.docx` 解成一堆 XML 再直接改。`docx_template.py apply --to`、`fix_fonts.py`、`fix_zoom.py` 相反：它们吃打包好的 `.docx`，经临时文件就地改写，所以给文件本身，别给解包目录。造一份解包目录：
@@ -45,13 +79,16 @@ python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpac
 python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import pack; pack('unpacked/','out.docx',original='in.docx')"
 ```
 
-或者在你已有的 Python 里直接 import：
+或者在你已有的 Python 里直接 import —— 但得补上上面那两个命令里同样那行，因为 `scripts/` 是平铺的，没人替你把它放进 `sys.path`：
 
 ```python
+import sys; sys.path.insert(0, r"<skill 路径>/scripts")   # 或者：import _bootstrap
 from docx_pack import unpack, pack
 unpack("in.docx", "unpacked/")
 pack("unpacked/", "out.docx", original="in.docx")
 ```
+
+这条对 `docx_pack` 并不特殊，它是通例，单独成一节：[在自己的脚本里 import 这套脚本](#在自己的脚本里-import-这套脚本)。
 
 `pack` 会沿用原文件的条目顺序与压缩方式，所以原样往返得到的是等价归档（字节级 diff 不会因为重新 deflate 而变噪音）。`original=` 给了一份缺失、空、或不是 zip 的原文件时会直接抛错，不会静默打出一个丢了继承信息的包。
 
@@ -69,6 +106,7 @@ pack("unpacked/", "out.docx", original="in.docx")
 | 我要做什么 | 用哪个 |
 |---|---|
 | 从零生成文档 | `python scripts/docx_create.py spec.json out.docx` |
+| 写一篇带公式的文档 | 一个 `{"type": "latex", "latex": "\\frac{a}{b}=c", "display": true}` block —— 见[从零写一篇含公式的文档](#从零写一篇含公式的文档) |
 | 读正文 / 大纲 / 样式 | `python scripts/docx_read.py in.docx --text` |
 | 抽图片 | `python scripts/docx_read.py in.docx --images DIR` |
 | 看修订 | `python scripts/docx_read.py in.docx --revisions` |
@@ -199,6 +237,7 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 | `table` | `header`、`rows`，可选 `style`（默认 `Table Grid`）、`header_bold`、`keep_together` |
 | `image` | `path`，以及 `width_mm` **或** `width_frac`（二者互斥） |
 | `page_break` | — |
+| `latex` | `latex`（必填，非空字符串）、`display`（bool，默认 `false`）—— 一个 block 一条原生 Office Math 公式；见[从零写一篇含公式的文档](#从零写一篇含公式的文档) |
 | `section_break` | `start_type`，可选 `page`、`header` / `footer`（及其 `_align` / `_font` / `_size_pt` / `_bold`）、`footer_page_numbers`（`fmt` / `start` / `align` / `template` / `total` / `prefix` / `suffix` / `page_type`，以及给页码 run 用的 `font` / `size_pt` / `bold`——见上面那张 `bold` 表：`false` 管得到文字 run，管不到域 run）、`different_first_page`、`cols`、`no_footer`、`reuse_last_paragraph`、`apply_to` |
 | `toc` | 可选 `instr` —— 默认 `TOC \o "1-3" \h \z \u`；要图目录就传 `TOC \h \c "图"`。**这是一个域**：Word 必须更新（F9）之后才有条目 |
 
@@ -206,7 +245,7 @@ python scripts/docx_section.py pagenums out.docx --template page_of -o out.docx
 
 ```
 spec: unknown key "blockz" (did you mean "blocks"?); valid keys here: blocks, footer, footer_page_numbers, header, page, styles
-blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one of: bullet_list, caption, crossref, heading, image, numbered_list, page_break, paragraph, section_break, table, table_caption, toc
+blocks[0]: unknown block type 'paragraf' (did you mean "paragraph"?); choose one of: bullet_list, caption, crossref, heading, image, latex, numbered_list, page_break, paragraph, section_break, table, table_caption, toc
 ```
 
 exit `2` 的承诺是**什么都没写**，所以改完 spec 直接重试，不用猜是不是留了半份文档。值也不做钳制：超范围的值会连同它本该被钳进去的区间一起报出来。
@@ -227,6 +266,75 @@ exit `2` 的承诺是**什么都没写**，所以改完 spec 直接重试，不�
 **`styles[]` 条目点名一个已存在的样式时，是就地修改，不是报错，而且只动你给出的键。** `{"name": "Heading 1", "size_pt": 16}` 改的是 Word 内置 `Heading 1` 的字号，它的字体、粗细、颜色、`outlineLvl` 一律原样留着；同一个条目再 apply 一次，`<w:style>` 仍然只有一个。没给出来的键永远不会被重置，所以不会有东西悄悄退回原值。想把颜色改回去就显式写 `color`——另外注意：本工具生成的文档里 `Heading 1`–`Heading 9`、`Title`、`Subtitle` **默认就是黑色**（见 [标题默认是黑的](#标题默认是黑的)），所以你没染过色的标题本来就是 `000000`，不是主题蓝。
 
 `heading.level` 是 `0`–`9`，不是 `1`–`9`：python-docx 的 `add_heading` 把 `0` 当 Word 的 **Title** 样式、`1`–`9` 当 Heading 1–9。`10` 是 spec 错误，不会被钳。
+
+### 从零写一篇含公式的文档
+
+两条路：一条是 spec 键，一条是当你自己已经管着段落时手写的几行 `python-docx`。
+
+**路线一 —— 一个 `latex` block。** 一个 block 一条公式，落成原生 Office Math：
+
+```json
+{"blocks": [
+  {"type": "heading", "text": "欧姆定律", "level": 1},
+  {"type": "latex", "latex": "E = mc^2"},
+  {"type": "latex", "latex": "\\frac{a}{b} = c", "display": true}
+]}
+```
+
+`latex` 必填且必须是非空字符串；`display` 可选，且必须是真 JSON bool —— `"display": "yes"` 是 spec 错误（exit `2`、一行 `error:`、零写盘），因为它是真值，会一句话不说地把行内公式变成行间公式。这个 block 同时接受上面列出的段落格式键（`alignment`、`space_before_pt`、`keep_with_next` 等），转换走 `latex_to_omml_safe()`，所以 `\dot{I}` 落成 `m:acc`，而不是 Word 会画成「大字配一个浮点」的 `m:limUpp`。
+
+**路线二 —— 手写 `python-docx`。** 同一套转换，段落自己处理。下面这段照抄就能跑（import 的来由见[在自己的脚本里 import 这套脚本](#在自己的脚本里-import-这套脚本)）：
+
+```python
+import sys
+sys.path.insert(0, r"<skill 路径>/scripts")
+import _bootstrap  # noqa: F401 —— sys.path + minidom 兜底 + UTF-8 stdio
+
+from docx import Document
+from math_omml import latex_to_omml_safe
+
+FAILS = []
+doc = Document()
+for tex, display in [(r"E = mc^2", False), (r"\frac{a}{b} = c", True)]:
+    p = doc.add_paragraph()
+    try:
+        p._p.append(latex_to_omml_safe(tex, display=display))
+        if not display:
+            p.add_run("\u200b")      # 见下面 (a)
+    except Exception as exc:          # 记下来，再退回文字
+        FAILS.append((tex, str(exc)[:150]))
+        p.add_run(tex)
+doc.save("out.docx")
+print("FAILS:", FAILS)                # 别让一条公式无声消失
+```
+
+下面三条行为两条路都吃，不知道的话每条都要花一小时：
+
+**(a) `display: false` 是「行内公式 + 一个零宽 run」。** 承载行内公式的段落里既有 `m:oMath`，**也**有一个 U+200B run。没有它，一条独占整段的行内公式会被 Word **提升**成行间公式——居中、`\sum` 堆起上下限——版面就在作者眼皮底下变了。此后 `docx_read.py --blocks` 会报出一个 `text` 只有一个不可见字符的段落，那是预期读法，不是文档坏了。与 `insert_formula` 规则 2、`docx_mathify` 的单元格分支是同一个手法、同一个理由。
+
+**(b) 一条公式转不成，不中断整篇。** 在一份第三条公式是 `\frac` 的 spec 上实测：
+
+```json
+{"ok": false,
+ "output": "…/out.docx",
+ "blocks": 4,
+ "formula_failures": [{"block": 2, "latex": "\\frac",
+                       "error": "RuntimeError: latex2mathml 转换失败: '\\\\frac' -> "}]}
+```
+
+（这里按解码后的样子显示：真正在管道里的字节中，JSON 字符串里的每个非 ASCII 字符都是 `\u` 转义，形状不变。）
+
+stderr 上就一行 ——
+
+```
+warning: 1 latex block(s) did not convert; the document was written with the LaTeX source left as plain text
+```
+
+—— 退出码是 **3**，转不成的那一段里留着 LaTeX 原文（普通文字），不是一块空白。这个 payload 里 `ok` 是 `false`，而 `output` 照样指向那个真写出来的文件：**只看 `ok` 会以为什么都没写，要读 `output`。**
+
+**(c) 转换要 `latex2mathml` *和* `MML2OMML.XSL`。** `math_omml` 是在 block 处理函数里延迟 import 的，这是刻意的，所以两台都没有的机器上 `docx_create` 照样能 import、不含公式的 spec 照样能跑。把 `MML2OMML_XSL` 指向一个不存在的文件实测：三个 `latex` block、`formula_failures` 三条、文档照写且三条公式都留成 LaTeX 文本、exit `3` —— 与 `docx_mathify` 缺 XSL 时的结果一样。
+
+一条校准，不然也要花一小时：**`latex2mathml` 容忍缺右括号。** `\frac{a` 会转成一条完全正常的 `m:oMath`；真会抛错的是 `\frac`、`\sqrt`、`\left(`、`x^{`、`\mathrm`、`\overline{`，以及空字符串。写测试或做校验时别拿 `\frac{a` 当坏样本 —— 它过得去，那条测试是为错的理由绿的。
 
 ### 标题默认是黑的
 
@@ -495,7 +603,8 @@ def _add_mixed(p, text):
 
 1. **`latex_to_omml_lxml()` 本身不修** —— 它是纯转换函数，`\dot{I}` 出来仍是 `limUpp=1 / acc=0`。
 2. **两个 CLI 已内置修复，正常走 CLI 不会出丑态** —— `docx_mathify.py` 的 `_to_omml()` 是所有转换的唯一出口、`insert_formula.py` 在 `_omml_stdlib()` 内转完即修；两者都计数，汇总行报「修正相量点 N」。
-3. **只有手写调用方**（自己 `import math_omml` 直接转）才需手动补这一刀，好处是能顺手断言 `limUpp == 0` 自证。
+3. **手写调用方用 `latex_to_omml_safe()`，什么都不用管。** 那个包装器就是「转换 + `fix_phasor_dots` + 再 `assert_legal`」，所以 `\dot{I}` 出来就是 `m:acc`、`limUpp == 0`；`docx_mathify`、`insert_formula` 与 `docx_create` 的 `latex` block 全走它。
+   现在去摸裸的 `latex_to_omml_lxml` 变成一个刻意的选择，它的 docstring 开头就用 ⚠️ 写着：纯转换、不修相量点、不做任何后处理。只有确实要拿未修的原始 OMML 自己再过一遍时才走这条路 —— 那时自己调 `fix_phasor_dots(el)`，顺手断言 `limUpp == 0` 自证。
 
 实测基准：
 
@@ -889,6 +998,8 @@ python scripts/docx_edit.py replace FILE.docx --find "原文精确片段" --repl
 
 `docx_preview.py` 回答的是工具链其余部分答不出的那个问题：**第 4 页到底对不对？** 它把文档交给无头 LibreOffice 渲染，产出 PDF 与每页一张 PNG，再把「这一页填了多少」量成报告。不用 Word、不走 COM、不需要 Office 授权：
 
+> **交付时刻的 LibreOffice 不是 Word。** 同一份 `.docx`，两者断行的词不同、一页装的东西不同，页数也可能变。这个差距被报上来时实测过：一份交付文档走 `docx_preview.py` 是 **6 页**，走 `pdf_export.ps1` 是 **5 页**。写这一条时又在新的样本上复测：页数这次一致（都是 3），但第 1 页在 LibreOffice 下装了 **36 行字**、在 Word 下是 **31 行** —— 断点确实挪了。**交付版面（分页、页数、填充率）以 `pdf_export.ps1` 出的 PDF 为准**；preview 用来快速看版面、跑结构 lint，它量的是几何，不靠某个渲染器的脸色。
+
 ```bash
 # 一次转换拿到三样东西
 python scripts/docx_preview.py in.docx --pdf out.pdf --pages png/ --lint --json
@@ -939,16 +1050,16 @@ top_margin_mm + head_gap_mm == 正文首行的 y（mm）
 
 ## 库模块（只能 import）
 
-**`_bootstrap.py` 是唯一的纯库**：没有 `__main__`、没有 argparse，每个脚本都在解析参数之前先 import 它——**新脚本第一件事就是 `import _bootstrap`**，一行覆盖 `sys.path` 自举、minidom 兜底与 UTF-8 stdio。下面七个模块同样以 import 为用途——其中六个带一行 `__main__` 自述、`fix_phasor_dot` 带自检，裸跑都不干活。它们一律按裸模块名 reach，因为每个脚本都把自己所在目录塞进 `sys.path`（见[约定](#约定conventions)）。
+**`_bootstrap.py` 是唯一的纯库**：没有 `__main__`、没有 argparse，每个脚本都在解析参数之前先 import 它——**新脚本第一件事就是 `import _bootstrap`**，一行覆盖 `sys.path` 自举、minidom 兜底与 UTF-8 stdio。下面七个模块同样以 import 为用途——其中六个带一行 `__main__` 自述、`fix_phasor_dot` 带自检，裸跑都不干活。它们一律按裸模块名 reach，因为每个脚本都把自己所在目录塞进 `sys.path`（见[约定](#约定conventions)）。**你自己的脚本也得自举一次** —— 在 `scripts/` 外裸写 `from math_omml import …` 是 `ModuleNotFoundError`，不是拼错字；见[在自己的脚本里 import 这套脚本](#在自己的脚本里-import-这套脚本)。
 
 | 模块 | 提供什么 |
 |---|---|
 | `linear_to_latex.py` | `find_math_spans` / `atoms_to_linear` / `linear_to_latex` / `repair_merged_scripts`、单位白名单 `UNITS` |
-| `math_omml.py` | `latex_to_omml_lxml` / `latex_to_omml_string` / `assert_legal` / `apply_math_font` / `find_xslt` |
+| `math_omml.py` | `latex_to_omml_safe`（转换 + 修相量点 + 自检，用这个入口）/ `latex_to_omml_lxml` / `latex_to_omml_string` / `assert_legal` / `apply_math_font` / `find_xslt` |
 | `fix_phasor_dot.py` | `fix_phasor_dots(omml) -> int`（`__main__` 跑自检） |
 | `docx_pack.py` | `unpack` / `pack`：解到目录、再打回 .docx，见[在解包目录上工作](#在解包目录上工作) |
 | `docx_utils.py` | `wtag` / `register_all` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` |
-| `encoding.py` | `_fix_stdio()`（Windows 下 stdout 切 UTF-8） |
+| `encoding.py` | `_fix_stdio()` / `harden_stream()`：Windows 下把 stdio 抬到 UTF-8，带一道复核与 `TextIOWrapper` 兜底；`STDIO_MODE` / `STDIO_MODES` 报走的是哪一支 |
 | `minidom_compat.py` | `defusedxml.minidom` 缺失时兜底 stdlib |
 
 `docx_common.py` **故意不在这张表里**：它有真 argparse 表面（`--api` 打印它导出的辅助函数），按判据算 CLI。
@@ -977,7 +1088,7 @@ top_margin_mm + head_gap_mm == 正文首行的 y（mm）
 scripts/     平铺，按裸模块名 import —— 28 个 .py + 1 个 .ps1 = 29 个文件（27 个 CLI，1 个纯库）
 references/  较长的做法笔记，按需加载 —— 7 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 77 个 .py（76 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 81 个 .py（80 个 test_*.py + _omml.py 辅助）
 ```
 
 ## 写到哪儿去，以及有什么保护
@@ -1076,7 +1187,7 @@ tests/       pytest 套件 —— 77 个 .py（76 个 test_*.py + _omml.py 辅�
 | `0` | 成功 |
 | `1` | 预期内的失败 —— marker 没命中、未知或重名的书签、文档里没有你要的东西、运行期异常 |
 | `2` | 用法错误 —— argparse、spec 里出现未知键或未知 block type、`--widths` 个数多于列数、`--pages` 个数与目录条数不等、互斥 flag 同传（含 `width_frac` 与 `width_mm`）、`--index` / `--insert-at` 越界或负数、输入路径不存在/是个目录/不是 Word 包、`image` 块的 `path` 指向的文件不存在或不是字符串 |
-| `3` | **仅 `docx_mathify`**（以及把它的码透传出来的 `docx_template apply --fix-formulas`）：文档已写出，但至少一条公式没转成 |
+| `3` | 文档已写出，但至少一条公式没转成 —— `docx_create`（`latex` block，列进 `formula_failures`）、`docx_mathify`，以及把 mathify 的码透传出来的 `docx_template apply --fix-formulas` |
 
 用法错误是**拒收，不是修补**：判定发生在任何读写之前，输入文件逐字节不变，消息是 stderr 上的一行 `error: …`，stdout 保持空。
 
@@ -1084,20 +1195,23 @@ tests/       pytest 套件 —— 77 个 .py（76 个 test_*.py + _omml.py 辅�
 
 `docx_mathify` 返回 `3` 是**故意的**：输出文件有效、绝大多数公式已转，但至少一条公式还是线性文本。**交付前必须查退出码**，只看文件存不存在会把半个公式发出去。「缺 XSL」并不必然退 `3`——文档里全是可降级片段（文字 run / 文字角标）时压根不碰 XSL，仍退 `0`。
 
+`docx_create` 把 `3` 用在「`latex` block 没转成」上，而它是这套工具里**唯一**一个 `"ok": false` 却照样有产物的 payload：那时 `output` 非空、指向真写出来的文件。所以判它要看 `output`，不是看 `ok`。
+
 `docx_read` 是 stdout 这条规矩最锋利的例子，因为它**每一种**成功模式都往 stdout 写 JSON：文件不存在、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，四种情况一律 exit `2`、stderr 一行、**stdout 一个字节都没有**。把失败当成 JSON 从 stdout 回传，会让每个 `json.loads(stdout)` 调用方把失败读成成功。「文档是真的、但里头有问题」归 `docx_validate` 管，那种走 exit `1`。
 
 ## 约定（Conventions）
 
-- 每个脚本自己把所在目录塞进 `sys.path`，所以任意工作目录都能跑 —— `python scripts/x.py` 与 `python x.py` 都行。
+- 每个脚本自己把所在目录塞进 `sys.path`，所以任意工作目录都能跑 —— `python scripts/x.py` 与 `python x.py` 都行。你自己的脚本需要同一行，见[在自己的脚本里 import 这套脚本](#在自己的脚本里-import-这套脚本)。
 - 机器可读的脚本往 `stdout` 写 JSON，给人看的写散文。诊断信息与错误一律走 `stderr`。
 - 退出码反映结果；解析输出之前先查退出码。
-- 文件读写一律显式 UTF-8；Windows 上 stdio 由 `_bootstrap.py` 切成 UTF-8，不要再手写 reconfigure。
+- 文件读写一律显式 UTF-8。Windows 上 `_bootstrap` → `encoding._fix_stdio()` 把 stdout 与 stderr 抬到 UTF-8 **并且验一遍**：先 `reconfigure(encoding="utf-8", errors="backslashreplace")`，再按 codec 归一化名复核 `stream.encoding` 与 `errors`（还停在 `replace` / `ignore` 的算没做完），只有这道复核不过才用 `io.TextIOWrapper(stream.buffer, …)` 重绑。非 Windows 整段不动 —— 那边 PEP 538/540 已经把 C locale 抬起来了。走的是哪一支，看 `encoding.STDIO_MODE` 与 `STDIO_MODES`；有人报乱码时先读这两个，它们能分开「开关生效了」与「根本没跑」。
+- **字节是 UTF-8，显示不归这套工具管。** 拿着这些字节按 GBK/cp936 解码的那一头 —— PowerShell 5.1 管道、`chcp 936` 控制台、父进程 `subprocess(text=True)` 没给 `encoding=` —— 会把一条完全正确的流显示成乱码，该修的是它那一边（`[Console]::OutputEncoding`、`encoding="utf-8"`）。本 skill 保证字节，不保证每个终端都显示正常。
 - `requirements.txt` **故意纯 ASCII**：pip 用系统 locale 读它，一个 em dash 就能让 CJK Windows 装不上。
 
 ## 硬规矩
 
 - 报告/正式文档的公式一律走 LaTeX→OMML；只有 `H₂O` 级极简上下标才用 `vertAlign` run。
-- 所有脚本都能 `python -X utf8` 直接跑；Windows 上 stdout 由 `_bootstrap` 切 UTF-8，不要再手写 reconfigure。
+- 所有脚本都能 `python -X utf8` 直接跑；Windows 上 stdout 已由 `_bootstrap` 硬化（见[约定](#约定conventions)），别再加第二个 `reconfigure()`。若 `encoding.STDIO_MODE` 在 Windows 上仍报 `untouched`，说明那条流没有 `.buffer` 可重绑 —— 那是调用方的流，不是这套工具的。
 - 就地改写前先备份。`docx_mathify --inplace` 会写 `<名>.bak.docx`，`docx_template.py apply --to` 不带 `-o` 时写 `<文件>.bak`；`fix_fonts.py`、`fix_zoom.py`、`merge_docs.py` 不留副本，原件重要就自己先复制。
 - 需要 node 的只有 `docx_template.py apply -o`（docx-js 骨架）；断链时用 `apply --to`。
 - **绝不要用 `cell.text =` 往模板单元格里写。** 它会清空单元格并丢掉全部 run 级属性。用 `docx_edit.py set-cell`（默认 `preserve`）；格子可能不止一个 run 时，先读 `docx_read.py --runs`。

@@ -161,7 +161,7 @@ unpack("in.docx", "unpacked/")
 pack("unpacked/", "out.docx", original="in.docx")
 ```
 
-上面这段是 **Python**，不是 shell：`docx_pack` 在 `scripts/` 里，所以在仓根直接贴进解释器会 `ModuleNotFoundError`。要么先 `cd scripts`，要么先把目录塞进 `sys.path`——一条命令版是 `python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`。
+上面这段是 **Python**，不是 shell：`docx_pack` 在 `scripts/` 里，所以在仓根直接贴进解释器会 `ModuleNotFoundError`。要么先 `cd scripts`，要么先把目录塞进 `sys.path`——一条命令版是 `python -c "import sys; sys.path.insert(0,'scripts'); from docx_pack import unpack; unpack('in.docx','unpacked/')"`。这条对 `scripts/` 里每个模块都成立，不只 `docx_pack`；两种 import 写法与一段能跑的最小片段见 [SKILL.zh-CN.md](SKILL.zh-CN.md#在自己的脚本里-import-这套脚本)。
 
 `pack` 沿用原件的条目顺序与压缩方式，所以"什么都没改"的往返产出等价归档。
 
@@ -227,9 +227,9 @@ python scripts/docx_create.py spec.json report.docx
 | `0` | 成功 |
 | `1` | 预期内失败——锚点段没找到、spec 不合法 |
 | `2` | 用法错误——argparse 拦下、某个必需的模式开关没给、`--index` / `--insert-at` 越界，或输入路径不存在、是目录、不是 Word 包 |
-| `3` | 部分成功——`docx_mathify` 把文档写出去了，但至少还有一条公式是线性文本 |
+| `3` | 部分成功——文档写出去了，但至少一条公式没转成：`docx_mathify`（还是线性文本）、`docx_create`（`latex` block，列进 `formula_failures`）、以及透传 mathify 退出码的 `docx_template apply --fix-formulas` |
 
-`3` 出自 `docx_mathify`，而 `docx_template apply --fix-formulas` 会把它原样透传——因为那条通道就是就地跑一遍 mathify；`--no-fix-formulas` 压根不调 mathify。两种情况都是刻意的：产物有效、绝大多数已转换，所以交付前要看一眼退出码。
+`3` 出自 `docx_mathify`，而 `docx_template apply --fix-formulas` 会把它原样透传——因为那条通道就是就地跑一遍 mathify；`--no-fix-formulas` 压根不调 mathify。两种情况都是刻意的：产物有效、绝大多数已转换，所以交付前要看一眼退出码。`docx_create` 的 `latex` block 转不成时走同一个码，而且它是这套工具里唯一一个 JSON 写着 `"ok": false`、`output` 却仍指向真写出来的文件的 payload —— 判它看 `output`。
 
 用法错误只往 stderr 写一行、stdout 留空、什么都不碰——输入文件逐字节不变。这条在 `docx_read` 上最要紧：它每一种成功模式都出 JSON，所以缺文件、给的是目录、不是 ZIP、是 ZIP 但不是 Word 包，一律 exit `2` 且 stdout **一个字节都没有**，而不是回一份会被每个 `json.loads(stdout)` 调用方读成成功的失败 JSON。
 
@@ -278,9 +278,9 @@ python scripts/docx_create.py spec.json report.docx
 | `docx_pack.py` | `unpack` / `pack` —— 把 `.docx` 解成目录再打回去，还原原始条目顺序与逐条目压缩方式。`table_width.py` 与 `insert_formula.py` 吃的就是它产出的目录，虽然两者都没 import 它。 |
 | `docx_utils.py` | `wtag` / `insert_ordered` / `fix_child_order` / `cm_to_dxa` / `FONT_TNR`、`FONT_HEITI`、`FONT_SONG` |
 | `linear_to_latex.py` | `find_math_spans` / `linear_to_latex` / `repair_merged_scripts`，外加 `UNITS` 白名单 |
-| `math_omml.py` | LaTeX → MathML → OMML：`latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
+| `math_omml.py` | LaTeX → MathML → OMML：`latex_to_omml_safe`（转换 + 修相量点 + 自检，用这个入口）/ `latex_to_omml_lxml` / `assert_legal` / `apply_math_font` |
 | `fix_phasor_dot.py` | `m:limUpp` → `m:acc`，修相量点浮大；`python scripts/fix_phasor_dot.py` 跑自检 |
-| `encoding.py` | `_fix_stdio()` —— Windows 下把 stdout 与 stderr 切到 UTF-8 |
+| `encoding.py` | `_fix_stdio()` / `harden_stream()`：Windows 下把 stdio 抬到 UTF-8，带一道复核与 `TextIOWrapper` 兜底；`STDIO_MODE` / `STDIO_MODES` 报走的是哪一支 |
 | `minidom_compat.py` | `defusedxml.minidom`，缺包时退回 stdlib |
 
 还有唯一一个**纯库**文件：
@@ -329,12 +329,12 @@ python -X utf8 -m pytest tests -q
 
 | 环境 | 结果 |
 |---|---|
-| 开发机，本机装了 Office | **2458 passed / 239 skipped / 0 failed**（collected 2697） |
+| 开发机，本机装了 Office，2026-11-24 实跑 | **2498 passed / 239 skipped / 0 failed**（collected 2737） |
 | 模拟 runner，整机没有 Office（`MML2OMML_XSL` 指向一个不存在的文件，**且必须在开发树之外的 clone 里跑**——上层目录若有 `_smoke/`，有 95 条用例会从 skip 变成 pass）——`ci.yml` 门禁的形状就是这一行 | **2220 passed / 477 skipped / 0 failed**（collected 2697） |
 
-差的就是那 238 条：143 条需要 `latex2mathml` **加** `MML2OMML.XSL`，另 95 条要读 `_smoke/` 基线。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 1974` 与 `skipped <= collected / 4`。
+差的就是那 238 条：143 条需要 `latex2mathml` **加** `MML2OMML.XSL`，另 95 条要读 `_smoke/` 基线。两组数字都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 2206` 与 `skipped <= collected / 4`。第二行是 P23 新增用例之前测的，本轮没重测，所以它的 collected 还是旧的 2697，第一行是现测值。
 
-`tests/` 里是 76 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
+`tests/` 里是 80 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 
 ## 授权
 

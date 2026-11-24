@@ -157,9 +157,25 @@ def keep_spacing(latex: str) -> str:
 
 def latex_to_omml_lxml(latex: str, display: bool = False,
                        raw_spacing: bool = False):
-    """LaTeX → OMML 的 lxml 元素（``m:oMath`` 或 ``m:oMathPara``）。
+    r"""LaTeX → OMML 的 lxml 元素（``m:oMath`` 或 ``m:oMathPara``）。
 
     返回的元素自带 xmlns:m；直接 append 进 python-docx / lxml 的 ``w:p`` 即可。
+
+    ⚠️ **本函数是纯转换，不修相量点，也不做任何后处理。**
+
+    ``latex2mathml`` 把 ``\dot{I}`` 翻成 ``m:limUpp``（上限），Word 里渲染成
+    「大字 + 飘着的点」；正确形态是 ``m:acc``（U+0307 组合点）。本函数只保证
+    OMML **结构合法**（``assert_legal``）与公式字体注入，**不会**替你把相量点改对。
+
+    手写调用方必须二选一，否则 ``\dot{I}`` 式相量一定以丑态落进交付物：
+
+    1. 直接用 :func:`latex_to_omml_safe` —— 转换 + 修相量点 + 再自检，一次做完
+       （推荐，``docx_mathify`` / ``insert_formula`` / ``docx_create`` 的 ``latex``
+       block 都走这条）；
+    2. 或者自己补一刀 ``fix_phasor_dot.fix_phasor_dots(el)`` —— 同目录平铺模块，
+       ``from fix_phasor_dot import fix_phasor_dots`` 即可，返回改了几处。
+
+    只有确实要「未修的原始 OMML」（例如自己做后处理）时才裸调本函数。
     """
     try:
         import latex2mathml.converter as lconv
@@ -233,8 +249,47 @@ def assert_legal(omml, latex: str) -> None:
                 raise RuntimeError(f"OMML 非法：<m:rad> 缺少 <m:e>（{latex!r}）。")
 
 
+def latex_to_omml_safe(latex: str, display: bool = False,
+                       raw_spacing: bool = False, stats: dict | None = None):
+    r"""LaTeX → OMML，**转换 + 相量点修复 + 结构自检**一次做完。
+
+    手写调用方的默认入口。三步的顺序与 ``docx_mathify._omml_with_phasor`` 一致：
+
+    1. :func:`latex_to_omml_lxml` —— 转成 OMML（内含 ``assert_legal`` 与字体注入）；
+    2. ``fix_phasor_dot.fix_phasor_dots`` —— ``m:limUpp`` → ``m:acc``，否则
+       ``\dot{I}`` 在 Word 里是「大字 + 飘着的点」；
+    3. :func:`assert_legal` —— 修完**再**自检一次。这不是重复劳动：改写本身
+       也可能把结构弄坏，而 ``latex_to_omml_lxml`` 内部那次自检只覆盖转换结果。
+
+    ``stats`` 非 None 时累进 ``stats["phasor_fixes"]``（``{"phasor_fixes": n}``
+    的形状）；修复抛异常时把 ``{"latex", "error"}`` 追加进 ``stats["phasor_errors"]``，
+    并返回**未修但可用**的元素 —— 与 ``docx_mathify`` 同一套异常语义：公式本身
+    是好的，相量点没修只是观感问题，不该让整篇转换失败。
+
+    返回元素与 :func:`latex_to_omml_lxml` **同形状**：``display=False`` 是
+    ``m:oMath``，``display=True`` 是 ``m:oMathPara``。
+    """
+    el = latex_to_omml_lxml(latex, display=display, raw_spacing=raw_spacing)
+    try:
+        # 延迟 import：fix_phasor_dot 在模块顶层 import lxml，而本模块刻意让
+        # lxml / latex2mathml 只在真正转换时才被拉进来（纯结构自检不需要它们）。
+        from fix_phasor_dot import fix_phasor_dots
+        n = fix_phasor_dots(el)
+    except Exception as exc:              # 修相量点出事不该让整条公式作废
+        if stats is not None:
+            stats.setdefault("phasor_errors", []).append(
+                {"latex": latex,
+                 "error": f"{type(exc).__name__}: {str(exc)[:160]}"[:200]})
+    else:
+        if stats is not None:
+            stats["phasor_fixes"] = stats.get("phasor_fixes", 0) + n
+    assert_legal(el, latex)
+    return el
+
+
 if __name__ == "__main__":
     print("math_omml is a library module, import it:")
+    print("    from math_omml import latex_to_omml_safe          # 推荐：转 + 修相量点")
     print("    from math_omml import latex_to_omml_lxml, latex_to_omml_string, "
           "assert_legal, apply_math_font")
     raise SystemExit(0)

@@ -10,8 +10,8 @@ fallbacks the flat layout would otherwise lose.
 1. **同目录 import 不再天然可用**。``scripts/docx_edit.py`` 里写
    ``from docx_common import ...``，只有当该脚本所在目录已经在 ``sys.path``
    上时才能解析；从别的 cwd 用绝对路径启动、或被 ``tests/`` 里的测试 import
-   时就会 ``ModuleNotFoundError``。这就是 A-1 的成因（``scripts/office/`` 少一个
-   ``__init__.py``，``import helpers.encoding`` 当场崩）。
+   时就会 ``ModuleNotFoundError``。这就是 A-1 的成因（旧 office 子包已并入
+   ``scripts/`` 平铺结构，那里少一个 ``__init__.py``，``import helpers.encoding`` 当场崩）。
 2. **包级副作用没有宿主了**。原来 ``helpers/__init__.py`` 只有一行
    ``from . import minidom_compat``，作用是给没有第三方包的运行时装
    ``defusedxml.minidom`` 兜底；平铺后 ``__init__.py`` 不存在，这一行没有落点，
