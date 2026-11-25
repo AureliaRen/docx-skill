@@ -477,17 +477,16 @@ runs, same commit, different machines; the numbers differ only because the skips
 | Where | Result |
 |---|---|
 | Developer machine, local Office installed, measured 2026-11-25 | **2539 passed / 239 skipped / 0 failed** (2778 collected) |
-| GitHub Actions, ubuntu-latest (py3.10 and py3.12 alike), measured 2026-11-24 on PR #5 | **2231 passed / 506 skipped / 0 failed** (2737 collected) |
-| GitHub Actions, windows-latest (py3.10 and py3.12 alike), same run | **2234 passed / 503 skipped / 0 failed** (2737 collected) |
+| GitHub Actions, ubuntu-latest (py3.10 and py3.12 alike), measured 2026-11-25 on PR #6 | **2233 passed / 545 skipped / 0 failed** (2778 collected) |
+| GitHub Actions, windows-latest (py3.10 and py3.12 alike), same run | **2236 passed / 542 skipped / 0 failed** (2778 collected) |
 
 The developer row and the two runner rows are **not from the same run**: the runner
 figures are the historical reading dated above, and the developer figure moves with
 every round. Do not subtract one from the other — the difference is the set of tests
 that need `latex2mathml` **and** `MML2OMML.XSL` plus those that read the `_smoke/`
 baseline kept above a development checkout, but its size only means something when
-both numbers come from one run. The current PR's runner readings replace the rows
-above once its CI finishes. No row is a number to chase by editing a constant;
-`ci.yml` gates `passed >= 2231` (the lower of the two runner legs) and
+both numbers come from one run. No row is a number to chase by editing a constant;
+`ci.yml` gates `passed >= 2233` (the lower of the two runner legs) and
 `skipped <= collected / 4`. The floor is a measured value, so it moves only when a
 new test actually *runs* on a runner — a test that skips there changes nothing.
 

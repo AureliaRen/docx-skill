@@ -86,11 +86,11 @@ that says what each renderer can and cannot verify.
   shipped CLIs carry no marker layer — `$x=1$` in a paragraph stays literal text —
   so the `$...$` loop in `formula-guide.md` is a recipe for your own caller, and a
   currency `$` in prose needs no escaping.
-- **README test readings refreshed** against this round's run: 2539 passed / 239
-  skipped / 0 failed on a developer machine with Word installed (2778 collected),
-  dated 2026-11-25. The two GitHub Actions rows keep their 2026-11-24 readings and
-  the `ci.yml` floor stays at 2231 — floors only move up when a real runner run
-  says so.
+- **README test readings refreshed** against this round's runs: 2539 passed / 239
+  skipped / 0 failed on a developer machine with Word installed, and 2233 passed /
+  545 skipped (ubuntu) vs 2236 / 542 (windows) on the four CI legs, all 2778
+  collected, dated 2026-11-25. The `ci.yml` floor moves 2231 -> **2233**, the lower
+  of the two runner legs — floors only move up when a real runner run says so.
 - **Documented: `cases` and matrices are the same object in OMML**, and a scanned
   textbook's printed page number is not the PDF page index — locate a formula by
   its equation number or section heading, never by offsetting the printed number.
