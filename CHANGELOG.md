@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-25
+
+A formula-layout round. Word draws letters in a math zone italic because a lone
+letter is a variable, so function names and differential operators arrived
+slanted: `\max\{x,y\}` came through as one run of literal `max{x,y}`, and
+`\frac{dy}{dx}` set the `d` italic along with the `x`. `cases` rendered
+centre-aligned while every matrix looked fine, and nothing in the OMML told the
+two apart. The fixes are two passes inside the converter, plus the documentation
+that says what each renderer can and cannot verify.
+
+### Added
+
+- **Upright completion for function names and differentials.**
+  `split_runs_for_upright()` (`math_omml.py`) classifies each `m:r`'s characters
+  and rebuilds the run as segments, giving digit runs, operators and the 34
+  whitelisted names in `UPRIGHT_FUNCS` their own `m:rPr/m:sty val="p"`. It runs
+  inside `latex_to_omml_lxml()` after `apply_math_font()` — the split has to
+  `deepcopy` the already-injected `w:rPr`, or the new segments fall back to
+  Cambria Math mid-formula — and `assert_legal()` re-runs afterwards, because
+  rebuilding runs is itself a structural edit. Deliberately not a switch: this is
+  layout correctness, not a preference.
+- **`\begin{cases}` columns are left-aligned.** `align_cases_left()` reads the
+  MathML tree the converter still holds (a `cases` `mtd` carries
+  `columnalign="left"`, a matrix's carries none) and rewrites only the matching
+  `m:m` to `mcJc=left`. Positional, so the counts must agree first: only tables
+  with two or more columns produce an `m:m`, and when the counts disagree it
+  changes nothing and records `stats["cases_align_skipped"]`. A blanket
+  `mcJc=left` pass would left-align every matrix in the document.
+- **Statistics for both passes.** `upright_split` / `upright_runs` /
+  `cases_aligned` / `cases_align_skipped` accumulate into the caller's `stats`
+  dict, from `latex_to_omml_lxml` through `latex_to_omml_safe`.
+
+### Changed
+
+- **The manual no longer asks for `\mathrm{max}` as the only correct spelling.**
+  Now that the converter uprights `max` on its own, `\max\{x,y\}` and
+  `\mathrm{max}\{x,y\}` produce segment-for-segment identical OMML and render to
+  the same pixels in Word (measured: 0 differing pixels; before the pass the two
+  forms differed in several hundred to several thousand pixels depending on the
+  rasterisation DPI — 371 at 72 dpi, 1195 at 150 dpi on a 1275x1650 page). The
+  recommendation stands — `\mathrm{}` states the intent to every other renderer —
+  but it is no longer a correctness requirement, and the documentation says so
+  instead of calling the plain form wrong.
+- **Documented: LaTeX literals in Python are raw strings, and why it matters.**
+  32 common commands lose their backslash to a control-character escape inside an
+  ordinary literal (`\frac`, `\forall` via `\f`; `\times`, `\text`, `\theta`,
+  `\tan`, `\top` via `\t`; `\nabla`, `\neq`, `\nu` via `\n`; `\beta`, `\bar`,
+  `\begin`, `\bmod` via `\b`; `\rho`, `\right`, `\ref` via `\r`; `\alpha`,
+  `\approx`, `\angle`, `\array` via `\a`; `\vee`, `\vec`, `\varphi` via `\v`),
+  and four more fail at parse time. Five of the seven escape classes then convert
+  **silently** into a wrong formula (`rac12`, `2imes3`, `hoV`) rather than
+  raising — that asymmetry is what makes it a hard rule. JSON doubles the
+  backslash, so a `docx_create` spec writes `"latex": "\\frac{a}{b} = c"`.
+- **Documented: body font and equation font are separate layers.** The equation
+  layer lives inside each `m:r` and is written by `apply_math_font()` from
+  `MATH_FONT`, across all four of `ascii`/`hAnsi`/`cs`/`eastAsia`. Switching the
+  body's CJK font must leave the equation's `eastAsia` alone, or `\text{中文}`
+  stops matching the prose around it while every Latin glyph still lines up. Change
+  the equation font through `MATH_FONT`; `fix_fonts.py` already honours the split.
+- **Documented: what each renderer can verify.** LibreOffice ignores `m:sty`
+  entirely — an italic and an upright `max` rasterise to the same pixels through
+  `docx_preview.py` (measured XOR 0 at every DPI tried; through `pdf_export.ps1`
+  the same pair differs by hundreds to thousands of pixels depending on DPI) — so
+  preview cannot confirm or refute the upright pass. Glyph shape, integral size and
+  delimiter height are decided on the Word-exported PDF only; preview is for
+  "did the equation get created, in the right paragraph, still inline". The
+  per-feature pixel measurements and the three-step division of labour are in
+  `references/formula-guide.md`.
+- **Documented: `$...$` is single-dollar only, and `$$...$$` fails silently.**
+  The doubled form is not a display marker and is not recognised at all: the
+  detector lifts the LaTeX out of the run and converts it correctly, every `$` the
+  author typed stays in the prose, and the run still reports `失败 0` with exit
+  `0`. Measured on `docx_mathify`: `由 $$\sigma=\frac{F}{A}$$ 可知` comes back as
+  `由 $$$$ 可知` with `oMath=1`. Checking it therefore means reading `w:t` back and
+  grepping for a residual `$`; a display equation is a `docx_create` `latex` block
+  with `"display": true` or `insert_formula.py --display`. Also recorded that the
+  shipped CLIs carry no marker layer — `$x=1$` in a paragraph stays literal text —
+  so the `$...$` loop in `formula-guide.md` is a recipe for your own caller, and a
+  currency `$` in prose needs no escaping.
+- **README test readings refreshed** against this round's runs: 2539 passed / 239
+  skipped / 0 failed on a developer machine with Word installed, and 2233 passed /
+  545 skipped (ubuntu) vs 2236 / 542 (windows) on the four CI legs, all 2778
+  collected, dated 2026-11-25. The `ci.yml` floor moves 2231 -> **2233**, the lower
+  of the two runner legs — floors only move up when a real runner run says so.
+- **Documented: `cases` and matrices are the same object in OMML**, and a scanned
+  textbook's printed page number is not the PDF page index — locate a formula by
+  its equation number or section heading, never by offsetting the printed number.
+- **Test-suite counts corrected.** `tests/` is 83 `.py` (82 `test_*.py` + the
+  `_omml.py` helper), not 81/80; `pytest --collect-only -q` reports 2778 collected
+  on 2026-11-25. Both `SKILL.md` and `SKILL.zh-CN.md` had the old figures.
+
 ## [1.2.1] - 2026-11-24
 
 A documentation-and-entry-point round driven by a real delivery that hit five
@@ -553,6 +644,7 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 - An existing `X.bak` is overwritten on the next in-place apply. The command
   says so on stdout; it does not rotate backups.
 
+[1.3.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.0
 [1.2.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.1.0

@@ -569,9 +569,52 @@ m/s       → \,\text{m/s}                裸的单位串
 
 公式字体默认 **Times New Roman**。用环境变量 `MATH_FONT` 覆盖（`MATH_FONT="Cambria Math"` 还原 Word 默认观感；`MATH_FONT=""` 完全不注入）。
 
+### 函数名与微分算子要直立
+
+Word 的数学区里单个字母默认是**斜体**（它当变量处理）。数字、运算符、函数名不是变量，必须直立。`latex2mathml` 只在少数场合自带 `m:sty val="p"`（`\sin` / `\log` / `\mathrm{...}`），微软的样式表不再补，于是 `\max\{x,y\}` 过去会以单个 run 落到文档里、文本是字面的 `max{x,y}`，在 Word 里整串斜体。
+
+现在 `latex_to_omml_lxml()` 每次转换都会修（这是排版正确性，不是开关）：`split_runs_for_upright()` 按字符类给 run 分块重建，数字串、运算符、以及白名单里的 34 个函数名各拿各的 `m:rPr/m:sty val="p"`。
+
+**机制是「拆 run」，不是「补属性」。** `m:sty` 是 run 级属性，而一个 run 经常同时装着两类字符：`\frac{dy}{dx}` 的分子出来是单个 run `dy`、分母是单个 run `dx`。给 `dx` 补 `sty=p` 会把 `d` **和 `x`** 一起变直立，比两个都斜更错。自己写后处理必须按字符类把 `m:r` 切开；只加属性的循环表达不了这件事。
+
+对写法的影响：`\mathrm{max}` 仍然推荐——它对别的渲染器、对读 `.tex` 的人都是明确表态——但它不再是**唯一**正确写法。`\max\{x,y\}` 与 `\mathrm{max}\{x,y\}` 现在产出逐段完全相同的 OMML，在 Word 里渲染成同样的像素（实测差异 0 像素；补丁上线前两种字形相差数百到数千像素，随栅格化 DPI 变化——1275×1650 页上 72 dpi 是 371、150 dpi 是 1195）。`\text{max}` 也能直立，但它强制 `m:nor`（正文样式），直立是「碰巧」而不是「因为它是算子」。
+
+`UPRIGHT_FUNCS` 刻意不含 `E`：工程与物理文档里的 `E` 几乎总是电动势或能量（斜体变量），一律直立会大面积误伤，而期望算子 `E[·]` 在中文交付物里极少出现。已经带 `m:nor` 或非空 `m:sty` 的 run 整块跳过，所以 `\text{...}` 与上游的决定都保得住。
+
+### cases 与矩阵在 OMML 里是同一个对象
+
+`cases`、`pmatrix`、`bmatrix`、`vmatrix`、`matrix`、`array{ll}` 转出来全是同一个形状：`m:m` 带 `baseJc=center`、`plcHide=on` 与 `mcJc=center`——六个环境的 `mPr` 完全一致。光看 OMML 分不出谁是分段函数、谁是矩阵。
+
+区别只存在于上游两处：LaTeX 源里的 `\begin{cases}`，以及 MathML 层（`cases` 的每个 `mtd` 带 `columnalign="left"`，矩阵的 `mtd` 不带）。`align_cases_left()` 读的就是 `latex_to_omml_lxml` 手里还留着的 MathML 树，判出之后只改对应的那一个 `m:m`。
+
+**「遍历 `mcJc` 一律改 left」不是选项**——一行代码，会把全篇矩阵一起带歪。对位是按文档序的：只有列数 ≥ 2 的表才产出 `m:m`，两者 1:1。数量对不上时函数**一个都不改**，把原因写进 `stats["cases_align_skipped"]`；赌一个错位，把左对齐挪到矩阵上，没有任何测试能提前发现。
+
+还有一条会打破直觉的边界：这个映射与 MathML 的 `mtable` 不是严格 1:1。`pmatrix` 里套 `cases` 会出两个 `mtable`、却只有一个 `m:m`——外层矩阵被折成 `m:d` + `m:eqArr`。数「列数 ≥ 2 的表」，别数全部表。
+
+### 自己代码里的 LaTeX 一律用原始字符串
+
+Python 里每个 LaTeX 字面量都写成原始字符串。`\f` 是换页、`\t` 是制表、`\n` 是换行、`\b` 是退格、`\v` 是垂直制表、`\r` 是回车：普通字面量会在转换器看到之前就把反斜杠吃掉。
+
+```python
+tex = r"\frac{1}{2}"     # 一个反斜杠到达 LaTeX
+tex = "\frac{1}{2}"      # U+000C + "rac{1}{2}"
+```
+
+这样中招的常用命令有 32 个（`\frac` `\forall` 走 `\f`；`\times` `\text` `\theta` `\tan` `\top` 走 `\t`；`\nabla` `\neq` `\nu` 走 `\n`；`\beta` `\bar` `\begin` `\bmod` 走 `\b`；`\rho` `\right` `\ref` 走 `\r`；`\alpha` `\approx` `\angle` `\array` 走 `\a`；`\vee` `\vec` `\varphi` 走 `\v`），另有 4 个（`\xi`、`\underbrace`、`\underline`、`\underset`）在解析阶段直接报错。更麻烦的是七类转义里有五类**静默**转成一个错的公式而不是抛异常——`rac12`、`2imes3`、`hoV`——所以这是铁律，不是偏好。
+
+JSON 里反斜杠要双写，`docx_create` 的 spec 因此写成 `"latex": "\\frac{a}{b} = c"`——解码后仍是同一个反斜杠。逐命令全表、下游真实后果见 [formula-guide](references/formula-guide.md#latex-in-python-source-must-be-a-raw-string)。
+
+### 正文字体与公式字体是两层
+
+`<w:rPr><w:rFonts>` 在一份文档里出现两遍：普通 `<w:r>` 上一份，每个 `<m:r>` **里面**再一份。公式那层由 `apply_math_font()` 按 `MATH_FONT` 写，`ascii`、`hAnsi`、`cs`、`eastAsia` 四个属性一起注入。
+
+**改正文的中文字体时，不要顺手改公式的 `eastAsia`。** `\text{中文}` 是公式 run，取的是公式那一层的 `eastAsia`；正文换成楷体而公式层留着原值，`\text{}` 里的中文就和周围行文对不上，而所有拉丁字形仍然严丝合缝——文档看着是对的，直到有人把两行并排比。要整体换公式字体，就按**公式字体**去换，走 `MATH_FONT`。`fix_fonts.py` 已经守着这条分工：在 `m:oMath` 内只改 `ascii`/`hAnsi`/`cs`，`eastAsia` 不动。
+
 ### `$...$` 标记层：作者标注，不让正则猜
 
 先把「哪里是公式」交给写文档的人：正文里用 `$...$` 包住 LaTeX。正则只负责切分，不负责判断语义。
+
+这是**给自己写的代码用**的配方，不是 shipped CLI 的行为描述。`docx_mathify` 与 `docx_create` 都没有标记层：对它们来说 `$` 就是普通字符，`$x=1$` 会原样留在段落里、`oMath=0`。下面这段循环是你在自己的调用方里需要标记时才加的，也是唯一会把分隔符吃掉的地方。
 
 ```python
 def _add_mixed(p, text):
@@ -594,6 +637,17 @@ def _add_mixed(p, text):
 ```
 
 `FAILS` 必须落盘或打印；静默丢公式是最难查的失败。
+
+**标记只有一个美元符。`$$...$$` 根本不是标记**——不是行间形式，也不是更强的形式，就是没被看见。这是写惯 LaTeX 的人几乎必踩的坑，而且它是静默的：公式照样转对，摘要行报「失败 0」，退出码 `0`，唯一的损伤是正文里多出两个游离的美元符。
+
+| spec 里的正文 | `docx_mathify` 转完的可见文本 | `oMath` |
+|---|---|---|
+| `由 $\sigma=F/A$ 可知，且 $\sigma=\frac{F}{A}$ (3-1)` | `由 $$ 可知，且 $$ (3-1)` | 2 |
+| `由 $$\sigma=\frac{F}{A}$$ 可知` | `由 $$$$ 可知` | 1 |
+| `$$\sigma=\frac{F}{A}$$ (3-1)` | `$$$$ (3-1)` | 1 |
+| `σ = F/A`（裸线性式、无标记） | 只剩一个零宽空格 | 1 |
+
+真正的机制：探测器把 LaTeX 片段从 run 里拎出来转掉，**作者写的每个 `$` 都原样留在原处**——`$$x$$` 于是就变成「一个正确的公式 + 前后各一个 `$`」。因为公式本身是对的、摘要行也是干净的，检查它只能回读 `w:t` 去 grep 残留美元符，不能信「失败 0」。行间公式绝不要写成 `$$...$$`：用 `docx_create` 的 `latex` block 配 `"display": true`（或 `insert_formula.py --display`），那条路根本不经过标记层。正文里单独一个货币美元符也不用转义——`单价 $5 一件` 原样保留，写成 `\$` 反而会在页面上留一个可见的反斜杠。完整机制与批量检查片段见 [formula-guide](references/formula-guide.md#doubled-dollars-are-not-a-marker)。
 
 ### 相量点（`\dot{}`）必须收尾
 
@@ -999,6 +1053,10 @@ python scripts/docx_edit.py replace FILE.docx --find "原文精确片段" --repl
 `docx_preview.py` 回答的是工具链其余部分答不出的那个问题：**第 4 页到底对不对？** 它把文档交给无头 LibreOffice 渲染，产出 PDF 与每页一张 PNG，再把「这一页填了多少」量成报告。不用 Word、不走 COM、不需要 Office 授权：
 
 > **交付时刻的 LibreOffice 不是 Word。** 同一份 `.docx`，两者断行的词不同、一页装的东西不同，页数也可能变。这个差距被报上来时实测过：一份交付文档走 `docx_preview.py` 是 **6 页**，走 `pdf_export.ps1` 是 **5 页**。写这一条时又在新的样本上复测：页数这次一致（都是 3），但第 1 页在 LibreOffice 下装了 **36 行字**、在 Word 下是 **31 行** —— 断点确实挪了。**交付版面（分页、页数、填充率）以 `pdf_export.ps1` 出的 PDF 为准**；preview 用来快速看版面、跑结构 lint，它量的是几何，不靠某个渲染器的脸色。
+>
+> **扫描版书的书内页码不是 PDF 页索引。** 前置部分自带编号，书内第 137 页可能是 PDF 第 149 页——按公式编号或所在章节标题定位，绝不要拿印刷页码去加减偏移。
+>
+> **而且它完全看不见 `m:sty`。** LibreOffice 不认这个直立标记：斜体 `max` 与直立 `max` 经 preview 出来是**同样的像素**（实测 XOR 计数 0，任何 DPI 都一样；同一样本走 `pdf_export.ps1` 时两种字形相差数百到数千像素，随栅格化 DPI 变化——72 dpi 是 371、150 dpi 是 1195）。公式的字形——字母直不直立、积分号多大、括号多高——只在 Word 导出的 PDF 上说了算；preview 只告诉你公式生成了没有、落在哪一段、有没有被升成独立公式行。逐项数字见 [formula-guide](references/formula-guide.md#checking-a-formula-what-each-renderer-can-and-cannot-tell-you)。
 
 ```bash
 # 一次转换拿到三样东西
@@ -1074,7 +1132,7 @@ top_margin_mm + head_gap_mm == 正文首行的 y（mm）
 
 | 文件 | 什么时候读 |
 |---|---|
-| `references/formula-guide.md` | 写公式链生产代码、调 `_add_mixed`、排查 Word 报损坏、处理 `%`/`℃`/`～`/绝对值/复合单位等源文本坑 |
+| `references/formula-guide.md` | 写公式链生产代码、调 `_add_mixed`、排查 Word 报损坏、处理 `%`/`℃`/`～`/绝对值/复合单位等源文本坑，以及判断各渲染器到底能验什么（LibreOffice 看不见 `m:sty`；交付版面只认 `pdf_export.ps1` 出的 PDF） |
 | `references/table-geometry.md` | 表格列宽不生效、要决定 `set` 还是 `sync`、`w:zoom` 缺 `w:percent`、用 `keep_together` 把表压在一页、按 `width_frac` 给图定宽 |
 | `references/font-scheme.md` | 中英文混排字体规范、`w:rPr` 顺序与去重、`--heading-threshold` 语义、标题为什么默认是黑的以及怎么有意给它上色 |
 | `references/merge-and-export.md` | 合并后版心/编号/图片出问题、Word COM 导出细节、PIL 多页 PDF 写法、手工驱 `soffice` 的 `-Wait` 与 `docx_preview.py` |
@@ -1088,7 +1146,7 @@ top_margin_mm + head_gap_mm == 正文首行的 y（mm）
 scripts/     平铺，按裸模块名 import —— 28 个 .py + 1 个 .ps1 = 29 个文件（27 个 CLI，1 个纯库）
 references/  较长的做法笔记，按需加载 —— 7 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 81 个 .py（80 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 83 个 .py（82 个 test_*.py + _omml.py 辅助）
 ```
 
 ## 写到哪儿去，以及有什么保护
@@ -1211,6 +1269,7 @@ tests/       pytest 套件 —— 81 个 .py（80 个 test_*.py + _omml.py 辅�
 ## 硬规矩
 
 - 报告/正式文档的公式一律走 LaTeX→OMML；只有 `H₂O` 级极简上下标才用 `vertAlign` run。
+- **自己代码里的 LaTeX 一律用原始字符串** —— `r"\frac{1}{2}"`，绝不写 `"\frac{1}{2}"`。`\f` `\t` `\n` `\b` `\v` `\r` 都是控制字符，32 个常用命令会这样丢掉反斜杠，而七类转义里有五类随后**静默**转成一个错的公式、不抛异常。JSON 里反斜杠双写：`"latex": "\\frac{a}{b} = c"`。
 - 所有脚本都能 `python -X utf8` 直接跑；Windows 上 stdout 已由 `_bootstrap` 硬化（见[约定](#约定conventions)），别再加第二个 `reconfigure()`。若 `encoding.STDIO_MODE` 在 Windows 上仍报 `untouched`，说明那条流没有 `.buffer` 可重绑 —— 那是调用方的流，不是这套工具的。
 - 就地改写前先备份。`docx_mathify --inplace` 会写 `<名>.bak.docx`，`docx_template.py apply --to` 不带 `-o` 时写 `<文件>.bak`；`fix_fonts.py`、`fix_zoom.py`、`merge_docs.py` 不留副本，原件重要就自己先复制。
 - 需要 node 的只有 `docx_template.py apply -o`（docx-js 骨架）；断链时用 `apply --to`。

@@ -81,11 +81,16 @@ from fix_phasor_dot import fix_phasor_dots
 
 # 上一次 _omml_stdlib() 修掉的相量点数（CLI 用来打印，库调用方也可直接读）。
 _LAST_PHASOR_FIXES = 0
+# 上一次转换的排版统计（直立补全 / cases 左对齐）。CLI **不打印**它 —— `--dump`
+# 的 stdout 必须是可直接解析的 <w:p>，多打一行就毁掉「stdout 是 XML」这条契约；
+# 所以只留给库调用方读。
+_LAST_STATS: dict = {}
 # 上一次相量点修复抛出的异常描述（None = 没出错）。
 _LAST_PHASOR_ERROR: str | None = None
 
 
-def _omml_stdlib(latex: str, display: bool, raw_spacing: bool = False) -> ET.Element:
+def _omml_stdlib(latex: str, display: bool, raw_spacing: bool = False,
+                 stats: dict | None = None) -> ET.Element:
     r"""lxml 元素 → stdlib ElementTree 元素（本脚本在 stdlib ET 树上改 document.xml）。
 
     转换完**立刻**修相量点：``latex2mathml`` 把 ``\dot{X}`` 转成 ``m:limUpp``，
@@ -98,11 +103,20 @@ def _omml_stdlib(latex: str, display: bool, raw_spacing: bool = False) -> ET.Ele
     由 CLI 打到 stderr。
 
     统计出口：修了几处写进模块级 ``_LAST_PHASOR_FIXES``（CLI 打印「修正相量点
-    N 处」，库调用方也可直接读该变量）。
+    N 处」，库调用方也可直接读该变量）；``stats`` 一路透传给
+    ``latex_to_omml_lxml``，于是直立补全 / cases 左对齐的计数也落在同一份 dict 里，
+    同时挂到模块级 ``_LAST_STATS`` 供库调用方读。
     """
-    global _LAST_PHASOR_FIXES, _LAST_PHASOR_ERROR
+    global _LAST_PHASOR_FIXES, _LAST_PHASOR_ERROR, _LAST_STATS
     from lxml import etree
-    el = latex_to_omml_lxml(latex, display=display, raw_spacing=raw_spacing)
+    # stats 只是统计出口：直立补全与 cases 左对齐是全局默认行为，不传也照样生效。
+    # 不传时新建一份，让 _LAST_STATS 反映「这一次」而不是调用方累积的历史。
+    # 刻意**不清空**传入的 dict —— 那会把别的调用点的累加一起抹掉。
+    if stats is None:
+        stats = {}
+    _LAST_STATS = stats
+    el = latex_to_omml_lxml(latex, display=display, raw_spacing=raw_spacing,
+                            stats=stats)
     _LAST_PHASOR_FIXES = 0
     _LAST_PHASOR_ERROR = None
     try:

@@ -723,7 +723,9 @@ def _omml_with_phasor(tex: str, stats: dict | None = None):
     ``--report`` 与测试都读它），失败追加 ``{"latex", "error"}`` 进
     ``stats["phasor_errors"]``（``error`` 里带异常类型名，便于区分根因）。
     """
-    om = latex_to_omml_lxml(tex)
+    # stats 一路透传：直立补全 / cases 左对齐的计数要汇进同一份汇总，
+    # 否则 --report 只看得到相量点，看不到这两项修了多少。
+    om = latex_to_omml_lxml(tex, stats=stats)
     try:
         n = fix_phasor_dots(om)
     except Exception as exc:              # 修相量点出事不该拖垮整篇转换

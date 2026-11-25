@@ -934,11 +934,115 @@ Equation font defaults to **Times New Roman**. Override with the `MATH_FONT`
 environment variable (`MATH_FONT="Cambria Math"` restores Word's default look;
 `MATH_FONT=""` disables injection entirely).
 
+### Function names and differentials come out upright
+
+Word sets a letter in a math zone *italic* — a lone letter is a variable. Digits,
+operators and function names are not, and must stand upright. `latex2mathml`
+supplies `m:sty val="p"` for `\sin` / `\log` / `\mathrm{...}` and Microsoft's
+stylesheet adds no more, so `\max\{x,y\}` used to arrive as a single run holding
+the literal text `max{x,y}`, italic in Word.
+
+`latex_to_omml_lxml()` now repairs this on every conversion (it is layout
+correctness, not a switch): `split_runs_for_upright()` classifies each run's
+characters and rebuilds it as segments, giving digit runs, operators and the 34
+whitelisted function names their own `m:rPr/m:sty val="p"`.
+
+**The mechanism is splitting, not annotating.** `m:sty` is run-level, and one run
+routinely holds both kinds of character: `\frac{dy}{dx}` produced `dy` as one run
+and `dx` as another. Setting `sty=p` on `dx` uprights the `d` **and the `x`**,
+which is worse than leaving both italic. Any post-processing you write has to cut
+`m:r` elements by character class; an attribute-only pass cannot express this.
+
+Practical consequence for how you write LaTeX: `\mathrm{max}` is still the
+recommended spelling — it states the intent to every other renderer and to a human
+reading the `.tex` — but it is no longer the *only* correct one. `\max\{x,y\}` and
+`\mathrm{max}\{x,y\}` now produce segment-for-segment identical OMML and render to
+the same pixels in Word (measured: 0 differing pixels; before the pass the two
+forms differed in several hundred to several thousand pixels depending on the
+rasterisation DPI — 371 at 72 dpi, 1195 at 150 dpi on a 1275x1650 page). `\text{max}`
+also works, but forces `m:nor` — body-text style — so the glyph
+is upright by accident rather than by meaning.
+
+`UPRIGHT_FUNCS` deliberately omits `E`: in engineering and physics it is nearly
+always EMF or energy, and uprighting it wholesale would break far more formulas
+than the rare `E[·]` operator would gain. A run that already carries `m:nor` or a
+non-empty `m:sty` is skipped whole, so `\text{...}` and upstream decisions survive.
+
+### `cases` and matrices are the same object in OMML
+
+`cases`, `pmatrix`, `bmatrix`, `vmatrix`, `matrix` and `array{ll}` all convert to
+an `m:m` with `baseJc=center`, `plcHide=on` and `mcJc=center` — the `mPr` is
+identical across all six. Nothing in the OMML distinguishes a brace-style case
+split from a matrix.
+
+The distinction lives upstream, in two places: the LaTeX source (`\begin{cases}`)
+and the MathML layer (every `mtd` of a `cases` carries `columnalign="left"`; a
+matrix's `mtd` carries none). `align_cases_left()` reads the MathML tree that
+`latex_to_omml_lxml` still has in hand and rewrites only the matching `m:m`.
+
+**A blanket `mcJc=left` pass is not an option** — one line, and every matrix in the
+document goes with it. The mapping is positional: only tables with two or more
+columns produce an `m:m`, and those map 1:1 in document order. If the counts
+disagree the function changes nothing and records the reason in
+`stats["cases_align_skipped"]`, because a guessed off-by-one would silently
+left-align a matrix and no test would catch it.
+
+One boundary that breaks the tidy mental model: the mapping is not 1:1 with MathML
+`mtable` elements. A `pmatrix` wrapping a `cases` gives two `mtable`s but one `m:m`
+— the outer matrix folds into `m:d` + `m:eqArr`. Count two-column tables.
+
+### LaTeX in your own code is a raw string
+
+Every LaTeX literal in Python is a raw string. `\f` is a form feed, `\t` a tab,
+`\n` a newline, `\b` backspace, `\v` a vertical tab, `\r` a carriage return: an
+ordinary literal eats the backslash **before** the converter sees it.
+
+```python
+tex = r"\frac{1}{2}"     # one backslash reaches LaTeX
+tex = "\frac{1}{2}"      # U+000C + "rac{1}{2}"
+```
+
+32 common commands are hit this way (`\frac` `\forall` via `\f`; `\times` `\text`
+`\theta` `\tan` `\top` via `\t`; `\nabla` `\neq` `\nu` via `\n`; `\beta` `\bar`
+`\begin` `\bmod` via `\b`; `\rho` `\right` `\ref` via `\r`; `\alpha` `\approx`
+`\angle` `\array` via `\a`; `\vee` `\vec` `\varphi` via `\v`) and four more
+(`\xi`, `\underbrace`, `\underline`, `\underset`) fail at parse time. Five of
+seven escape classes then convert **silently into a wrong formula** rather than
+raising — `rac12`, `2imes3`, `hoV` — which is exactly why this is a hard rule and
+not a preference.
+
+In JSON the backslash is doubled, so a `docx_create` spec writes
+`"latex": "\\frac{a}{b} = c"` — that is the same one backslash after decoding.
+Full tables, the per-command breakdown and the downstream behaviour:
+[formula-guide](references/formula-guide.md#latex-in-python-source-must-be-a-raw-string).
+
+### Body font and equation font are two layers
+
+A document carries `<w:rPr><w:rFonts>` twice over: on ordinary `<w:r>` runs, and
+again **inside** every `<m:r>`. The equation layer is written by
+`apply_math_font()` from `MATH_FONT`, and it sets all four attributes — `ascii`,
+`hAnsi`, `cs`, `eastAsia`.
+
+**Switch the body's CJK font and the equation's `eastAsia` must not follow.**
+`\text{中文}` is an equation run, so it takes the formula layer; change the body to
+楷体 and leave the formula's `eastAsia` alone and the Chinese inside `\text{}` no
+longer matches the prose around it, while every Latin glyph still lines up — the
+document looks right until the two lines are compared side by side. Change the
+equation font *as an equation font*, through `MATH_FONT`.
+`fix_fonts.py` already honours the split: inside `m:oMath` it rewrites
+`ascii`/`hAnsi`/`cs` and leaves `eastAsia` untouched.
+
 ### The `$...$` marker layer
 
 The regex must not be the thing that decides what is a formula. Let the author
 mark it instead: wrap LaTeX in `$...$` in the source text, and the parser only
 splits — it never guesses semantics.
+
+This is a recipe for **code you write**, not a description of the shipped CLIs.
+`docx_mathify` and `docx_create` carry no marker layer: to them a `$` is an
+ordinary character, so `$x=1$` in a paragraph comes back unchanged with
+`oMath=0`. The loop below is what you add when your own caller needs markers, and
+it is the only place the delimiters are consumed.
 
 ```python
 def _add_mixed(p, text):
@@ -965,6 +1069,30 @@ def _add_mixed(p, text):
 
 `FAILS` has to be printed or written to a file. A formula that vanishes without
 a trace is the hardest failure to find.
+
+**The marker is one dollar. `$$...$$` is not a marker at all** — not a display
+form, not a stronger form, simply not seen. This is the trap almost every LaTeX
+habit walks into, and it is silent: the formula converts fine, the run reports
+`失败 0`, the exit code is `0`, and the only damage is two stray dollars left in
+the prose.
+
+| Text in the source | Visible text after `docx_mathify` | `oMath` |
+|---|---|---|
+| `由 $\sigma=F/A$ 可知，且 $\sigma=\frac{F}{A}$ (3-1)` | `由 $$ 可知，且 $$ (3-1)` | 2 |
+| `由 $$\sigma=\frac{F}{A}$$ 可知` | `由 $$$$ 可知` | 1 |
+| `$$\sigma=\frac{F}{A}$$ (3-1)` | `$$$$ (3-1)` | 1 |
+| `σ = F/A` (bare linear form, no markers) | (a zero-width space only) | 1 |
+
+What actually happens: the detector lifts the LaTeX span out of the run and
+converts it, and every `$` the author typed stays where it was — so `$$x$$`
+becomes a correct equation flanked by `$$`. Since the equation itself is right and
+the summary line is clean, checking it means reading the `w:t` back and grepping
+for a residual `$`, not trusting `失败 0`. Never write a display equation as
+`$$...$$`; use a `docx_create` `latex` block with `"display": true` (or
+`insert_formula.py --display`), which never goes near a marker layer. A lone
+currency `$` in prose needs no escape either — `单价 $5 一件` survives untouched,
+while `\$` leaves a visible backslash on the page. Full mechanism and the batch
+check: [formula-guide](references/formula-guide.md#doubled-dollars-are-not-a-marker).
 
 ### Phasor dots need a correction pass
 
@@ -1589,6 +1717,22 @@ No Word, no COM, no Office licence:
 > the `pdf_export.ps1` PDF** — page breaks, page count, fill — and use preview to
 > look at layout fast and to run the structural lint, which measures geometry
 > instead of trusting a renderer.
+>
+> **And it cannot see `m:sty` at all.** LibreOffice ignores the upright marker, so an
+> italic `max` and an upright `max` rasterise to the *same pixels* through preview
+> (measured XOR count: 0 at every DPI tried). Through `pdf_export.ps1` the same pair
+> differs by several hundred to several thousand pixels depending on the
+> rasterisation DPI — 371 at 72 dpi, 1195 at 150 dpi on a 1275x1650 page — so quote
+> a pixel count only together with its page size and DPI. Equation glyph
+> shape — upright letters, integral size, delimiter height — is settled only on the
+> Word-exported PDF; preview tells you an equation exists, sits in the right
+> paragraph, and was not promoted to a display equation. The per-feature numbers
+> are in [formula-guide](references/formula-guide.md#checking-a-formula-what-each-renderer-can-and-cannot-tell-you).
+>
+> **A scanned book's printed page number is not the PDF page index.** Front matter
+> carries its own numbering, so book page 137 can be PDF page 149 — find the
+> formula by its equation number or the heading around it, never by offsetting the
+> printed number.
 
 ```bash
 # all three capabilities in one conversion
@@ -1725,7 +1869,7 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 
 | File | Read it when |
 |---|---|
-| `references/formula-guide.md` | writing formula-chain production code, calling `_add_mixed`, debugging Word's "file may be corrupted", handling `%` / `℃` / `～` / absolute-value / compound-unit source traps |
+| `references/formula-guide.md` | writing formula-chain production code, calling `_add_mixed`, debugging Word's "file may be corrupted", handling `%` / `℃` / `～` / absolute-value / compound-unit source traps, and deciding what each renderer can actually verify (LibreOffice ignores `m:sty`; judge delivery from the `pdf_export.ps1` PDF) |
 | `references/table-geometry.md` | column widths not taking effect, deciding between `set` and `sync`, `<w:zoom>` missing `w:percent`, keeping a table on one page (`keep_together`), sizing an image by `width_frac` |
 | `references/font-scheme.md` | mixed CJK/Latin font conventions, `w:rPr` ordering and dedupe, what `--heading-threshold` means, why Heading/Title/Subtitle come out black and how to colour one deliberately |
 | `references/merge-and-export.md` | after merging: page area / numbering / images wrong; Word COM export details; multi-page PDF via PIL; driving `soffice` by hand (`-Wait`, `docx_preview.py`) |
@@ -1739,7 +1883,7 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 scripts/     flat, imported by bare module name — 28 .py + 1 .ps1 = 29 files (27 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 7 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 81 .py (80 test_*.py + _omml.py helper)
+tests/       pytest suite — 83 .py (82 test_*.py + _omml.py helper)
 ```
 
 ## Where a write lands, and what protects it
@@ -1939,6 +2083,11 @@ has a problem" is `docx_validate`'s job and exits `1` instead.
 
 - Formulas in reports and formal documents go through LaTeX→OMML. Only
   `H₂O`-level sub/superscripts use a `vertAlign` run instead.
+- **Every LaTeX literal in your own code is a raw string** — `r"\frac{1}{2}"`,
+  never `"\frac{1}{2}"`. `\f` `\t` `\n` `\b` `\v` `\r` are control characters;
+  32 common commands lose their backslash that way and five of the seven escape
+  classes then convert **silently** into a wrong formula instead of raising.
+  In JSON the backslash is doubled: `"latex": "\\frac{a}{b} = c"`.
 - Every script runs under `python -X utf8`. On Windows `_bootstrap` already
   hardens stdio (see [Conventions](#conventions)) — do not add a second
   `reconfigure()`. If `encoding.STDIO_MODE` still reads `untouched` on Windows,

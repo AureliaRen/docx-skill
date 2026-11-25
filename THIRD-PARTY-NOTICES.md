@@ -6,7 +6,7 @@ provenance of everything in the repository that is not original work, so that
 upstream attribution travels with the source.
 
 Scope of this file: **every file in the repository** is accounted for below —
-`scripts/` (28 `.py` + 1 `.ps1` — 29 files), `tools/` (2), `tests/` (81),
+`scripts/` (28 `.py` + 1 `.ps1` — 29 files), `tools/` (2), `tests/` (83),
 `references/` (7), `examples/` (2), `.github/` (1), plus the top-level
 documents. Nothing is
 redistributed from a third party: there is no vendored library, no `.xsd` /
@@ -71,7 +71,7 @@ Everything else is original work for this project:
 - **Runtime plumbing** — `_bootstrap.py`, `encoding.py`, `minidom_compat.py`,
   `docx_utils.py`, `docx_pack.py`
 - **Acceptance tooling** — `tools/word_accept.py`, `tools/README.md`
-- **Tests** — `tests/` (81 files: 80 `test_*.py` modules plus the `_omml.py`
+- **Tests** — `tests/` (83 files: 82 `test_*.py` modules plus the `_omml.py`
   helper)
 - **Reference documentation** — `references/` (7 documents: `font-scheme`,
   `formula-guide`, `merge-and-export`, `revisions-and-comments`,
