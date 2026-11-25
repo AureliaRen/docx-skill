@@ -201,6 +201,40 @@ Two details worth knowing:
   `w:rPr/w:rFonts` block, including runs nested inside `m:f`/`m:rad`/`m:nary`
   argument containers. There is no residue on Cambria Math in the visible text.
 
+### Two layers, and only one of them is the body
+
+A document carries two independent font layers. Changing one does not move the
+other, and it is easy to spend an afternoon on the wrong one:
+
+| Layer | Where it lives | Who writes it |
+|---|---|---|
+| body text | `<w:rPr><w:rFonts>` on an ordinary `<w:r>` | the styles, `docx_create`, `fix_fonts.py` |
+| equation text | `<w:rPr><w:rFonts>` **inside** each `<m:r>` | `math_omml.apply_math_font()`, from `MATH_FONT` |
+
+Both layers get the same four attributes — `ascii`, `hAnsi`, `cs`, `eastAsia` —
+but from different code, at different times. The rule that follows is narrow and
+absolute:
+
+> **Switching the body's CJK font must not touch the formula's `eastAsia`.**
+
+`\text{中文}` is an equation run, so it takes the *formula* layer's `eastAsia`,
+not the body's. Rewrite the body to 楷体 and leave the formula's `eastAsia` behind
+and the Chinese inside `\text{}` no longer matches the surrounding prose — while
+every Latin glyph still lines up, so the document looks correct until someone
+compares the two lines. Change the formula font **as a formula font**, through
+`MATH_FONT`:
+
+```
+MATH_FONT="楷体"   python scripts/docx_mathify.py in.docx -o out.docx
+```
+
+`fix_fonts.py` already obeys this split: for a run inside `m:oMath` it rewrites
+`ascii`/`hAnsi`/`cs` to Times New Roman and deliberately leaves `eastAsia` alone
+(`scripts/fix_fonts.py:13-14`, implemented at `scripts/fix_fonts.py:179-190`, where
+the math runs are collected by `id()` before the rewrite loop). Do not "finish the
+job" by adding `insert(0, rFonts)` for every run — see
+[font-scheme](font-scheme.md#和公式链的交界) for why that breaks `m:r` child order.
+
 The count is the cheap way to check a document after conversion. On the smoke
 fixture, which is the regression baseline this chain is measured against:
 
@@ -250,9 +284,15 @@ span you know is a formula — and no amount of tuning fixes the general case,
 because the information it lacks is *intent*, which only you have.
 
 The escape hatch is to mark the span yourself. `$...$` is not LaTeX in the
-document sense and pandoc will not see it; it is a convention this chain honours,
-and the rule is one line: whatever sits between the dollars goes to the converter
-as LaTeX, verbatim, and the text around it stays text.
+document sense and pandoc will not see it; it is a convention the loop below
+implements, and the rule is one line: whatever sits between the dollars goes to
+the converter as LaTeX, verbatim, and the text around it stays text.
+
+Read that as **a recipe for code you write**, not a description of the shipped
+CLIs. `docx_mathify` and `docx_create` have no marker layer: a `$` in a paragraph
+is an ordinary character to them, so `$x=1$` survives as literal text with
+`oMath=0` and nothing is converted. The loop is what you add when your own script
+needs the marker, and it is the only place the delimiters are consumed.
 
 ```python
 def _add_mixed(p, text):
@@ -287,9 +327,87 @@ Three things in that loop carry weight:
   in the run summary. Silently losing an equation is the one outcome worth this
   much code to prevent.
 
-The trade-off is honest: a `$` in prose now has to be written `\$`, and the
-detector's opinion no longer applies inside the markers. In exchange you get
-exactly the equations you meant, in exactly the places you meant them.
+The trade-off is honest: **inside your own loop**, a `$` in prose has to be written
+`\$`, and the detector's opinion no longer applies between the markers. In
+exchange you get exactly the equations you meant, in exactly the places you meant
+them. (In the shipped CLIs there is nothing to escape — see the currency note at
+the end of the next section.)
+
+### Doubled dollars are not a marker
+
+The marker is **single** `$...$`. `$$...$$` is not a display marker, not a
+stronger marker, and not recognised at all: the convention is one dollar on each
+side and the pattern in the recipe above — `\$([^$]+)\$` — has no second-dollar
+branch. Anyone who writes LaTeX habitually reaches for the doubled form, which
+makes this the trap that gets hit most often, and it fails in the worst possible
+way.
+
+| Text in the source | Visible text after conversion | `oMath` |
+|---|---|---|
+| `由 $\sigma=F/A$ 可知，且 $\sigma=\frac{F}{A}$ (3-1)` | `由 $$ 可知，且 $$ (3-1)` | 2 |
+| `由 $$\sigma=\frac{F}{A}$$ 可知` | `由 $$$$ 可知` | 1 |
+| `$$\sigma=\frac{F}{A}$$ (3-1)` | `$$$$ (3-1)` | 1 |
+| `σ = F/A` (bare linear form, no markers) | (a zero-width space only) | 1 |
+
+The mechanism, measured end to end (`docx_create` → `docx_mathify` → read back
+`w:t`): **the detector finds the LaTeX on its own and removes it from the text
+runs; every `$` the author typed stays behind.** In row 2 the span
+`\sigma=\frac{F}{A}` is lifted out and converted, leaving the two dollars from
+each side adjacent — four characters that now read as `$$$$`. In row 1 the same
+thing happens twice, so you get `$$` in two places. Nothing in the chain ever
+looked for a closing dollar; the doubled form is not rejected, it is simply not
+*seen*, and the residue is what remains after the formula leaves.
+
+That matters for where the fix belongs. The `$...$` loop shown above is a recipe
+for your own caller — it is not something the shipped CLIs run. `docx_mathify`
+and `docx_create` treat `$` as an ordinary character: `$x=1$` in a paragraph
+survives untouched (`oMath=0`), and whenever the detector *does* convert a span
+between markers, the markers are left in the prose. So there is no configuration
+that makes `$$` work, and nothing to switch off — the correct move is not to
+write it.
+
+A run reports `失败 0` and exits `0` while doing all of this, and the equation
+itself is correct. Only the page text is wrong.
+
+That combination — silent, exit `0`, formula present — is why this needs a
+read-back rather than a summary line. **Grep the converted `w:t` for a residual
+dollar:**
+
+```python
+import sys, zipfile
+from lxml import etree
+
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+root = etree.fromstring(zipfile.ZipFile(sys.argv[1]).read("word/document.xml"))
+for i, p in enumerate(root.iter(W + "p")):
+    text = "".join(t.text or "" for t in p.iter(W + "t"))
+    if "$" in text:
+        print(f"paragraph {i}: {text!r}")
+```
+
+Nothing printed means no residual marker. `docx_read.py --text` shows the same
+text and is enough for a single file; the loop above is for sweeping a batch.
+
+Two correct ways to get a centred display equation instead:
+
+- **write a `docx_create` `latex` block** with `"display": true` — it produces an
+  `m:oMathPara` and never touches any marker layer;
+- **use `insert_formula.py --display`**, which builds the `m:oMathPara` in place.
+
+Note what does *not* work: dropping the markers and letting the detector see the
+span gives you an **inline** equation, not a display one. `docx_mathify` emits
+`m:oMath` on every path and never an `m:oMathPara` — measured on a paragraph
+holding nothing but `\sigma=\frac{F}{A}`, the result is `oMath=1, oMathPara=0`.
+The markers exist to rescue spans the detector *declines*; they are not, and never
+were, a display-layout request.
+
+A currency sign in prose needs neither form. Measured on `docx_mathify` output:
+`单价 $5 一件` comes back untouched (`oMath=0`) — a lone `$` that does not enclose
+something the detector reads as a formula is just a character. What you should
+*not* do is escape it: `单价 \$5 一件` comes back with the backslash still on the
+page, because nothing in the shipped chain maps `\$` back to `$` — that mapping
+exists only inside a formula. The escape is for the hand-written `$...$` caller,
+whose loop consumes the delimiters; the CLIs do not consume anything.
 
 ## Phasor dots need their own accent
 
@@ -379,6 +497,109 @@ gives `\omega_{0L}` — one subscript containing two tokens — when the author 
 `repair_merged_scripts()` splits these apart heuristically: it recognises when
 the tail of a script is actually a following token, and honours the cases where
 it genuinely is one script (`U^{2}`, `10^{-6}`).
+
+## Function names and differentials come out upright
+
+Word sets letters in a math zone *italic*, because a single letter is a variable.
+Digits, operators, and function names are not variables and must stand upright.
+`latex2mathml` supplies `m:sty val="p"` in a few places (`\sin`, `\log`,
+`\mathrm{...}`) and Microsoft's stylesheet does not add any more, so
+`\max\{x,y\}` used to arrive as one run holding the literal text `max{x,y}`,
+italic in Word.
+
+Since this round the converter repairs it in `split_runs_for_upright()`
+(`scripts/math_omml.py:192`, called from `latex_to_omml_lxml` at
+`scripts/math_omml.py:498`): it classifies each run's characters and rebuilds the
+run as segments, giving every digit run, operator, and whitelisted function name
+its own `m:rPr/m:sty val="p"`.
+
+**Splitting is the mechanism, not an optimisation.** `m:sty` is a *run-level*
+property, and one run routinely holds both kinds of character at once:
+`\frac{dy}{dx}` produced the numerator as a single run `dy` and the denominator
+as a single run `dx`. Setting `sty=p` on `dx` uprights the `d` **and the `x`**,
+which is more wrong than leaving both italic. The only correct move is to cut the
+run by character class first, so every segment carries its own answer. If you
+write your own post-processing pass, it has to split `m:r` elements — a loop that
+only adds an attribute to existing runs cannot express this.
+
+### `\mathrm{max}` is still the recommendation, but no longer the only correct form
+
+Measured on this repository, before and after the pass landed:
+
+| Input | Runs produced (before) | Runs produced (now) |
+|---|---|---|
+| `\max\{x,y\}` | one run, text `max{x,y}`, no style | `max`(p) · `{`(p) · `x`(–) · `,`(p) · `y`(–) · `}`(p) |
+| `\mathrm{max}\{x,y\}` | `max`(p) + `{x,y}` | `max`(p) · `{`(p) · `x`(–) · `,`(p) · `y`(–) · `}`(p) |
+| `\text{max}\{x,y\}` | `max`(`m:nor`) + `{x,y}` | `max`(`m:nor`) · `{`(p) · `x`(–) · `,`(p) · `y`(–) · `}`(p) |
+
+The first two rows are now **segment-for-segment identical**, and Word renders them
+identically: exported through `pdf_export.ps1` and compared pixel by pixel, the two
+`max` regions differ in **0 pixels**. So `\mathrm{max}` stays the written
+convention because it says what it means to every other renderer and to a human
+reading the `.tex`, but `\max\{x,y\}` is no longer wrong.
+
+Before the pass they did *not* agree, and the size of the disagreement is a
+property of the rasteriser rather than of the document — quote it with the DPI or
+not at all:
+
+| Rasterisation DPI | 72 | 96 | 150 | 200 | 300 |
+|---|---|---|---|---|---|
+| differing pixels, old vs new | 371 | 556 | 1195 | 1957 | 3896 |
+
+(sample: one `latex` block reading `\max\{x,y\}\le z`, against the same block
+with `\mathrm{max}`; `pdf_export.ps1` → PDF, `fitz` rasterises at the stated DPI,
+`ImageChops.difference`, non-zero pixel count on a 1275x1650 page.)
+
+The third row is worth avoiding for a different reason: `\text{}` forces
+`m:nor`, the body-text style, so the glyph is upright by accident rather than
+because it is an operator — and everything else in the group inherits text
+spacing with it.
+
+Two scope limits, both deliberate:
+
+- the whitelist (`UPRIGHT_FUNCS`, `scripts/math_omml.py:112`) holds 34 names and
+  **excludes `E`**: in engineering and physics `E` is nearly always EMF or energy,
+  an italic variable, so uprighting it wholesale would damage far more formulas
+  than the rare expectation operator `E[·]` would gain;
+- a run that already carries `m:nor` or a non-empty `m:sty` is skipped whole, so
+  `\sin`, `\mathrm{Var}` and `\text{...}` keep whatever the upstream decided.
+
+## `\begin{cases}` and matrices are the same object in OMML
+
+`cases`, `pmatrix`, `bmatrix`, `vmatrix`, `matrix` and `array{ll}` all convert to
+the *same* OMML shape: an `m:m` whose `mPr` carries `baseJc=center` and
+`plcHide=on`, with `mcs/mc/mcPr/{count, mcJc=center}`. Measured across all six
+environments the `mPr` is identical. Nothing in the OMML says which one it was.
+
+The distinction survives in exactly two places, and both are upstream of the
+stylesheet:
+
+- **the LaTeX source** — `\begin{cases}` versus `\begin{pmatrix}`;
+- **the MathML layer** — every `mtd` of a `cases` carries
+  `columnalign="left"`; a matrix's `mtd` carries no `columnalign` at all
+  (`array{ll}` carries `left` too, and that is correct — it asked for `l`).
+
+`align_cases_left()` (`scripts/math_omml.py:323`) therefore reads the MathML tree
+that `latex_to_omml_lxml` still has in hand, decides which tables are cases-like,
+and only then rewrites the matching `m:m` to `mcJc=left`.
+
+**Why a blanket pass over `mcJc` is not an option.** "Every `mcJc` becomes
+`left`" is one line, and it silently left-aligns every matrix in the document as
+well. Because the mapping is positional, the count has to agree first: only tables
+with **two or more columns** produce an `m:m`, and they map 1:1 in document order.
+When the counts disagree the function changes **nothing** and records the reason in
+`stats["cases_align_skipped"]` — a guessed off-by-one would move the left alignment
+onto a matrix, and no test would catch it.
+
+Measured, after the pass: `cases` → `mcJc=left`; `pmatrix`, `bmatrix`, `vmatrix`,
+`matrix` → still `center`; `array{ll}` → `left`; `cases` nested inside a
+`pmatrix` → the inner one goes `left`, the outer stays `center`.
+
+One boundary worth writing down, because it breaks the simple mental model: the
+mapping is **not** strictly 1:1 with MathML `mtable` elements. A `pmatrix` wrapping
+a `cases` produced two `mtable`s in MathML but only one `m:m` in OMML — the outer
+matrix was folded into `m:d` + `m:eqArr`. Compare counts of "tables with two or
+more columns", not of all tables.
 
 ## Two defects fixed in this round
 
@@ -502,6 +723,167 @@ while writing the source text, not afterwards:
 
 `--dry-run` reports conversions without writing, which is the cheap way to audit
 a large document before committing to the change.
+
+## Checking a formula: what each renderer can and cannot tell you
+
+Three different questions get asked about a converted formula, and only one of
+them needs Word. Getting the split wrong wastes hours in both directions —
+staring at LibreOffice output for a defect it cannot show, or shipping on its
+word for a defect only Word reveals.
+
+| Question | Tool | Trustworthy? |
+|---|---|---|
+| Did an equation object get created at all? | `docx_read.py --runs`, OMML count | yes — it reads the XML |
+| Is the structure legal? | `docx_validate.py`, `assert_legal()` | yes |
+| Does the equation *look* right? | `docx_preview.py` (LibreOffice) | **no** — see below |
+| Does the delivered page look right? | `pdf_export.ps1` (Word COM) | yes, at 150 dpi and above |
+
+### LibreOffice cannot see `m:sty` at all
+
+The upright pass above writes `m:rPr/m:sty val="p"`. LibreOffice **ignores that
+element**, so an italic `max` and an upright `max` rasterise to the *same pixels*
+through `docx_preview.py`: measured on one document, the XOR count between the two
+regions was **0** at every DPI tried, while the same pair through `pdf_export.ps1`
+differed in several hundred to several thousand pixels depending on the
+rasterisation DPI (371 at 72 dpi, 1195 at 150 dpi on a 1275x1650 page). A preview
+screenshot therefore cannot confirm or refute the upright fix — it renders both
+forms with the same slant, so a *correct* document looks broken and a *broken* one
+looks fine.
+
+The same sample, rasterised through `pdf_export.ps1` at five DPIs:
+
+| Rasterisation DPI | 72 | 96 | 150 | 200 | 300 |
+|---|---|---|---|---|---|
+| `pdf_export.ps1` (Word COM), differing pixels | 371 | 556 | 1195 | 1957 | 3896 |
+| `docx_preview.py` (LibreOffice), differing pixels | 0 | 0 | 0 | 0 | 0 |
+
+**A pixel count is a property of the rasteriser, not of the document.** The same
+pair of forms re-measured through a different pipeline — or the same pipeline at a
+different DPI — gives a different number, so any figure quoted here has to carry
+its page size and DPI or it will not reproduce. The figure that *is* stable is the
+zero: LibreOffice returns 0 no matter how it is rasterised, because it never reads
+the element in the first place.
+
+### The sizes disagree too, and not symmetrically
+
+Measured on one 1275x1650 page rendered at 150 dpi through both paths:
+
+| Feature | LibreOffice | Word |
+|---|---|---|
+| `max` line height | 26 px | 21 px |
+| integral sign, stroke height | 34 px | 35 px |
+| integral sign, whole object incl. limits | 64 px | 58 px |
+| the upper limit digit `1` | 10 px tall | 27 px band |
+| cases closing brace, width x height | 7 x 70 px | 24 x 46 px |
+| `pmatrix` alignment | centred | centred |
+
+Read that table as *these are different renderers*, not *one of them is wrong*:
+LibreOffice draws the integral smaller with its limits tucked closer, and draws the
+cases brace as a thin tall stroke where Word draws a wide heavy one. Both are
+internally consistent; only Word's is what the reader receives.
+
+### The division of labour
+
+1. **While iterating** — `docx_preview.py --pages DIR --dpi 150` for a fast look.
+   Use it to confirm the formula exists, sits in the right paragraph, and has not
+   been promoted to a display equation. Do not judge glyph shape, upright letters,
+   integral size, or brace height from it.
+2. **At sign-off** — export the same `.docx` through Word COM and read that PDF:
+
+   ```
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\pdf_export.ps1 `
+       -DocxPath out.docx -PdfPath out.pdf
+   ```
+
+   `pdf_export.ps1` takes `-DocxPath` (required) and `-PdfPath` (omit it and the PDF
+   lands beside the input under the same stem), opens the document read-only through
+   `Documents.Open`, and calls `ExportAsFixedFormat($pdf, 17)`. `tools/word_accept.py`
+   wraps the same path when you want the result as JSON — `--pdf`, `--expect-pages`,
+   `--expect-tables`, and exactly one JSON object on stdout.
+3. **On the PDF** — zoom into the formula region. Anything about glyph shape,
+   upright letters, operator size, or delimiter height is decided here and nowhere
+   else.
+
+> **A scanned textbook's printed page number is not the PDF page index.** The front
+> matter (cover, preface, contents) usually carries its own numbering, so a book
+> page 137 can be PDF page 149 or 131. Locate the formula by its equation number or
+> the section heading around it, never by adding a fixed offset to the printed
+> number — the offset changes at every section break, and a formula checked against
+> the wrong page looks wrong in a way no amount of re-rendering fixes.
+
+## LaTeX in Python source must be a raw string
+
+Every LaTeX string you write in Python is a **raw string**:
+
+```python
+tex = r"\frac{1}{2}"          # ✅ one backslash reaches LaTeX
+tex = "\frac{1}{2}"           # ❌ \f is a form feed: U+000C + "rac{1}{2}"
+```
+
+This is not style. Python resolves `\` + letter inside an ordinary string literal
+into a *control character* before the converter ever sees it, and the result
+usually does not raise — it converts into a quietly wrong formula.
+
+### Which commands are hit
+
+Measured by evaluating each command name in a plain literal and inspecting the
+resulting code point (`scripts`-side probe, all 79 names in the chain's own
+vocabulary):
+
+| Escape | Code point | Commands whose backslash disappears |
+|---|---|---|
+| `\a` | U+0007 BEL | `\alpha`, `\angle`, `\approx`, `\array` |
+| `\b` | U+0008 BS | `\bar`, `\begin`, `\beta`, `\binom`, `\bmod`, `\bot`, `\boxed` |
+| `\f` | U+000C FF | `\frac`, `\forall` |
+| `\n` | U+000A LF | `\nabla`, `\neq`, `\notin`, `\nu` |
+| `\r` | U+000D CR | `\ref`, `\rho`, `\right` |
+| `\t` | U+0009 TAB | `\tag`, `\tan`, `\text`, `\tfrac`, `\theta`, `\tilde`, `\times`, `\top`, `\triangle` |
+| `\v` | U+000B VT | `\varphi`, `\vec`, `\vee` |
+| `\x` | — | `\xi` and friends: **`SyntaxError: (unicode error) 'unicodeescape' codec can't decode`** — the only failure loud enough to stop you |
+
+32 names break this way and 4 more raise at parse time. Forty-three others —
+`\sqrt`, `\int`, `\sum`, `\lim`, `\partial`, `\infty`, `\left`, `\mathbb`, `\mathrm`,
+`\lambda`, `\sigma`, `\cdot` and their neighbours — survive by accident: the letter
+after the backslash starts no valid escape, so Python passes the pair through
+untouched. **Do not learn the table. Write `r"..."` and the question never
+arises.**
+
+### What actually happens downstream
+
+Feeding the mangled strings to `latex_to_omml_lxml` (seven probes, one per escape
+class):
+
+| Source text reaching the converter | Result |
+|---|---|
+| U+000C + `rac{1}{2}` | converts, `m:t` = `rac12` — silent |
+| U+0009 + `imes 3` | converts, `m:t` = `2imes3` — silent |
+| U+000A + `eq b` | converts, `m:t` = `aeqb` — silent |
+| U+000D + `ho V` | converts, `m:t` = `hoV` — silent |
+| U+000B + `ec{F}` | converts, `m:t` = `ecF` — silent |
+| U+0008 + `eta` | raises `XMLSyntaxError: PCDATA invalid Char value 8` |
+| U+0007 + `lpha` | raises `XMLSyntaxError: PCDATA invalid Char value 7` |
+
+Five of seven fail **silently** with a plausible-looking but wrong formula. That
+asymmetry is the whole reason this is a hard rule rather than a preference: the
+loud cases get fixed immediately, the quiet ones ship.
+
+### The same rule in JSON and in a spec
+
+A JSON string has its own escape layer, so the backslash is doubled there:
+
+| Context | Written as | Meaning |
+|---|---|---|
+| Python raw string | `r"\frac{1}{2}"` | one backslash |
+| JSON | `"\\frac{1}{2}"` | one backslash after JSON decoding |
+| JSON, single backslash | `"\frac{1}{2}"` | U+000C + `rac{1}{2}` — the Python bug, in JSON |
+
+`"\beta"` gives U+0008 + `eta`; `"\vee"`, `"\alpha"` and `"\xi"` make `json.loads`
+raise `Invalid \escape`. A `docx_create` spec is JSON, so its `latex` blocks follow
+the JSON column — that is why every example in this manual is spelled
+`"latex": "\\frac{a}{b} = c"`.
+
+The chain's own `--tex` output and `--report` tables are written with the literal
+backslash, so reading them back into a Python literal still needs `r"..."`.
 
 ## Command line
 
