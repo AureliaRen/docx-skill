@@ -1261,6 +1261,281 @@ alongside the `m:oMath`-nesting and `m:rad` cases, so a freshly converted formul
 cannot reach a document unnoticed. Full mechanism, the wider matrix and the
 adjacent traps:
 [formula-guide](references/formula-guide.md#a-unary-sign-at-the-head-of-a-delimiter-group).
+
+### Control sequences that OMML cannot express
+
+A LaTeX source is full of commands that only mean something to a typesetting
+engine: `\eqno`, `\nonumber`, `\textwidth`, `\hline`, `\newpage`. OMML has no structure
+for any of them, and until this round the converter chain had no opinion about
+them either. `latex2mathml` turns an unrecognised control sequence into literal
+text, `MML2OMML.XSL` copies that text into an `m:t` run, and Word then draws the
+backslash and the command name **inside** the equation. The formula is otherwise
+correct: the fraction is a real fraction and the document opens normally.
+
+**The defect is that nothing complained.** Measured on a four-paragraph document
+carrying `\eqno`, `\nonumber` and `\textwidth`, with both guard layers patched out:
+
+| Reading | Value |
+|---|---|
+| `docx_mathify` summary line | `… 失败 0 …` — the failure field reads zero |
+| `docx_mathify` exit code | `0` |
+| `docx_validate` | `ok: true`, and no `omml_latex_residue` key at all |
+| `m:t` runs whose entire text is a backslash command | **3** (`\eqno`, `\nonumber`, `\textwidth`) |
+
+Every check in the toolkit was green while the deliverable carried three literal
+commands. The same document with the guards in place reports
+`失败 3（拒收 3，转换 0）`, exits `3`, and reads back zero backslash runs. That is what
+this round is about: a silent delivery defect, not a missing feature.
+
+**Three layers, each answering a question the others cannot.**
+
+| Layer | Where it runs | What it covers | What it does |
+|---|---|---|---|
+| 1. Pre-emptive rejection | `scripts/math_omml.py:975`, before `keep_spacing` | the 48 known LaTeX-only names, plus 5 position-dependent ones | raises, naming each command with the replacement to write |
+| 2. Post-conversion residue | `scripts/math_omml.py:1021`, after `split_runs_for_upright` | **any** command, including ones it has never heard of | raises, quoting the command it found in the output |
+| 3. After-the-fact health check | `scripts/docx_validate.py`, code `omml_latex_residue` | documents already on disk | adds a warning; `ok` and the exit code stay put |
+
+Layer 1 is the only one that can explain *why*, because it works on the source
+while the command name is still a name — but that needs a list, and the list is
+closed. Layer 2 reads the artefact, so it covers the unbounded set of unknown
+commands; its limit is that it only sees a command that survives as its own
+token. Layer 3 runs where neither converter-side layer can reach: a file written
+last month by an older build, opened today. It must not move any exit code,
+because "this archive has residue" is not "this run failed".
+
+**The 48 names, grouped the way the source groups them.** Layer 1 matches the
+command name exactly, so every name below is refused wherever it appears. The
+right-hand column is the advice the error message prints.
+
+Numbering and references — LaTeX's `\label`/`\ref` machinery, with no OMML counterpart:
+
+| Command | Write instead |
+|---|---|
+| `\eqno` | Drop it; number with `\tag{n}`, which this toolkit lands as a literal `(n)` in the text |
+| `\nonumber` | Drop it; numbering is decided by the numbering segment or `\tag`, nothing needs suppressing per line |
+| `\notag` | Drop it; same family as `\nonumber` — OMML has no "leave this line unnumbered" slot |
+| `\label` | Drop `\label{}`; cross-references are `docx_crossref`'s job (bookmark + REF field), a formula carries no tag |
+| `\eqref` | Write the number by hand, or let `docx_crossref` produce the REF field; no `\eqref{}` inside a formula |
+| `\ref` | Write the number by hand, or let `docx_crossref` produce the REF field; no `\ref{}` inside a formula |
+
+Page and column dimensions — Word owns these, in paragraph, table and section settings:
+
+| Command | Write instead |
+|---|---|
+| `\textwidth` | Use a concrete length, or put the formula in a paragraph as wide as the text column |
+| `\textheight` | Page geometry belongs to the `page` block of `docx_create`; do not reference it from a formula |
+| `\columnwidth` | Use a concrete length; column width comes from Word's column settings |
+| `\linewidth` | Use a concrete length; line width comes from paragraph or table settings |
+| `\baselineskip` | Line spacing belongs to paragraph formatting (`line_spacing`); do not reference it from a formula |
+| `\setlength` | Drop it; lengths are set by the formatting arguments of `docx_create` / `docx_edit` |
+
+Vertical and horizontal spacing — OMML has no spacing node, paragraphs do:
+
+| Command | Write instead |
+|---|---|
+| `\vspace` | Drop it; paragraph spacing uses `space_before` / `space_after` |
+| `\hfill` | Drop it; right alignment is a paragraph property, not something a formula says |
+| `\vfill` | Drop it; vertical fill is page and paragraph layout |
+| `\hfil` | Drop it; horizontal fill is the alignment |
+| `\smallskip` | Drop it; paragraph spacing is set by paragraph formatting |
+| `\medskip` | Drop it; paragraph spacing is set by paragraph formatting |
+| `\bigskip` | Drop it; paragraph spacing is set by paragraph formatting |
+| `\bigskipamount` | Drop it; paragraph spacing is set by paragraph formatting |
+
+Line and page breaks — a break is a paragraph or a page-break run, never formula content:
+
+| Command | Write instead |
+|---|---|
+| `\cr` | Drop it; in a matrix or align environment a new row is a double backslash, outside a formula a break is a new paragraph |
+| `\newline` | Drop it; a break inside a formula is a double backslash, or write two formulas |
+| `\linebreak` | Drop it; breaking is the paragraph's job |
+| `\nolinebreak` | Drop it; break control belongs to the paragraph, or write a non-breaking space |
+| `\pagebreak` | Drop it; a page break is `docx_edit`'s page-break run |
+| `\newpage` | Drop it; a page break is `docx_edit`'s page-break run |
+| `\clearpage` | Drop it; a page break is `docx_edit`'s page-break run |
+| `\allowbreak` | Drop it; break points belong to the layout engine, OMML has no such concept |
+| `\break` | Drop it; breaking belongs to the paragraph |
+| `\displaybreak` | Drop it; where a multi-line formula breaks is paragraph pagination |
+| `\allowdisplaybreaks` | Drop it; where a multi-line formula breaks is paragraph pagination |
+
+Table rules and column merge — border settings, not formula content:
+
+| Command | Write instead |
+|---|---|
+| `\hline` | Drop it; table borders come from `docx_create` / `table_width` border settings |
+| `\cline` | Drop it; table borders come from the border settings |
+| `\hrule` | Drop it; a horizontal rule is a paragraph or table border |
+| `\vrule` | Drop it; a vertical rule is a table border |
+| `\multicolumn` | Drop it; merging cells is `docx_edit`'s `merge_cells` |
+
+Boxes — no OMML structure exists:
+
+| Command | Write instead |
+|---|---|
+| `\makebox` | Drop it; fixed-width content is a table, or write `\text{}` |
+| `\raisebox` | Drop it; vertical shifting belongs to a sub/superscript structure |
+
+Macros and fine layout adjustments — nothing on the Word side corresponds:
+
+| Command | Write instead |
+|---|---|
+| `\renewcommand` | Drop it; `latex2mathml` does not expand it (measured: the whole string leaks), so write commands that convert |
+| `\settowidth` | Drop it; it measures a LaTeX layout length and has no OMML equivalent — control width with table column widths |
+| `\ignorespaces` | Drop it; spacing is controlled directly by the source text |
+| `\unskip` | Drop it; it removes a LaTeX spacing node that OMML does not have |
+| `\protect` | Drop it; it is a LaTeX expansion-control modifier with no counterpart |
+
+Paragraphs — a formula fragment is not a paragraph:
+
+| Command | Write instead |
+|---|---|
+| `\par` | Drop it; a new paragraph is a paragraph (`docx_edit`'s `add_paragraph`) |
+| `\noindent` | Drop it; first-line indent is paragraph formatting, `first_line_indent` |
+
+Interoperating with the surrounding prose:
+
+| Command | Write instead |
+|---|---|
+| `\intertext` | Drop it; to put prose between two display lines, split into formula + paragraph + formula |
+| `\shortintertext` | Drop it; same as `\intertext`, split into a formula and a paragraph |
+| `\qed` | Drop it; end a proof with `\square` / `\Box`, or type the tombstone character in the body text |
+
+**Five more names are legal or illegal depending on position, so they are not on
+that list.** This is also why a name-based blacklist cannot work: the same name
+converts cleanly in one place and leaks in another. Measured in both directions:
+
+| Name | Legal only when | Illegal use, measured |
+|---|---|---|
+| `\limits`, `\nolimits` | immediately after a big operator (`bigop_prefix`) | `x\nolimits` reports `\nolimits` and gives `m:t` `['x', '\nolimits']` |
+| `\middle` | inside an unclosed `\left`/`\right` pair (`left_right`) | bare use reports it and raises |
+| `\def`, `\newcommand` | defined **and** then referenced (`macro_use`) | defined but never used reports it and produces an **empty** formula |
+
+The allowed side, measured on the same build: after a big operator, a subscripted
+`\sum` with `\nolimits` converts with no report at all; inside a real delimited group
+the `\middle` form converts with no report; `\def`+`\foo{1}` followed by `\foo` converts to
+`['1']`, and so does `\newcommand`+`{`+`\x`+`}{1}` followed by `\x`. The big operators the rule
+knows are exactly those in `BIG_OPERATORS` (`scripts/math_omml.py:557`).
+
+Two details worth knowing before you edit a formula:
+
+- The rule reads the text **immediately** before the command, so a later
+  `\nolimits` after the subscript also trips: `\sum_{i=1}^{n}`+`\nolimits`+` a_i` is reported,
+  because the character before the command is a closing brace, not an operator
+  name. Write it straight after the operator, or drop it — the OMML structure
+  places limits by itself, so `\limits` and `\nolimits` change nothing in the output.
+- At top level `\limits` is silently eaten (`x`+`\limits` becomes `['x']`, no leak), but inside
+  `\text{}` it survives in one token with its neighbour — `\text{a\limits}` gives
+  `['a\limits']` — which layer 2 cannot see. That is exactly why the name stays in
+  layer 1 instead of being trusted to the output scan.
+
+**`\label`, `\eqref` and `\ref`: know which entry point the guard is for.** In the
+whole-document chain `docx_mathify` strips these three before the LaTeX is
+analysed (`_mark_commands`, `scripts/docx_mathify.py:498`, runs before `_analyze`),
+so they become numbering atoms and never reach the converter — layer 1 neither
+sees them nor needs to. The guard is the **single-formula** defence:
+`insert_formula` and a `latex` block in `docx_create` have no such pre-pass, and
+there `\label` would go all the way to the converter as literal text. For numbering in
+a whole document use the numbering segment or `\tag`; for a cross-reference use
+`docx_crossref`.
+
+**Six boundaries, measured with both layers off.** None of these is fixed by this
+round, and each is pinned by a test so it does not read as a new bug:
+
+1. **A rule that takes arguments converts into nothing.** `\rule{1em}{2pt}` alone gives
+   an empty `m:t` and no error; `a \rule{1em}{2pt} b` gives `['a','b']` — the rule simply
+   vanishes. That is conversion distortion, not a leak, so neither layer reports it.
+2. **Spacing commands are swallowed.** `a \hspace{1em} b` gives `['a','b']`. No leak, so
+   `\hspace` is in neither the command table nor the context rules.
+3. **A backslash glued to the previous word is missed by both layers.**
+   `\text{a\zzz b}` becomes the single token `a\zzz` and `find_latex_residue` returns
+   empty. Catching it would mean substring matching, and that fires on ordinary
+   path content: `\text{C:\Users\me}` is a legitimate formula and must not be reported.
+4. **Punctuation or a brace glued to the command hides it.** `\text{a \zzz, b}`,
+   `\text{a (\zzz) b}` and `\text{where \zzz{x}}` all return an empty residue.
+5. **`\limits` is inconsistent between positions.** At top level it is eaten (`x`+`\limits`
+   becomes `['x']`); inside `\text{}` it leaks as `a\limits`, invisible to layer 2.
+   Layer 1 keeps the name for this reason alone.
+6. **A bare `\middle` raised an exception nobody could read.** `latex2mathml` raised
+   `ExtraLeftOrMissingRightError` with `str(e) == ''` and empty `e.args`. Layer 1
+   now replaces that with a message that says what to write instead.
+
+The criterion behind layer 2 is documented in full, together with the measured
+comparison of the three candidate rules — why "the whole `m:t` is a command"
+misses text mode, and why "a backslash anywhere" flags every Windows path:
+[formula-guide](references/formula-guide.md#how-residue-is-recognised).
+
+**Two kinds of failure, and the summary line tells them apart.** Every failure
+`docx_mathify` records now carries a kind. `latex_guard` means the source text
+holds a command OMML cannot express — **fix the document**. `convert` means the
+converter itself raised — **check the environment** (a missing `MML2OMML.XSL`,
+a syntax error, illegal structure). One run of each, measured:
+
+```text
+$ python scripts/docx_mathify.py report.docx --out report-fixed.docx
+段落 4　片段 4　编号段 0　对齐编号块 0　引用域 0　量纲串 0　失败 3（拒收 3，转换 0）　修正上下标 0　修正相量点 0
+error: 3 formula(s) failed to convert
+  FAIL[guard] E=mc^{2} \eqno{(3-1)} -> LaTeX 含 OMML 表达不了的控制序列（…）：\eqno。
+  FAIL[guard] a=b \nonumber -> LaTeX 含 OMML 表达不了的控制序列（…）：\nonumber。
+  FAIL[guard] w=0.5\textwidth -> LaTeX 含 OMML 表达不了的控制序列（…）：\textwidth。
+```
+
+```text
+[with MML2OMML_XSL pointing at Z:\nowhere\MML2OMML.XSL]
+段落 2　片段 2　编号段 0　对齐编号块 0　引用域 0　量纲串 0　失败 2（拒收 0，转换 2）　修正上下标 0　修正相量点 0
+error: 2 formula(s) failed to convert
+  FAIL[convert] x=\frac{a}{b} -> MML2OMML_XSL=Z:\nowhere\MML2OMML.XSL 不是文件
+  FAIL[convert] y=\sqrt{x} -> MML2OMML_XSL=Z:\nowhere\MML2OMML.XSL 不是文件
+```
+
+`失败` is the failure count, `拒收` the rejections and `转换` the converter errors.
+Both kinds exit `3` and the output document is written either way. Three rules
+about that line:
+
+- **The parenthetical appears only when there are failures.** A clean run prints
+  `失败 0` and nothing more, byte-identical to the previous release (a test pins
+  this), so anything that parses the line keeps working.
+- **No new exit code.** D-024 stands: partial success is `3`, and the kind is
+  carried by the `FAIL[guard]` / `FAIL[convert]` prefix on stdout and by the
+  failure record — never by the process status.
+- **Up to ten lines per kind on stdout**; the rest live in the file named by
+  `--report`, which writes **two sections**, one per kind, because they call for
+  opposite repairs:
+
+```text
+## 转换失败 · 守卫拒收（源文本里有 OMML 表达不了的命令，已保留原文）
+## 转换失败 · 转换器报错（多为环境问题：缺 XSL / 语法错 / 结构非法，已保留原文）
+```
+
+**`docx_validate` reports the damage after the fact.** Its criterion is deliberately
+**not** shared with the converter. The converter asks "would this produce
+residue?" and can afford to be strict, because a false positive stops a run a
+human is watching. Validate asks "did this document already ship residue?" while
+walking a file that may have been written a year ago, so it reports and never
+blocks: `ok` stays `true` and the exit code does not move. It scans `<m:t>` only,
+never `<w:t>` — a backslash in body text is legitimate content (`C:\Users\me` in a
+paragraph is correct) — and on a clean document it grows no key at all. The issue
+it adds has this shape, measured:
+
+```json
+{"severity": "warning", "code": "omml_latex_residue", "count": 2, "samples": ["\\zzz", "\\eqno"]}
+```
+
+`count` is the number of `m:t` runs that are wrong — the number a caller acts on —
+and `samples` names the first three distinct commands, so the report says *which*
+without dumping the document. Both sides split the run on whitespace and anchor
+the **token**: against three candidates that is the only rule which catches
+text-mode residue (5 of 5) without flagging a single legitimate path-bearing
+formula (0 of 3) — one accepted blind spot instead of three false positives. One
+new false-positive class comes with it: a path fragment that stands alone as its
+own word, `\text{见 \Users 目录}` → token `\Users`, measured as reported. It is a
+warning, not a failure, and cheaper than missing text mode altogether.
+
+Run it on anything you are about to deliver:
+
+```bash
+python scripts/docx_validate.py report.docx
+```
+
 ## Editing a table cell without destroying its formatting
 
 `set-cell` writes a *flat string* into a cell. Templates are rarely flat: one

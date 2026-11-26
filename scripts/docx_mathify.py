@@ -739,16 +739,64 @@ def _omml_with_phasor(tex: str, stats: dict | None = None):
     return om
 
 
+# ----------------------------------------------------- 失败分类（P27-C · C-1）
+#
+# ``stats["failed"]`` 以前把两类完全不同的失败混在一起：
+#
+# * ``latex_guard`` —— 守卫拒收：源文本里写了 OMML 表达不了的控制序列
+#   （``\eqno`` / ``\textwidth`` / 未知命令…）。**用户该改源文本**，
+#   换台机器、重装 Office、重跑一遍都不会好。
+# * ``convert`` —— 转换器抛错：缺 ``MML2OMML.XSL`` / ``latex2mathml`` 语法错 /
+#   XSLT 应用失败 / ``assert_legal`` 判结构非法。**环境或工具问题**，改源文本
+#   通常没用。
+#
+# 两类都进 ``stats["failed"]``（退出码 3 的判据不变，D-024 一个码都不加），
+# 但每条带 ``kind`` 字段，汇总行与 stderr 据此分开说 —— 否则用户看到「失败 3」
+# 根本不知道该改文档还是该查环境。
+#
+# 判据用 ``stats["latex_guard_hits"]``（P27-A 建的）而不是正则异常文案：
+# 文案是给人读的，改一次措辞就会把分类打歪；计数是结构化事实。做法是调用前
+# 快照长度、异常后比较 —— 命中即本次调用新增了一条拒收记录。
+GUARD_KIND = "latex_guard"
+CONVERT_KIND = "convert"
+
+
+def _classify_failure(stats: dict, guard_before: int) -> str:
+    """本次失败是守卫拒收还是转换器报错（判据见本节顶部注释）。"""
+    hits = stats.get("latex_guard_hits") or []
+    return GUARD_KIND if len(hits) > guard_before else CONVERT_KIND
+
+
+def _guard_marks(stats: dict) -> int:
+    """调用前的快照；与 :func:`_classify_failure` 配对使用。"""
+    return len(stats.get("latex_guard_hits") or [])
+
+
+def _failed_by_kind(stats: dict) -> tuple[list, list]:
+    """把 ``stats["failed"]`` 切成 (守卫拒收, 转换失败) 两份，保序。
+
+    老记录（P27-C 之前写进 ``--report`` 或别处构造的 dict）没有 ``kind`` 键，
+    一律按 ``convert`` 算 —— 那是「不认识的失败」更保守的归类：至少不会把
+    环境问题报成「你写错了」。
+    """
+    guard, convert = [], []
+    for f in stats.get("failed") or []:
+        (guard if f.get("kind") == GUARD_KIND else convert).append(f)
+    return guard, convert
+
+
 def _om_or_text(tex: str, fallback: str, stats: dict) -> list:
     if not tex:
         return []
     runs = _om_or_scripts(tex, None, stats)
     if runs is not None:
         return runs
+    before = _guard_marks(stats)
     try:
         return [_omml_with_phasor(tex, stats)]
     except Exception as exc:
-        stats["failed"].append({"latex": tex, "error": str(exc)[:200]})
+        stats["failed"].append({"latex": tex, "error": str(exc)[:200],
+                                "kind": _classify_failure(stats, before)})
         return [_text_run(None, fallback)]
 
 
@@ -895,10 +943,12 @@ def rebuild(p_el, segs: list[dict], stats: dict,
                 p_el.append(el)
             return
         om = None
+        before = _guard_marks(stats)
         try:
             om = _omml_with_phasor(eqnum["latex"], stats)
         except Exception as exc:                       # 失败 → 退回普通段落
-            stats["failed"].append({"latex": eqnum["latex"], "error": str(exc)[:200]})
+            stats["failed"].append({"latex": eqnum["latex"], "error": str(exc)[:200],
+                                    "kind": _classify_failure(stats, before)})
         if om is not None:
             r = _run_tag()
             r.append(_tab_tag())
@@ -952,10 +1002,12 @@ def rebuild(p_el, segs: list[dict], stats: dict,
             for el in text_runs:
                 p_el.append(el)
             continue
+        before = _guard_marks(stats)
         try:
             om = _omml_with_phasor(seg["latex"], stats)
         except Exception as exc:                       # 失败 → 退回原文
-            stats["failed"].append({"latex": seg["latex"], "error": str(exc)[:200]})
+            stats["failed"].append({"latex": seg["latex"], "error": str(exc)[:200],
+                                    "kind": _classify_failure(stats, before)})
             p_el.append(_text_run(seg["atoms"][0]["rpr"],
                                   "".join(a["ch"] for a in seg["atoms"])))
             continue
@@ -1166,7 +1218,10 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
                  f"量纲串：{stats.get('unit_strings', 0)}　"
                  f"免排版降级：{n_plain}　"
                  f"修正相量点：{stats.get('phasor_fixes', 0)}　"
-                 f"失败：{len(stats['failed'])}", "",
+                 f"失败：{len(stats['failed'])}"
+                 + (f"（拒收 {len(_failed_by_kind(stats)[0])}，"
+                    f"转换 {len(_failed_by_kind(stats)[1])}）"
+                    if stats["failed"] else ""), "",
                  "| # | 段落 | 原线性写法 | 生成的 LaTeX | 编号 | 量纲串（`/` = 每） |",
                  "|---|---|---|---|---|---|"]
         for i, r in enumerate(rows, 1):
@@ -1198,10 +1253,18 @@ def mathify(src: Path, out: Path | None, report: Path | None, tex: Path | None,
             lines += ["", "## ⚠️ 仍需人工确认的上下标", ""]
             for r in left:
                 lines.append(f"- 段落 {r['p']}：`{r['latex']}`")
+        guard_fails, convert_fails = _failed_by_kind(stats)
         if stats["failed"]:
-            lines += ["", "## 转换失败（已保留原文）", ""]
-            for f in stats["failed"]:
-                lines.append(f"- `{f['latex']}` → {f['error']}")
+            # 两类分开列：拒收要改源文本，转换失败要查环境 —— 混在一节里，
+            # 用户会拿着「缺 XSL」的错误去改公式，或者拿着 \eqno 去重装 Office。
+            if guard_fails:
+                lines += ["", "## 转换失败 · 守卫拒收（源文本里有 OMML 表达不了的命令，已保留原文）", ""]
+                for f in guard_fails:
+                    lines.append(f"- `{f['latex']}` → {f['error']}")
+            if convert_fails:
+                lines += ["", "## 转换失败 · 转换器报错（多为环境问题：缺 XSL / 语法错 / 结构非法，已保留原文）", ""]
+                for f in convert_fails:
+                    lines.append(f"- `{f['latex']}` → {f['error']}")
         # 相量点修复失败**不是**转换失败（公式已转成、只是 ``\dot`` 可能仍是
         # limUpp 形态），所以单列一节，别并进上面那段——两件事混在一起，
         # 用户会以为公式没转成。
@@ -1335,16 +1398,27 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     number_align=args.number_align)
 
+    # C-2：汇总行把两类失败分开说。``失败 N`` 是总数（退出码 3 的判据不变），
+    # 后面跟一句拆解 —— 用户读到「拒收」知道该改源文本，读到「转换」知道该查环境。
+    # 只在有失败时才追加拆解，零失败时那行与 P27-C 之前**逐字一致**（有测试钉）。
+    guard_fails, convert_fails = _failed_by_kind(stats)
+    fail_note = ""
+    if stats["failed"]:
+        fail_note = f"（拒收 {len(guard_fails)}，转换 {len(convert_fails)}）"
     print(f"段落 {stats['paragraphs']}　片段 {stats['math_segments']}　"
           f"编号段 {stats.get('eqnum', 0)}　对齐编号块 {stats.get('align_tables', 0)}　"
           f"引用域 {stats.get('refs', 0)}　量纲串 {stats.get('unit_strings', 0)}　"
-          f"失败 {len(stats['failed'])}　"
+          f"失败 {len(stats['failed'])}{fail_note}　"
           f"修正上下标 {len(stats['script_fixes'])}　"
           f"修正相量点 {stats.get('phasor_fixes', 0)}")
     if out:
         print(f"输出: {out}")
-    for f in stats["failed"][:10]:
-        print("  FAIL", f["latex"], "->", f["error"][:120])
+    # C-3：两类分开打、各限 10 条（沿用既有截断）。前缀就是分类本身 —— 不另开
+    # 一节，免得把「失败清单」拆成两处让人对不上总数。
+    for f in guard_fails[:10]:
+        print("  FAIL[guard]", f["latex"], "->", f["error"][:120])
+    for f in convert_fails[:10]:
+        print("  FAIL[convert]", f["latex"], "->", f["error"][:120])
     # 相量点没修好**不算转换失败**（公式本身是好的），所以只提示、不改退出码。
     # 走 stderr：本脚本的 stdout 是给人看的汇总行，诊断一律走另一路。
     perr = stats.get("phasor_errors") or []

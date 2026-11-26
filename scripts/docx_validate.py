@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # MIT License. Part of the Hermes docx skill.
-"""Health-check a .docx package and report issues as JSON.
+r"""Health-check a .docx package and report issues as JSON.
 
 Usage: docx_validate.py file.docx
 
@@ -21,6 +21,15 @@ Checks (health-check tier, NOT full XSD schema validation):
     every reference in it still resolves, so the reference checks above cannot
     see them.  This is *not* XSD validation — it is only the two shapes that
     are cheap to detect and fatal in practice.
+  - **OMML text that is a leftover LaTeX command**: an ``<m:t>`` whose whole
+    text is one control sequence (``\eqno``, ``\textwidth``, ``\zzz``) —
+    ``latex2mathml`` writes an unsupported command out as literal text instead
+    of failing, and the formula renders showing the backslash.  Reported as
+    ``omml_latex_residue`` (**warning**: Word opens these files, it merely
+    draws the text, so this must not change ``ok`` or the exit code).  The
+    scan is limited to ``m:t`` on purpose — a backslash in ``w:t`` is ordinary
+    body text such as ``C:\Users\me`` — and a run must *equal* a command, not
+    merely contain a backslash, so text-mode paths in ``m:t`` stay clean.
   - **restricted run-property values** in every ``word/*.xml`` part: the
     enumerated children of ``<w:rPr>`` whose ``w:val`` comes from a closed
     value list.  Two severities, **decided by what Word 16.0 actually does with
@@ -91,8 +100,9 @@ PR = "http://schemas.openxmlformats.org/package/2006/relationships"
 # not required for a legal drawing (charts, shapes, text boxes).
 WP = ("http://schemas.openxmlformats.org/drawingml/2006/"
       "wordprocessingDrawing")
-# ``m:`` — the Office Math namespace.  Only used by the empty-slot scan below;
-# every other check in this file is about the package or about ``w:`` markup.
+# ``m:`` — the Office Math namespace.  Used by the two OMML text scans below
+# (empty delimiter slots, leftover LaTeX commands); every other check in this
+# file is about the package or about ``w:`` markup.
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 #: Children a ``<w:p>`` / ``<w:tbl>`` may never sit directly inside a run.
@@ -244,6 +254,51 @@ def _issue(issues, severity, code, detail):
 _EFFECT_VALUES = ("blinkBackground", "lights", "sparkle", "none")
 
 _COLOR_STRICT = re.compile(r"^(?:auto|[0-9A-Fa-f]{6})$")
+
+#: One LaTeX control sequence: backslash, ASCII letters, optional ``*``
+#: (``\eqno``, ``\textwidth``, ``\vspace*``).  Anchored, and applied to a
+#: **whitespace-separated token**, never to a bare substring.
+#:
+#: ``latex2mathml`` emits an unsupported control sequence as its own inline
+#: element, so in **math mode** the ``<m:t>`` it lands in holds exactly the
+#: command — but in **text mode** (``\text{…}``) it is merged into one run with
+#: the neighbouring words: ``\text{a \zzz b}`` becomes the single ``<m:t>``
+#: ``a\xa0\zzz\xa0b``.  Two different shapes, so neither "match the whole run"
+#: nor "search for a backslash anywhere" covers both:
+#:
+#:   * whole-run match  — misses every text-mode leak (the run is not just the
+#:     command); ``\text{a \zzz b}`` measured as **not** reported.
+#:   * substring search — fires on ordinary path content: ``C:\Users\me`` has a
+#:     ``\Users`` fragment that is a path component, not a command.
+#:
+#: Splitting the run on whitespace and anchoring **the token** covers both.
+#: ``str.split()`` splits on every space character including NBSP (``\\xa0``),
+#: which is what ``latex2mathml`` uses to space text mode — so ``a\xa0\zzz\xa0b``
+#: yields ``["a", "\\zzz", "b"]`` and the command stands alone, while
+#: ``C:\Users\me`` is a single token that starts with ``C:`` and never matches.
+#:
+#: Known boundaries, measured rather than assumed away:
+#:
+#:   * a backslash **glued** to the preceding word is not separated by any
+#:     whitespace (``\text{a\zzz b}`` → token ``a\zzz``), so it is not
+#:     reported.  Catching it would mean going back to substring matching,
+#:     i.e. re-introducing the path false positives below; layer 1 of
+#:     ``math_omml`` still refuses every command it knows by name.
+#:   * a single-segment path fragment that stands alone as its own word is
+#:     indistinguishable from a command (``\text{见 \Users 目录}`` → token
+#:     ``\Users``).  This is the price of covering text mode at all; measured
+#:     as the only new false positive class, and it is a warning, not an error.
+#:   * a command with punctuation glued to it in text mode is not reported
+#:     (``\text{a \zzz, b}`` → token ``\zzz,``; likewise ``(\zzz)`` and
+#:     ``\zzz{x}``).  Splitting on punctuation as well was tried and made
+#:     nothing better: it fixes none of these (the brace form puts ``\zzz{x``
+#:     in one token either way) while it would start splitting path content.
+#:     So the rule stays "whitespace-separated token", which is the converter
+#:     spelling that actually occurs: text mode separates words with NBSP.
+#:
+#: The set of commands ``latex2mathml`` does not know is unbounded, so this is a
+#: shape test, never a list of forbidden names.
+LATEX_RESIDUE_RE = re.compile(r"^\\[A-Za-z]+\*?$")
 
 
 def _legal_highlight() -> tuple:
@@ -600,6 +655,83 @@ def validate(path: str) -> dict:
                        f"read as the slot separator (``m:sepChr``) by "
                        f"MML2OMML.XSL."),
             "count": empty_slots,
+        })
+
+    # --- OMML text carrying leftover LaTeX commands -----------------------
+    # ``latex2mathml`` does not fail on a control sequence it does not know:
+    # it emits the command **as literal text**, which ``MML2OMML.XSL`` copies
+    # into ``<m:t>``.  The formula then renders as ``\eqno`` / ``\textwidth``
+    # in the body of the document, while the whole chain reports success —
+    # conversion raises nothing, ``docx_mathify`` counts only exceptions in
+    # ``stats["failed"]``, and ``math_omml.assert_legal`` inspects structure,
+    # never text.  Measured on three documents produced that way: every one of
+    # them came back ``{"ok": true, "issues": []}``, exit 0.
+    #
+    # This is the **after-the-fact** half of that guard.  The converter side
+    # rejects such input before it becomes OMML, which treats the cause; this
+    # scan is for documents that already exist — produced by an older skill, by
+    # another tool, or before that refusal shipped.
+    #
+    # Deliberately a **local implementation, not an import** from
+    # ``math_omml``.  This script's whole design is "the package is examined
+    # without the conversion chain": it reads parts with the stdlib (``zipfile``
+    # + lxml) and must keep working on a machine where the conversion
+    # dependencies are absent or half-installed.  ``math_omml`` imports
+    # ``latex2mathml`` at module scope and needs ``MML2OMML.XSL`` from Office;
+    # importing it here would drag both onto a health check.  So the pattern is
+    # duplicated rather than shared: one line of regex is a fair price for an
+    # import edge that would otherwise exist only to save it.
+    #
+    # Severity is **warning** for the reason spelled out above the empty-slot
+    # scan: this report feeds pass/fail decisions downstream, and Word opens
+    # these documents — it merely draws the backslash text.  Content that
+    # shows the wrong thing is worth naming, but it must not reject a file
+    # that opens.  So ``ok`` and the exit code do not move, and a document
+    # with no residue gets no issue at all (no key, no ``count: 0`` noise).
+    #
+    # Why ``<m:t>`` and only ``<m:t>``: a backslash in ``<w:t>`` is ordinary
+    # body text — ``C:\Users\me`` in a paragraph is correct content, not
+    # residue — so the scan must not reach outside the math namespace.  Inside
+    # it, Word's markup does not spell backslash commands, so a run that *is*
+    # one came through from LaTeX.  Note the ``is``: the scan asks whether a run
+    # equals a command, not whether one appears somewhere in it — see
+    # ``LATEX_RESIDUE_RE``, which also records the boundaries it accepts.
+    residue_runs = 0
+    residue_cmds: list[str] = []
+    for math_text in doc_root.iter(f"{{{M}}}t"):
+        # Anchored match against each whitespace-separated **token**, not against
+        # the whole run and not a substring search.  ``split()`` also splits on
+        # NBSP, which is how the converter spaces text mode, so a command inside
+        # ``\text{…}`` still stands alone as a token.  See ``LATEX_RESIDUE_RE``
+        # for the two shapes this reconciles and the two boundaries it accepts.
+        hits = [tok for tok in (math_text.text or "").split()
+                if LATEX_RESIDUE_RE.match(tok)]
+        if not hits:
+            continue
+        # One issue for the whole document, not one per run: the caller needs
+        # "is this formula broken", and a 40-command formula would otherwise
+        # bury every other finding.
+        residue_runs += 1
+        for cmd in hits:
+            if cmd not in residue_cmds:      # de-duplicated, document order
+                residue_cmds.append(cmd)
+    if residue_runs:
+        # Same shape as every other issue here (severity / code / detail), plus
+        # ``count`` (how many math runs are wrong — the number a caller acts on)
+        # and ``samples`` (the first three distinct command names, so the report
+        # says *which* commands without dumping the whole document).
+        issues.append({
+            "severity": "warning",
+            "code": "omml_latex_residue",
+            "detail": (f"document.xml: {residue_runs} ``<m:t>`` run(s) are a "
+                       f"LaTeX command name rendered as literal text "
+                       f"({len(residue_cmds)} distinct); Word shows the "
+                       f"backslash text in the formula. Cause: latex2mathml "
+                       f"emits an unsupported control sequence as plain "
+                       f"text instead of failing, and MML2OMML.XSL copies "
+                       f"it into ``<m:t>``."),
+            "count": residue_runs,
+            "samples": residue_cmds[:3],
         })
 
     # --- footer semantics -------------------------------------------------

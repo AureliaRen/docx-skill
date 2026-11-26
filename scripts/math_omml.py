@@ -15,6 +15,7 @@ import _bootstrap  # noqa: F401 — UTF-8 stdio on Windows
 # --------------------------------------------------------------------------
 
 import os
+import re
 from pathlib import Path
 
 M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
@@ -525,6 +526,398 @@ def keep_spacing(latex: str) -> str:
     return re.sub(r"\\(?:qquad|quad|,|;|:|!)", r"\\ ", latex)
 
 
+# ── 控制序列守卫（P27-A）：LaTeX 专属命令硬拒 + 残留兜底 ─────────────────────
+#
+# ## 为什么需要这一层
+#
+# latex2mathml 对**不认识的控制序列不报错**，而是把它们当字面量塞进 <mi>
+# → MML2OMML.XSL 原样搬进 <m:t>。于是交付物的公式里真的印着 \eqno、\textwidth，
+# 而整条链路四个环节全部沉默：转换不抛、docx_mathify 的 stats["failed"] 只数
+# 异常、退出码只看那个计数、assert_legal 只查结构不看文本。取证见
+# docs/reports/P27-PROBE-CONTROLSEQ.md（48 条矩阵：leak 25 / error 1 / dropped 1
+# / ok 21）。
+#
+# ## 两层，各自不可省
+#
+# 1. **前置硬拒**（find_unsupported_commands）—— 治因。表里穷举「LaTeX 排版
+#    专属、OMML 里没有对应物」的那批命令，命中就在**转换之前**抛 RuntimeError，
+#    并逐条给出替代写法。代价是表永远不全：\zzz 这种用户瞎写的命令不可能预先列出。
+# 2. **后置残留检测**（find_latex_residue）—— 兜底。扫成品 OMML 的每个 m:t，
+#    只要某段文本**整段**就是一条控制序列就拒收。这一层不看命令名，所以任意未知
+#    命令都跑不掉 —— 去掉它就等于把 \zzz 放行。
+#
+# ## 上下文档位是关键，不是锦上添花
+#
+# \nolimits / \middle 这类命令在特定位置是**合法**的：实测
+# \sum\nolimits_{i=1}^{n} a_i 正常、x\nolimits 泄漏；\left(a \middle| b \right)
+# 正常、裸 a \middle| b 报错。按命令名一刀切必然误伤正常公式，所以它们不进
+# 黑名单，而是按位置判定（见 CONTEXT_RULES）。
+
+# \limits / \nolimits 只有**紧跟**大算符时才是合法修饰符。
+BIG_OPERATORS = (
+    "sum", "prod", "coprod", "int", "iint", "iiint", "oint",
+    "bigcup", "bigcap", "bigvee", "bigwedge", "bigoplus", "bigotimes",
+    "bigodot", "biguplus", "lim", "limsup", "liminf", "sup", "inf",
+    "max", "min", "det", "gcd", "Pr",
+)
+
+# 每条命令一行中文替代写法。**只收实测会泄漏的**（P27-PROBE-CONTROLSEQ \② 的 25
+# 条 + work/p27a/probe*.py 复核过的同族扩展）；\hspace（吞间距）、\rule（产空
+# m:oMath）属「转换失真但不泄漏」，另有边界，不进此表（见报告 \8）。
+# \def / \newcommand **也不进**：latex2mathml 会展开简单宏
+# （\def\foo{1}\foo 实测正常），硬拒会误伤；它们由 CONTEXT_RULES 的 macro_use
+# 判据处理（定义了却没用 = 静默产出空公式，那种才拒）。
+LATEX_ONLY_COMMANDS: dict[str, str] = {
+    # —— 编号 / 引用：LaTeX 的 \label-\ref 体系，OMML 里没有对应物 ——
+    # ⚠️ 这三条（label / eqref / ref）**在整篇链路里是死代码，在单条入口上是唯一防线**：
+    #    整篇走 docx_mathify 时，`_mark_commands()`（docx_mathify.py:498）在 `_analyze`
+    #    之前就把它们摘成 special atom 做编号，于是 \label{} 根本到不了
+    #    latex_to_omml_lxml，这一层拦不到、也不需要拦；而单条入口（insert_formula /
+    #    docx_create 的 latex block）**没有**那层预处理，\label 会一路走到
+    #    latex2mathml 变成字面量。所以保留，但说清它是哪条入口的防线。
+    "eqno": r"去掉 \eqno：编号改用 \tag{n}，本仓库的编号链路会把它落成正文里的 (n)",
+    "nonumber": r"去掉 \nonumber：编不编号由编号段 / \tag 决定，不需要逐行压制",
+    "notag": r"去掉 \notag：与 \nonumber 同族，OMML 里没有「这一行不编号」的位",
+    "label": r"去掉 \label{}：交叉引用交给 docx_crossref（书签 + REF 域），公式里不留标签",
+    "eqref": r"改为手写编号，或交给 docx_crossref 生成 REF 域；公式里不写 \eqref{}",
+    "ref": r"改为手写编号，或交给 docx_crossref 生成 REF 域；公式里不写 \ref{}",
+    # —— 版面尺寸：Word 里由段落 / 表格 / 页面设置负责 ——
+    "textwidth": r"改为具体长度（\textwidth 换成绝对值），或把公式放进整行宽的段落",
+    "textheight": "版面高度交给页面设置（docx_create 的 page 段），公式里不要引用",
+    "columnwidth": "改为具体长度；栏宽由 Word 的分栏设置决定",
+    "linewidth": "改为具体长度；行宽由 Word 的段落 / 表格设置决定",
+    "baselineskip": "行距交给段落格式（line_spacing），公式里不要引用",
+    "setlength": r"去掉 \setlength：长度由 docx_create / docx_edit 的格式参数设定",
+    # —— 垂直 / 水平间距：OMML 无对应物，间距交给段落 ——
+    "vspace": r"去掉 \vspace：段间距用段落格式的 space_before / space_after",
+    "hfill": r"去掉 \hfill：要右对齐就用右对齐段落，公式里不写",
+    "vfill": r"去掉 \vfill：垂直填充由页面 / 段落布局负责",
+    "hfil": r"去掉 \hfil：水平填充由对齐方式负责",
+    "smallskip": r"去掉 \smallskip：段间距用段落格式设定",
+    "medskip": r"去掉 \medskip：段间距用段落格式设定",
+    "bigskip": r"去掉 \bigskip：段间距用段落格式设定",
+    "bigskipamount": r"去掉 \bigskipamount：段间距用段落格式设定",
+    # —— 断行 / 断页：Word 里是段落与分页符，不是公式内容 ——
+    "cr": r"去掉 \cr：矩阵 / 对齐环境里换行用双反斜杠，公式外的换行用新段落",
+    "newline": r"去掉 \newline：公式内换行用双反斜杠（或拆成两条公式）",
+    "linebreak": r"去掉 \linebreak：换行交给段落",
+    "nolinebreak": r"去掉 \nolinebreak：断行控制交给段落，或用不换行空格的写法",
+    "pagebreak": r"去掉 \pagebreak：分页用 docx_edit 的分页符，不写在公式里",
+    "newpage": r"去掉 \newpage：分页用 docx_edit 的分页符",
+    "clearpage": r"去掉 \clearpage：分页用 docx_edit 的分页符",
+    "allowbreak": r"去掉 \allowbreak：断行点由排版引擎决定，OMML 无此概念",
+    "break": r"去掉 \break：断行交给段落",
+    "displaybreak": r"去掉 \displaybreak：多行公式的断页由段落分页控制",
+    "allowdisplaybreaks": r"去掉 \allowdisplaybreaks：多行公式的断页由段落分页控制",
+    # —— 表格线 / 列合并：Word 表格里没有「公式内的表格线」——
+    "hline": r"去掉 \hline：表格加边框用 docx_create / table_width 的表框设置",
+    "cline": r"去掉 \cline{}：表格加边框用表框设置",
+    "hrule": r"去掉 \hrule：横线用段落边框或表格边框",
+    "vrule": r"去掉 \vrule：竖线用表格边框",
+    "multicolumn": r"去掉 \multicolumn{}：单元格合并用 docx_edit 的 merge_cells",
+    # —— 盒子：OMML 无对应结构 ——
+    "makebox": r"去掉 \makebox：定宽内容用表格，或改用 \text{}",
+    "raisebox": r"去掉 \raisebox：上下移位交给上下标结构",
+    # —— 宏 / 版面细调：Word 侧无对应物 ——
+    "renewcommand": r"去掉 \renewcommand：latex2mathml 不展开它（实测整串泄漏），改写成可直接转换的命令",
+    "settowidth": r"去掉 \settowidth：它量的是 LaTeX 版面长度，OMML 无等价物；要控制宽度请用表格列宽",
+    "ignorespaces": r"去掉 \ignorespaces：空格由源文本直接控制",
+    "unskip": r"去掉 \unskip：它撤掉的是一个 LaTeX 间距节点，OMML 里没有",
+    "protect": r"去掉 \protect：它是 LaTeX 展开控制的修饰符，OMML 无对应物",
+    # —— 段落：公式片段里不该出现 ——
+    "par": r"去掉 \par：分段用新段落（docx_edit 的 add_paragraph）",
+    "noindent": r"去掉 \noindent：首行缩进用段落格式 first_line_indent",
+    # —— 文本互操作：数学环境里插正文 ——
+    "intertext": r"去掉 \intertext{}：多行公式之间插正文请拆成「公式 + 段落 + 公式」",
+    "shortintertext": r"去掉 \shortintertext{}：同 \intertext，拆成公式与段落",
+    "qed": r"去掉 \qed：证明结束符用 \square / \Box，或在正文里手写 ∎",
+}
+
+# 上下文判据。「按命令名一刀切会误伤」的实测依据见本节顶部注释。
+CONTEXT_RULES: dict[str, dict[str, str]] = {
+    "limits": {
+        "rule": "bigop_prefix",
+        # 为什么留这一条（实测，不是「为口径一致」）：
+        #   * 顶层位置 \limits 会被 latex2mathml **静默吃掉**（`x\limits` → m:t
+        #     ['x']，不泄漏）；
+        #   * 但它出现在 \text{…} 里时会跟着正文一起变字面量：
+        #     `\text{a\limits}` → m:t ['a\\limits'] ——
+        #     而层 2 的整段锚定**看不见这一条**（整段是 `a\limits`，不是 `\limits`）。
+        # 所以「\limits 在本链路上从不泄漏」只对顶层成立；有层 2 的盲区就需要层 1。
+        # 必要性由 test_limits_rule_is_necessary 用「临时摘掉本条 → 静默泄漏」钉死。
+        "reason": r"\limits 只对大算符有意义；非大算符位置会静默失效，在 \text{} 里则会被当字面量印进公式",
+        "suggestion": r"去掉 \limits：上下限摆位由 OMML 的 m:limUpp / m:limLow 结构自动决定，写不写 \limits 结果一样",
+    },
+    "nolimits": {
+        "rule": "bigop_prefix",
+        "reason": r"\nolimits 只对大算符有意义；离开大算符它会被当字面量印进公式",
+        "suggestion": r"去掉 \nolimits：上下限摆位交给 OMML 结构；要压成行内形态就把上下限写成普通上下标（a_{i}）",
+    },
+    "middle": {
+        "rule": "left_right",
+        "reason": r"\middle 只用在 \left … \right 之间",
+        "suggestion": r"去掉 \middle：分隔符直接写 \mid / \| / |；要在定界组里当分隔符，就写成 \left( a \middle| b \right)",
+    },
+    "def": {
+        "rule": "macro_use",
+        "reason": r"宏定义只有被使用才有意义；未被使用的 \def 会产出一条空公式",
+        "suggestion": r"去掉 \def：直接把展开后的内容写进公式（要用宏就确保后面真的引用了它）",
+    },
+    "newcommand": {
+        "rule": "macro_use",
+        "reason": r"宏定义只有被使用才有意义；未被使用的 \newcommand 会产出一条空公式",
+        "suggestion": r"去掉 \newcommand：直接把展开后的内容写进公式（要用宏就确保后面真的引用了它）",
+    },
+}
+
+_CMD_RE = re.compile(r"\\([A-Za-z]+)(\*?)")
+_RESIDUE_RE = re.compile(r"^\\[A-Za-z]+\*?$")
+_LEFT_RIGHT_RE = re.compile(r"\\(left|right)(?![A-Za-z])")
+_MACRO_NAME_RE = re.compile(r"[ \t]*\{?[ \t]*\\([A-Za-z]+)")
+
+
+def _rule_bigop_prefix(latex: str, start: int, _end: int) -> bool:
+    r"""前面（跳过空白）紧跟一个大算符 → 放行。
+
+    实测两态：\sum\nolimits_{i=1}^{n} a_i 正常转成上下限结构；x\nolimits 把命令名
+    整串印进 m:t。判据是「紧邻」而不是「附近有」：\sum_{i=1}^{n}\nolimits 同样
+    泄漏（前缀以右花括号结尾，不是大算符）。
+    """
+    prefix = latex[:start].rstrip()
+    return any(prefix.endswith("\\" + op) for op in BIG_OPERATORS)
+
+
+def _rule_left_right(latex: str, start: int, _end: int) -> bool:
+    r"""位置落在某个未闭合的 \left … \right 区间内 → 放行。
+
+    实测两态：\left(a \middle| b\right) 正常；裸 a \middle| b 由 latex2mathml 抛
+    ExtraLeftOrMissingRightError（消息是空串，用户看不出为什么）。
+    """
+    depth = 0
+    for m in _LEFT_RIGHT_RE.finditer(latex, 0, start):
+        depth += 1 if m.group(1) == "left" else -1
+    return depth > 0
+
+
+def _rule_macro_use(latex: str, _start: int, end: int) -> bool:
+    r"""宏被定义了**且**在后面被引用 → 放行；定义了没用 → 拒。
+
+    实测：\def\foo{1}\foo 与 \newcommand{\x}{1}\x 上游会展开、结果正常；而
+    \newcommand{\x}{1} 单独写产出一条空 m:oMath（内容被静默丢掉）。
+    """
+    rest = latex[end:]
+    m = _MACRO_NAME_RE.match(rest)
+    if not m:
+        return False
+    return ("\\" + m.group(1)) in rest[m.end():]
+
+
+_CONTEXT_PREDICATES = {
+    "bigop_prefix": _rule_bigop_prefix,
+    "left_right": _rule_left_right,
+    "macro_use": _rule_macro_use,
+}
+
+
+def _context_allows(latex: str, m) -> bool | None:
+    r"""True 放行 / False 拒 / None 表示这条命令不在上下文表里。"""
+    rule = CONTEXT_RULES.get(m.group(1))
+    if rule is None:
+        return None
+    return _CONTEXT_PREDICATES[rule["rule"]](latex, m.start(), m.end())
+
+
+def find_unsupported_commands(latex: str) -> list[dict]:
+    r"""层 1：找出会在 OMML 里变成反斜杠字面量的控制序列。
+
+    返回 [{"command", "star", "position", "reason", "suggestion"}, …]，按源文本
+    出现顺序、同名只留第一条。**未知命令不在本函数的射程内** —— \zzz 这种谁都
+    想不到的命令由 find_latex_residue 兜。
+
+    带星号（\vspace*{1em}）与带参数（\vspace{1em}）都按同一个命令名识别：星号只
+    影响 LaTeX 语义，不影响它会被当字面量印进公式。
+
+    \settowidth{\x}{y} 内层的 \x 属未知命令，**不在这里判**（它自己独占一个 m:t，
+    层 2 会抓到）；本函数也不会因为「里面还有未知命令」就放过外层已知命令。
+    """
+    hits: list[dict] = []
+    seen: set[str] = set()
+    text = latex or ""
+    for m in _CMD_RE.finditer(text):
+        name = m.group(1)
+        if name in seen:
+            continue
+        verdict = _context_allows(text, m)
+        if verdict is True:
+            continue
+        if verdict is None and name not in LATEX_ONLY_COMMANDS:
+            continue                      # 未知命令：交给后置残留检测
+        seen.add(name)
+        if verdict is False:
+            info = CONTEXT_RULES[name]
+            reason, suggestion = info["reason"], info["suggestion"]
+        else:
+            reason = ("LaTeX 排版专属命令（编号 / 引用 / 版面尺寸 / 断行 / 表格线 / "
+                      "宏），OMML 里没有对应结构，必然无处安放")
+            suggestion = LATEX_ONLY_COMMANDS[name]
+        hits.append({
+            "command": "\\" + name,
+            "star": bool(m.group(2)),
+            "position": m.start(),
+            "context": verdict is False,
+            "reason": reason,
+            "suggestion": suggestion,
+        })
+    return hits
+
+
+def _guard_hit(stats: dict | None, layer: str, latex: str,
+               commands: list[str]) -> None:
+    r"""记一次拒收。
+
+    stats 的口径（P27-A 约定，两选一取这个）：命中即累进 stats["latex_guard"]
+    （拒收条数），并把明细 append 进 stats["latex_guard_hits"]
+    （{"latex", "layer", "commands"}，layer 是 "pre" 或 "residue"）。
+    **不回滚此前已累进的排版计数**（upright_split 等）—— 层 2 的检查位置按约定
+    必须在 split_runs_for_upright 之后（那里才扫得到最终树），而那时拆 run 的
+    计数已经落库。下游要区分「拒收」与「转换失败」看 latex_guard，不要看 failed
+    （后者只数异常）。
+    """
+    if stats is None:
+        return
+    stats["latex_guard"] = stats.get("latex_guard", 0) + 1
+    stats.setdefault("latex_guard_hits", []).append(
+        {"latex": latex, "layer": layer, "commands": list(commands)})
+
+
+def assert_no_unsupported_commands(latex: str, stats: dict | None = None) -> None:
+    r"""层 1 的出口：命中就抛 RuntimeError，四段文案（症状 / 成因 / 替代 / 怎么做）。
+
+    调用位置在 latex_to_omml_lxml 里 keep_spacing() **之前** —— 必须扫**原始**
+    参数：keep_spacing 会把 \quad / \, 改写成控制空格的形态，扫改写后的串会漏判；
+    而且这一层在 latex2mathml 之前就拦下，报错能直接给替代写法，用户不必去读
+    上游那个语义不明的语法异常。
+    """
+    hits = find_unsupported_commands(latex)
+    if not hits:
+        return
+    _guard_hit(stats, "pre", latex, [h["command"] for h in hits])
+    # 上下文类命中要带上「为什么这次不行」：同一个 \nolimits 在 \sum 后面是好的，
+    # 光给替代写法会让用户以为这条命令一律不许用。
+    detail = "\n".join(
+        "  - %s%s → %s" % (h["command"], "*" if h["star"] else "",
+                          ("（%s）" % h["reason"] if h["context"] else "") + h["suggestion"])
+        for h in hits)
+    # 编号 / 引用那三条的适用范围要说清：整篇链路里 docx_mathify 的 _mark_commands
+    # 会先把它们摘成编号原子（_analyze 之前，docx_mathify.py:498），所以它们到不了
+    # 这里 —— 这一层对它们是「单条入口的唯一防线」，不是「整篇链路的拦截点」。
+    numbering = sorted({"label", "eqref", "ref"} &
+                       {h["command"].lstrip(chr(92)) for h in hits})
+    if numbering:
+        tail = ("注意：你命中的 %s 属于编号 / 引用类。整篇走 docx_mathify 时，它的 "
+                "_mark_commands 会先把这些命令摘成编号原子，不会走到这条守卫；"
+                "也就是说这一层拦的是**单条入口**（insert_formula / docx_create 的 "
+                "latex block），那里没有那层预处理。整篇链路要改编号请用 "
+                "docx_mathify 的编号段 / \\tag。"
+                % "、".join("\\" + n for n in numbering))
+    else:
+        tail = ""
+    raise RuntimeError(
+        "LaTeX 含 OMML 表达不了的控制序列（%r）：%s。\n"
+        "症状：换成 Word 公式时，命令名可能被当字面量印进公式（例如 \\eqno 原样"
+        "出现在公式末尾，回读 document.xml 能搜到以反斜杠开头的 m:t）；也可能直接"
+        "抛一个看不懂的语法异常，或者把整条公式静默吞成空的。三种表现都说明这条"
+        "命令没有 OMML 对应物。\n"
+        "成因：这些命令是 LaTeX 的排版专属（编号 / 引用 / 版面尺寸 / 断行断页 / "
+        "表格线 / 宏定义），OMML 里没有对应结构；latex2mathml 对它们要么当普通字符"
+        "塞进 <mi>，要么在语法检查上直接失败。\n"
+        "替代写法：\n%s\n"
+        "怎么做：把源文本里的这些命令按上面的替代写法改掉再转。"
+        "%s"
+        % (latex, "、".join(h["command"] for h in hits), detail, tail))
+
+
+def find_latex_residue(omml) -> list[str]:
+    r"""层 2：扫成品 OMML 里所有 m:t 的文本，收**以空白为界的词本身是一条命令**的残留。
+
+    返回去重保序的命令名（**带**反斜杠，如 "\zzz"）；干净时返回空列表。
+
+    ## 判据：以空白为界的**词**（token），不是整段 m:t、也不是任意位置
+
+    两个更朴素的判据各自有一个洞，实测都堵不住：
+
+    * **整段锚定**（`^\[A-Za-z]+\*?$` 匹配整条 m:t）**漏文本模式**：
+      命令写在 `\text{}` 里时与前后正文**共享一段 m:t** ——
+      `\text{a \zzz b}` 转出来是 `m:t` = `a` + NBSP + `\zzz` + NBSP + `b`，
+      整段不是单条命令，判据看不见（实测漏，5/5 文本模式全漏）。
+    * **任意位置匹配**（`\[A-Za-z]+` 在整段里 search）**误伤正文**：
+      `\text{C:\Users\me}` 的 m:t 是 `C:\Users\me` —— 一个 Windows
+      路径，任意位置会把 `\Users` 当残留，把一条完全正常的公式判死。
+
+    取中间：**先按空白把 m:t 切成 token，再对每个 token 做整段锚定**。`str.split()`
+    恰好按 Unicode 空白切分，**包含 NBSP（U+00A0）** —— 而 latex2mathml 在 `\text{}`
+    里正是用 NBSP 填空白，所以 `a\xa0\zzz\xa0b` 切得出 `['a', '\zzz', 'b']`；
+    而 `C:\Users\me` 切出来仍是一个 token（开头是 `C:`），不命中。
+
+    ## 实测三判据对照（work/p27a/tok.py，本机 latex2mathml 3.81.1）
+
+    | 判据 | 25 条数学模式泄漏 | 文本模式残留 | 合法公式误报 |
+    |---|---|---|---|
+    | 整段锚定 | 25/25 | **0/5** | 0 |
+    | 任意位置 | 25/25 | 5/5 | **3 条** |
+    | **按空白切词** | **25/25** | **5/5** | **0** |
+
+    **只认 m: 命名空间的 m:t**：w:t 里的反斜杠是合法正文（`C:\Users` 那种路径），不能报。
+
+    ## 已知边界（写清现状，别当没有）
+
+    1. **反斜杠紧贴字母时仍漏**：`\text{a\zzz b}` 的 m:t 是 `a\zzz\xa0b`，
+       切出来的 token 是 `a\zzz` —— 不是单条命令，本判据**不命中**。抓它必须回到
+       「任意位置匹配」，而那样上面三条路径公式会全被误伤。这个取舍是刻意的，
+       由 `test_residue_known_blind_spot_glued` 钉住，别让人以为是 bug。
+    2. **已知命令在文本模式由层 1 兜**：`\text{\eqno}` / `\text{\limits}` 这类
+       （层 1 的表里有名字）到不了层 2。所以边界 1 只对**完全未知**命令成立 ——
+       而未知命令本来就没有替代写法可给，报出来的价值也最低。
+    3. 未展开的 `\protect\foo` 两者挤在同一 token 里也不命中；`\protect` 在层 1 表里。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in omml.iter(_m("t")):
+        # str.split() 无参 = 按任意 Unicode 空白切，含 NBSP（U+00A0）——
+        # latex2mathml 在 \text{} 里正是用 NBSP 填空白，这是本判据成立的前提。
+        for token in (t.text or "").split():
+            if token in seen:
+                continue
+            if _RESIDUE_RE.match(token):
+                seen.add(token)
+                out.append(token)
+    return out
+
+
+def assert_no_latex_residue(omml, latex: str, stats: dict | None = None) -> None:
+    r"""层 2 的出口：产物里还有整段控制序列就抛 RuntimeError。
+
+    调用位置在 latex_to_omml_lxml 里 split_runs_for_upright **之后**、最后一次
+    assert_legal **之前**：split 会重建 m:r / m:t，扫最终树才正确。
+    """
+    residue = find_latex_residue(omml)
+    if not residue:
+        return
+    _guard_hit(stats, "residue", latex, residue)
+    raise RuntimeError(
+        "OMML 产物里残留了 LaTeX 控制序列（%r）：%s。\n"
+        "症状：公式里印着反斜杠命令名（例如 \\zzz 整串出现），Word 里就是一串带"
+        "反斜杠的怪字符，交付物上直接看得到。\n"
+        "成因：这条命令 latex2mathml 不认识，被当字面量搬进了 <m:t>；它不在已知的"
+        "「LaTeX 排版专属」清单里，所以只能靠这层文本扫描兜住 —— 任意未知命令都会"
+        "走到这里。\n"
+        "替代写法：把该命令换成等效的 LaTeX（希腊字母 / 运算符 / 结构命令），或"
+        "直接从公式里删掉。要正文里的反斜杠字形请写 \\backslash。\n"
+        "怎么做：按上面点名的命令逐个改源文本。若这条公式是程序拼出来的，检查拼串"
+        "时有没有把排版命令一起拼进去。"
+        % (latex, "、".join(residue)))
+
+
 def latex_to_omml_lxml(latex: str, display: bool = False,
                        raw_spacing: bool = False, stats: dict | None = None):
     r"""LaTeX → OMML 的 lxml 元素（``m:oMath`` 或 ``m:oMathPara``）。
@@ -576,6 +969,11 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
 
     from lxml import etree
 
+    # 层 1（前置硬拒）：必须在 keep_spacing **之前**扫原始参数 —— 那一步会把
+    # \quad / \, 改写成控制空格，扫改写后的串会漏判；也要在 latex2mathml 之前，
+    # 这样报错能直接给替代写法，而不是让用户去读上游那个语义不明的语法异常。
+    assert_no_unsupported_commands(latex, stats)
+
     src = latex if raw_spacing else keep_spacing(latex)
     try:
         mathml = lconv.convert(src)
@@ -618,6 +1016,9 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
     # 顺序关键：拆 run 要 deepcopy 已注入的 w:rPr，所以必须在 apply_math_font 之后。
     split_runs_for_upright(out, stats)
     align_cases_left(mml_root, out, stats)
+    # 层 2（后置残留检测）：必须在 split_runs_for_upright **之后** —— 那一步会重建
+    # m:r / m:t，在它之前扫到的是中间态；扫最终树才正确。
+    assert_no_latex_residue(out, latex, stats)
     # 拆 run 重写了 m:r 的结构，第一次 assert_legal 只覆盖了 XSLT 的产物，必须复检。
     assert_legal(out, latex)
     return out

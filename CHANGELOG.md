@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-26
+
+A silent-delivery round. LaTeX commands that OMML has no structure for - `\eqno`,
+`\nonumber`, `\textwidth`, `\hline`, `\newpage` and 43 more - used to reach the document as
+**literal text inside the equation**: `latex2mathml` emits an unsupported control
+sequence as plain text instead of failing, `MML2OMML.XSL` copies it into an `<m:t>`
+run, and Word draws the backslash and the command name where the equation should
+be. Nothing in the toolkit objected. Measured on a four-paragraph document
+carrying three such commands, with the new guards patched out: `docx_mathify`
+printed `失败 0` and exited `0`, `docx_validate` returned `ok: true` with no
+residue key, and the file held three backslash-only `m:t` runs. Every check was
+green while the deliverable was visibly wrong - a defect in what the toolkit
+*reported*, not a feature it lacked.
+
+### Added
+
+- **A pre-emptive control-sequence guard, `assert_no_unsupported_commands()`.**
+  Runs at the head of `latex_to_omml_lxml`, before `keep_spacing`, and refuses the
+  48 LaTeX-only names OMML cannot express (`LATEX_ONLY_COMMANDS`), each with the
+  replacement to write instead - numbering to `\tag` or the numbering segment,
+  cross-references to `docx_crossref`, page and column dimensions to the `page`
+  block, spacing and breaks to paragraph formatting, table rules to border
+  settings, macros to expanded text. Refusing at the source is the only place a
+  message can explain **why**: once the command has become text, nothing
+  downstream knows what it was meant to do.
+- **Five position-dependent names on the same guard.** `\limits`, `\nolimits`,
+  `\middle`, `\def` and `\newcommand` are legal in one position and leak in another, so
+  `CONTEXT_RULES` decides by looking around the command instead of at its name:
+  `bigop_prefix` (immediately after one of the 25 `BIG_OPERATORS`), `left_right`
+  (inside an unclosed pair of `\left` and `\right`), `macro_use` (defined and then
+  referenced). A name-based blacklist cannot do this: measured on one build, a
+  subscripted `\sum` with `\nolimits` converts cleanly while `x\nolimits` leaks, and a
+  used `\newcommand` yields `['1']` while an unused one yields an **empty** formula.
+- **A post-conversion residue guard, `assert_no_latex_residue()`.** Runs after
+  `split_runs_for_upright` so it scans the final tree, and reports any command
+  that survived as literal text - including ones nobody has catalogued, which is
+  the whole reason it exists next to the name list. The criterion is that the
+  whitespace-separated token *is* a command; measured against three candidates it
+  is the only one that catches text-mode residue (5 of 5) without flagging a
+  legitimate path-bearing formula (0 of 3). Whole-run anchoring misses every
+  text-mode leak because the command shares its run with the surrounding words;
+  substring matching flags `\text{C:\Users\me}`. It works because `str.split()` splits
+  on NBSP, which is how `latex2mathml` spaces text mode.
+- **`docx_validate` reports `omml_latex_residue`.** `<m:t>` runs whose text is a
+  command name are counted into one `warning` issue carrying `count` and the first
+  three distinct `samples`. `<w:t>` is never scanned - a backslash in body text is
+  legitimate content. Severity is `warning` on purpose: this check inspects a
+  document that may already be on someone's disk, so `ok` and the exit code stay
+  put and a clean document does not grow the key. Both sides share the shape test
+  but not the consequence: the converter may refuse, the health check may not.
+
+### Changed
+
+- **`docx_mathify` failures carry a kind.** `latex_guard` means the source text
+  holds a command OMML cannot express (fix the document); `convert` means the
+  converter raised (check the environment - a missing `MML2OMML.XSL`, a syntax
+  error, illegal structure). The two used to arrive in one undifferentiated list,
+  which sent readers to reinstall Office over a `\eqno` and to edit a formula over
+  a missing stylesheet.
+- **The summary line splits the failure count.** `失败 N（拒收 M，转换 K）` - the total
+  is unchanged, so `N` still matches the exit code, and the parenthetical names how
+  many are which. It appears **only when there is at least one failure**: a clean
+  run still prints `失败 0` and nothing else, byte-identical to the previous
+  release, so anything parsing that line keeps working.
+- **`FAIL[guard]` / `FAIL[convert]` prefixes on stdout**, up to ten lines of each
+  kind. The prefix *is* the classification - no extra section, so the count in the
+  summary and the count of printed lines cannot drift apart.
+- **`--report` writes two sections**, one per kind, each naming the repair it
+  wants. Mixed together, the reader takes a missing-XSL error to the formula and a
+  `\eqno` to the installer.
+
+**No new exit code.** D-024 stands: a document with at least one failed formula is
+still `3`, both kinds included, and the output file is still written. The kind is
+carried by the prefix on stdout and by the failure record, never by the process
+status.
+
 ## [1.3.1] - 2026-11-26
 
 A delimiter round. A bracket group whose first item is a unary sign —
@@ -744,6 +820,7 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 - An existing `X.bak` is overwritten on the next in-place apply. The command
   says so on stdout; it does not rotate backups.
 
+[1.3.2]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.2
 [1.3.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.1
 [1.3.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.0
 [1.2.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.1

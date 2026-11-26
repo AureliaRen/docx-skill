@@ -746,6 +746,237 @@ print(len(bad))          # 0 才是干净的
 ```
 
 `docx_validate` 现在把同一件事报成 `omml_empty_slot` issue（只报不崩：`ok` 与退出码都不变），`assert_legal()` 也把「`m:d` 里的空 `m:e`」列为第三类结构错误，与 `m:oMath` 嵌套、`m:rad` 缺 `m:e` 并列，所以刚转出来的公式不可能再无声无息地落进文档。完整机制、更宽矩阵与相邻的坑见 [formula-guide](references/formula-guide.md#a-unary-sign-at-the-head-of-a-delimiter-group)。
+
+### OMML 表达不了的 48 个命令
+
+LaTeX 源文本里到处是只对排版引擎有意义的命令：`\eqno`、`\nonumber`、`\textwidth`、`\hline`、`\newpage`。
+OMML 里没有它们的任何对应结构，而这一轮之前，转换链对它们也**没有任何意见**：`latex2mathml`
+把不认识的控制序列当字面量输出，`MML2OMML.XSL` 把它搬进一个 `m:t` run，Word 就**在公式里**画出
+那个反斜杠和命令名。公式其余部分都是对的：分式是真的分式，文档也照常打开。
+
+**真正的缺陷是：没有任何一处报错。** 在一份四段文档上实测（里面带 `\eqno`、`\nonumber`、`\textwidth`），
+把两个守卫层都摘掉后：
+
+| 读数 | 值 |
+|---|---|
+| `docx_mathify` 汇总行 | `… 失败 0 …`，失败字段读作零 |
+| `docx_mathify` 退出码 | `0` |
+| `docx_validate` | `ok: true`，连 `omml_latex_residue` 这个键都没有 |
+| 整段文本就是一条反斜杠命令的 `m:t` run | **3** 条（`\eqno`、`\nonumber`、`\textwidth`） |
+
+工具集的每一项检查都是绿的，而交付物里躺着三条字面命令。同一份文档换上守卫后报
+`失败 3（拒收 3，转换 0）`、退出 `3`、回读反斜杠 run 为 0。这一轮修的是**静默交付缺陷**，不是补功能。
+
+**三层，各答一个另外两层答不了的问题。**
+
+| 层 | 跑在哪 | 覆盖什么 | 做什么 |
+|---|---|---|---|
+| 1. 事前硬拒 | `scripts/math_omml.py:975`，在 `keep_spacing` 之前 | 48 个已知 LaTeX 排版专属命令名，再加 5 个位置相关的 | 抛错，逐条点名并给出该改成什么 |
+| 2. 事后残留扫描 | `scripts/math_omml.py:1021`，在 `split_runs_for_upright` 之后 | **任意**命令，包括没听说过的 | 抛错，把在产物里查到的命令照原样报出来 |
+| 3. 事后体检 | `scripts/docx_validate.py`，code `omml_latex_residue` | 已经落盘的文档 | 加一条 warning；`ok` 与退出码都不动 |
+
+层 1 是唯一能解释**为什么**的一层，因为它在源文本上工作、命令名那时还是名字 —— 但它需要一张清单，
+而清单是封闭的。层 2 读产物，所以它覆盖的是「未知命令」这个无界集合；它的短板是只看得见以独立 token
+形态活下来的命令。层 3 跑在两个转换器侧守卫都到不了的地方：上个月由旧版本写出来、今天才被打开的文件。
+它必须不动任何退出码，因为「这份存档有残留」不等于「这一次运行失败了」。
+
+**48 个命令名，按源码的分组列出。** 层 1 按命令名精确匹配，所以下面每一个名字出现在任何位置都会被拒；
+右列就是错误信息里打印的替代写法。
+
+编号 / 引用 —— LaTeX 的 `\label`/`\ref` 体系，OMML 里没有对应物：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\eqno` | 去掉 `\eqno`：编号改用 `\tag{n}`，本仓库的编号链路会把它落成正文里的 `(n)` |
+| `\nonumber` | 去掉 `\nonumber`：编不编号由编号段 / `\tag` 决定，不需要逐行压制 |
+| `\notag` | 去掉 `\notag`：与 `\nonumber` 同族，OMML 里没有「这一行不编号」的位 |
+| `\label` | 去掉 `\label{}`：交叉引用交给 `docx_crossref`（书签 + REF 域），公式里不留标签 |
+| `\eqref` | 改为手写编号，或交给 `docx_crossref` 生成 REF 域；公式里不写 `\eqref{}` |
+| `\ref` | 改为手写编号，或交给 `docx_crossref` 生成 REF 域；公式里不写 `\ref{}` |
+
+版面尺寸 —— Word 里由段落 / 表格 / 页面设置负责：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\textwidth` | 改为具体长度，或把公式放进整行宽的段落 |
+| `\textheight` | 版面高度交给页面设置（`docx_create` 的 `page` 段），公式里不要引用 |
+| `\columnwidth` | 改为具体长度；栏宽由 Word 的分栏设置决定 |
+| `\linewidth` | 改为具体长度；行宽由 Word 的段落 / 表格设置决定 |
+| `\baselineskip` | 行距交给段落格式（`line_spacing`），公式里不要引用 |
+| `\setlength` | 去掉 `\setlength`：长度由 `docx_create` / `docx_edit` 的格式参数设定 |
+
+垂直 / 水平间距 —— OMML 没有间距节点，间距归段落：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\vspace` | 去掉 `\vspace`：段间距用段落格式的 `space_before` / `space_after` |
+| `\hfill` | 去掉 `\hfill`：要右对齐就用右对齐段落，公式里不写 |
+| `\vfill` | 去掉 `\vfill`：垂直填充由页面 / 段落布局负责 |
+| `\hfil` | 去掉 `\hfil`：水平填充由对齐方式负责 |
+| `\smallskip` | 去掉 `\smallskip`：段间距用段落格式设定 |
+| `\medskip` | 去掉 `\medskip`：段间距用段落格式设定 |
+| `\bigskip` | 去掉 `\bigskip`：段间距用段落格式设定 |
+| `\bigskipamount` | 去掉 `\bigskipamount`：段间距用段落格式设定 |
+
+断行 / 断页 —— 换行是段落或分页符，不是公式内容：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\cr` | 去掉 `\cr`：矩阵 / 对齐环境里换行用双反斜杠，公式外的换行用新段落 |
+| `\newline` | 去掉 `\newline`：公式内换行用双反斜杠（或拆成两条公式） |
+| `\linebreak` | 去掉 `\linebreak`：换行交给段落 |
+| `\nolinebreak` | 去掉 `\nolinebreak`：断行控制交给段落，或用不换行空格的写法 |
+| `\pagebreak` | 去掉 `\pagebreak`：分页用 `docx_edit` 的分页符，不写在公式里 |
+| `\newpage` | 去掉 `\newpage`：分页用 `docx_edit` 的分页符 |
+| `\clearpage` | 去掉 `\clearpage`：分页用 `docx_edit` 的分页符 |
+| `\allowbreak` | 去掉 `\allowbreak`：断行点由排版引擎决定，OMML 无此概念 |
+| `\break` | 去掉 `\break`：断行交给段落 |
+| `\displaybreak` | 去掉 `\displaybreak`：多行公式的断页由段落分页控制 |
+| `\allowdisplaybreaks` | 去掉 `\allowdisplaybreaks`：多行公式的断页由段落分页控制 |
+
+表格线 / 列合并 —— 是边框设置，不是公式内容：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\hline` | 去掉 `\hline`：表格加边框用 `docx_create` / `table_width` 的表框设置 |
+| `\cline` | 去掉 `\cline{}`：表格加边框用表框设置 |
+| `\hrule` | 去掉 `\hrule`：横线用段落边框或表格边框 |
+| `\vrule` | 去掉 `\vrule`：竖线用表格边框 |
+| `\multicolumn` | 去掉 `\multicolumn{}`：单元格合并用 `docx_edit` 的 `merge_cells` |
+
+盒子 —— OMML 无对应结构：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\makebox` | 去掉 `\makebox`：定宽内容用表格，或改用 `\text{}` |
+| `\raisebox` | 去掉 `\raisebox`：上下移位交给上下标结构 |
+
+宏 / 版面细调 —— Word 侧没有对应物：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\renewcommand` | 去掉 `\renewcommand`：`latex2mathml` 不展开它（实测整串泄漏），改写成可直接转换的命令 |
+| `\settowidth` | 去掉 `\settowidth`：它量的是 LaTeX 版面长度，OMML 无等价物；要控制宽度请用表格列宽 |
+| `\ignorespaces` | 去掉 `\ignorespaces`：空格由源文本直接控制 |
+| `\unskip` | 去掉 `\unskip`：它撤掉的是一个 LaTeX 间距节点，OMML 里没有 |
+| `\protect` | 去掉 `\protect`：它是 LaTeX 展开控制的修饰符，OMML 无对应物 |
+
+段落 —— 公式片段不是段落：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\par` | 去掉 `\par`：分段用新段落（`docx_edit` 的 `add_paragraph`） |
+| `\noindent` | 去掉 `\noindent`：首行缩进用段落格式 `first_line_indent` |
+
+与正文互操作：
+
+| 命令 | 替代写法 |
+|---|---|
+| `\intertext` | 去掉 `\intertext{}`：多行公式之间插正文请拆成「公式 + 段落 + 公式」 |
+| `\shortintertext` | 去掉 `\shortintertext{}`：同 `\intertext`，拆成公式与段落 |
+| `\qed` | 去掉 `\qed`：证明结束符用 `\square` / `\Box`，或在正文里手写 ∎ |
+
+**另有 5 个名字合法与否取决于位置，所以不进上面那张表。** 这正也是「按命令名一刀切行不通」的原因：
+同一个名字在一处转得干干净净，在另一处就泄漏。两个方向都实测过：
+
+| 名字 | 只在什么位置合法 | 非法位置实测 |
+|---|---|---|
+| `\limits`、`\nolimits` | 紧跟大算符（`bigop_prefix`） | `x\nolimits` 命中 `\nolimits`，`m:t` 是 `['x', '\nolimits']` |
+| `\middle` | 在一个未闭合的 `\left`/`\right` 对里（`left_right`） | 裸用命中并抛错 |
+| `\def`、`\newcommand` | 定义了**且**后面真的引用（`macro_use`） | 只定义不引用命中，并产出**空**公式 |
+
+合法的一侧也实测了：大算符后接带下标的 `\sum` 再写 `\nolimits`，零命中；真的放在定界组里 `\middle` 形式零命中；
+`\def`+`\foo{1}` 后接 `\foo` 转出 `['1']`，`\newcommand`+`{`+`\x`+`}{1}` 后接 `\x` 同样转出 `['1']`。这条规则认的大算符
+就是 `BIG_OPERATORS` 里那 25 个（`scripts/math_omml.py:557`）。
+
+动手改公式前值得知道的两个细节：
+
+- 规则读的是命令**紧邻**前面的那段文本，所以把 `\nolimits` 写在上下标之后一样会命中：
+  `\sum_{i=1}^{n}`+`\nolimits`+` a_i` 会被报，因为命令前一个字符是右花括号而不是算符名。要么紧贴算符写，
+  要么直接去掉 —— 上下限摆位由 OMML 结构自己决定，写不写 `\limits` / `\nolimits` 对产物没影响。
+- 顶层位置 `\limits` 会被静默吃掉（`x`+`\limits` 转成 `['x']`，不泄漏），但放进 `\text{}` 里它就和邻居挤进同一个
+  token（`\text{a\limits}` 得 `['a\limits']`），层 2 看不见 —— 名字留在层 1 而不是交给产物扫描，就是为了这个。
+
+**`\label`、`\eqref`、`\ref`：先分清守卫是给哪条入口的。** 整篇链路上 `docx_mathify` 在分析之前就把这三个
+摘掉了（`_mark_commands`，`scripts/docx_mathify.py:498`，在 `_analyze` 之前跑），它们变成编号原子、根本到不了
+转换器 —— 层 1 既看不见也不需要看见。这条守卫是**单条公式**入口的防线：`insert_formula` 和
+`docx_create` 的 `latex` block 没有那层预处理，在那里 `\label` 会一路走到转换器变成字面量。整篇编号请用
+编号段或 `\tag`，交叉引用请用 `docx_crossref`。
+
+**六条已知边界，都是把两层守卫全关掉测出来的。** 这一轮不修它们，每条都有测试钉住，免得被当成新 bug：
+
+1. **带参数、自己就是一条规则的命令会转成空。** `\rule{1em}{2pt}` 单独出现给出空 `m:t` 且不报错；
+   `a \rule{1em}{2pt} b` 给出 `['a','b']` —— 这条横线直接消失。那是转换失真不是泄漏，两层都不报。
+2. **间距命令被吞掉。** `a \hspace{1em} b` 给出 `['a','b']`。没有泄漏，所以 `\hspace` 既不在命令表也不在位置规则里。
+3. **反斜杠贴在前一个词上时两层都漏。** `\text{a\zzz b}` 变成单个 token `a\zzz`，`find_latex_residue` 返回空。
+   要抓它只能回到子串匹配，而那样会误伤正常的路径内容：`\text{C:\Users\me}` 是合法公式，不该被报。
+4. **标点或花括号贴着命令也会把它藏起来。** `\text{a \zzz, b}`、`\text{a (\zzz) b}`、`\text{where \zzz{x}}` 残留都是空。
+5. **`\limits` 在不同位置表现不一致。** 顶层被吃掉（`x`+`\limits` 得 `['x']`），放进 `\text{}` 却泄漏成 `a\limits`，
+   层 2 看不见。名字留在层 1 就为了这一条。
+6. **裸 `\middle` 抛出的异常没人看得懂。** `latex2mathml` 抛 `ExtraLeftOrMissingRightError`，`str(e)` 是空串、
+   `e.args` 也是空的。层 1 现在把它换成一条说清该写什么的错误信息。
+
+层 2 的判据连同三条候选规则的实测对照（为什么「整段 `m:t` 匹配」漏文本模式、为什么「任意位置匹配」误伤每一条
+Windows 路径）完整写在这里：[formula-guide](references/formula-guide.md#how-residue-is-recognised)。
+
+**两类失败，汇总行会把它们分开说。** `docx_mathify` 记下的每一条失败现在都带一个 kind。
+`latex_guard` 表示源文本里有 OMML 表达不了的命令 —— **改文档**；`convert` 表示转换器自己抛了错 ——
+**查环境**（缺 `MML2OMML.XSL`、语法错、结构非法）。两类各跑一次，实测输出：
+
+```text
+$ python scripts/docx_mathify.py report.docx --out report-fixed.docx
+段落 4　片段 4　编号段 0　对齐编号块 0　引用域 0　量纲串 0　失败 3（拒收 3，转换 0）　修正上下标 0　修正相量点 0
+error: 3 formula(s) failed to convert
+  FAIL[guard] E=mc^{2} \eqno{(3-1)} -> LaTeX 含 OMML 表达不了的控制序列（…）：\eqno。
+  FAIL[guard] a=b \nonumber -> LaTeX 含 OMML 表达不了的控制序列（…）：\nonumber。
+  FAIL[guard] w=0.5\textwidth -> LaTeX 含 OMML 表达不了的控制序列（…）：\textwidth。
+```
+
+```text
+[把 MML2OMML_XSL 指到一个不存在的路径]
+段落 2　片段 2　编号段 0　对齐编号块 0　引用域 0　量纲串 0　失败 2（拒收 0，转换 2）　修正上下标 0　修正相量点 0
+error: 2 formula(s) failed to convert
+  FAIL[convert] x=\frac{a}{b} -> MML2OMML_XSL=Z:\nowhere\MML2OMML.XSL 不是文件
+  FAIL[convert] y=\sqrt{x} -> MML2OMML_XSL=Z:\nowhere\MML2OMML.XSL 不是文件
+```
+
+`失败` 是失败总数，`拒收` 是被守卫拒掉的条数，`转换` 是转换器报错的条数。两类都退出 `3`，文档两种情况下都会写出来。
+关于这一行有三条规矩：
+
+- **括号里的拆解只在有失败时出现。** 干净的运行只打 `失败 0`，与上一版**逐字一致**（有测试钉住），所以解析这一行
+  的东西不会坏。
+- **不新增退出码。** D-024 不变：部分成功就是 `3`，类别靠 stdout 上的 `FAIL[guard]` / `FAIL[convert]` 前缀和失败
+  记录本身携带，绝不靠进程状态。
+- **stdout 上每类最多打 10 条**；其余在 `--report` 指定的文件里，那份报告写**两节**，一节一类，因为它们的
+  修法正好相反：
+
+```text
+## 转换失败 · 守卫拒收（源文本里有 OMML 表达不了的命令，已保留原文）
+## 转换失败 · 转换器报错（多为环境问题：缺 XSL / 语法错 / 结构非法，已保留原文）
+```
+
+**`docx_validate` 负责事后把伤报出来。** 它的判据**故意**与转换器不共用。转换器问的是「这样转会不会产生
+残留」，它可以严，因为一次误报停掉的是一个有人在看的运行。validate 问的是「这份文档是不是已经把残留交付
+出去了」，它走的是可能一年前写下的文件，所以只报不拦：`ok` 保持 `true`，退出码不动。它只扫 `<m:t>`、
+从不扫 `<w:t>` —— 正文里的反斜杠是合法内容（段落里的 `C:\Users\me` 是对的）—— 而且在干净的文档上
+它一个键都不长。它加的 issue 实测长这样：
+
+```json
+{"severity": "warning", "code": "omml_latex_residue", "count": 2, "samples": ["\\zzz", "\\eqno"]}
+```
+
+`count` 是出错 `m:t` run 的条数 —— 调用方真正要行动的那个数；`samples` 是去重后的前三个命令名，
+让报告说得清**是哪几个**命令，又不用把整份文档倒出来。两侧都是把 run 按空白切词、再对 **token** 做锚定：
+三条候选规则里，只有它能抓到文本模式残留（5/5）且一条合法路径公式都不误报（0/3）—— 用一个认下的盲点换掉
+三条误报。代价是多一类误报：单独成词的路径片段，`\text{见 \Users 目录}` 的 token 是 `\Users`，实测会被报。
+那是 warning 不是失败，比整片漏掉文本模式便宜。
+
+要交付之前跑一次：
+
+```bash
+python scripts/docx_validate.py report.docx
+```
+
 ## 改表格单元格而不毁掉它的格式
 
 `set-cell` 塞进单元格的是**一段平字符串**。模板里的格很少是平的：一个格里常有

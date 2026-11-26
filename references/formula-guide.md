@@ -863,6 +863,233 @@ None of these is a substitute for upgrading: they narrow the damage, they do not
 remove the rule.
 
 
+## How residue is recognised
+
+`latex2mathml` does not fail on a control sequence it does not know. It emits the
+name as literal text, `MML2OMML.XSL` copies that text into an `<m:t>` run, and Word
+draws the backslash inside the equation. Nothing raises, `docx_mathify` reports
+`失败 0` and exits `0`, and `docx_validate` used to have no OMML check at all.
+
+Three layers close that hole, and they do not share a criterion on purpose:
+the two converter-side layers decide **before** shipping and may therefore be
+strict; the validate check inspects a file that may already be on someone's disk
+and may only warn.
+
+| Layer | Function | Criterion | Failure mode it can have |
+|---|---|---|---|
+| pre-emptive | `assert_no_unsupported_commands` (`scripts/math_omml.py:793`) | closed list of 48 names + 5 position rules | a name nobody has met yet |
+| residue | `assert_no_latex_residue` (`scripts/math_omml.py:897`) | whitespace token that *is* a command | a command glued to its neighbour |
+| health check | `docx_validate`, code `omml_latex_residue` | same token shape, warning only | same as residue |
+
+The pre-emptive layer is the only one that can say **why** a command is
+unrepresentable, because it sees the command as a name in the source. That is why
+its message carries a replacement for every name it refuses. It cannot cover
+unknown commands, and there is no way to make it: the set of commands
+`latex2mathml` does not implement is unbounded, so any list is incomplete by
+construction. The residue layer inverts the trade: it covers everything, but only
+what survives into the output as a standalone token.
+
+### The three candidate criteria, measured
+
+The residue check needs a shape test, not a name list. Three shapes were built
+and measured against the same corpus: 25 math-mode leaks, 5 text-mode leaks, and
+3 legitimate formulas that contain Windows paths and therefore a backslash.
+
+| Criterion | Math-mode leaks (25) | Text-mode leaks (5) | Legitimate formulas flagged (3) |
+|---|---|---|---|
+| the whole `<m:t>` is a command | 25/25 | **0/5** | 0 |
+| a backslash anywhere in the run | 25/25 | 5/5 | **3/3** |
+| **the whitespace token is a command** | **25/25** | **5/5** | **0/3** |
+
+The two rejected rows each fail for a concrete, measured reason.
+
+**Whole-run anchoring misses text mode.** In math mode `latex2mathml` gives an
+unsupported command its own `<m:t>`, so the run *is* the command. Inside
+`\text{}` it merges the name into one run with the surrounding words:
+`\text{a \zzz b}` becomes the single `<m:t>` `a`+NBSP+`\zzz`+NBSP+`b`. Nothing about that
+run equals a command, so a whole-run match reports zero of the five text-mode
+leaks — the exact shape a document author writes most often (`\text{...}` around
+a label).
+
+**Substring matching flags ordinary prose.** `\text{C:\Users\me}` is a legitimate
+formula and its run contains `\Users`, which a substring search reads as a command.
+All three path formulas in the corpus were reported, i.e. the check would fire on
+correct documents.
+
+**A whitespace token covers both, because `str.split()` splits on NBSP.**
+This is the pivot the criterion rests on: `latex2mathml` separates words in text
+mode with U+00A0, not U+0020, and Python's argument-less `split()` treats every
+Unicode space character as a separator. `a`+NBSP+`\zzz`+NBSP+`b` therefore yields
+`['a', '\zzz', 'b']` and the command stands alone, while `C:\Users\me` yields one
+token that starts with `C:` and never matches.
+
+The same shape test is used in `docx_validate.py` (`LATEX_RESIDUE_RE`,
+`scripts/docx_validate.py:301`) and in `math_omml.find_latex_residue`
+(`scripts/math_omml.py:840`), so a document is judged by the same rule before and
+after it is written. What differs is the consequence, not the test.
+
+### The commands layer 1 refuses by name
+
+All 48, grouped the way `LATEX_ONLY_COMMANDS` (`scripts/math_omml.py:570`) groups
+them. The right-hand column is the replacement that ships in the error message.
+
+| Command | Write instead |
+|---|---|
+| `\eqno` | `\tag{n}` (lands as a literal `(n)`), not `\eqno` |
+| `\nonumber` | nothing — numbering is decided by the numbering segment or `\tag` |
+| `\notag` | nothing — same family as `\nonumber` |
+| `\label` | `docx_crossref` (bookmark + REF field); no tag inside a formula |
+| `\eqref` | a hand-written number, or `docx_crossref` |
+| `\ref` | a hand-written number, or `docx_crossref` |
+
+| Command | Write instead |
+|---|---|
+| `\textwidth` | a concrete length, or a full-width paragraph |
+| `\textheight` | `docx_create`'s `page` block |
+| `\columnwidth` | a concrete length; Word's column settings |
+| `\linewidth` | a concrete length; paragraph / table settings |
+| `\baselineskip` | paragraph `line_spacing` |
+| `\setlength` | `docx_create` / `docx_edit` formatting arguments |
+
+| Command | Write instead |
+|---|---|
+| `\vspace` | paragraph `space_before` / `space_after` |
+| `\hfill` | a right-aligned paragraph |
+| `\vfill` | page / paragraph layout |
+| `\hfil` | the alignment |
+| `\smallskip` | paragraph spacing |
+| `\medskip` | paragraph spacing |
+| `\bigskip` | paragraph spacing |
+| `\bigskipamount` | paragraph spacing |
+
+| Command | Write instead |
+|---|---|
+| `\cr` | a double backslash inside a matrix / align environment; a new paragraph outside |
+| `\newline` | a double backslash, or two separate formulas |
+| `\linebreak` | paragraph-level breaking |
+| `\nolinebreak` | paragraph-level break control, or a non-breaking space |
+| `\pagebreak` | `docx_edit`'s page-break run |
+| `\newpage` | `docx_edit`'s page-break run |
+| `\clearpage` | `docx_edit`'s page-break run |
+| `\allowbreak` | nothing — break points belong to the layout engine |
+| `\break` | paragraph-level breaking |
+| `\displaybreak` | paragraph pagination |
+| `\allowdisplaybreaks` | paragraph pagination |
+
+| Command | Write instead |
+|---|---|
+| `\hline` | `docx_create` / `table_width` border settings |
+| `\cline` | the border settings |
+| `\hrule` | a paragraph or table border |
+| `\vrule` | a table border |
+| `\multicolumn` | `docx_edit`'s `merge_cells` |
+
+| Command | Write instead |
+|---|---|
+| `\makebox` | a table, or `\text{}` |
+| `\raisebox` | a sub/superscript structure |
+
+| Command | Write instead |
+|---|---|
+| `\renewcommand` | commands that convert — `latex2mathml` does not expand it |
+| `\settowidth` | table column widths |
+| `\ignorespaces` | the source text itself |
+| `\unskip` | nothing — OMML has no spacing node |
+| `\protect` | nothing — no counterpart |
+
+| Command | Write instead |
+|---|---|
+| `\par` | a new paragraph (`docx_edit`'s `add_paragraph`) |
+| `\noindent` | `first_line_indent` |
+
+| Command | Write instead |
+|---|---|
+| `\intertext` | formula + paragraph + formula |
+| `\shortintertext` | formula + paragraph |
+| `\qed` | `\square` / `\Box`, or the tombstone character in body text |
+
+### The five context-dependent names
+
+`CONTEXT_RULES` (`scripts/math_omml.py:637`) holds the names a blacklist cannot
+handle: each converts cleanly in one position and leaks in another, measured in
+both directions on the same build.
+
+| Name | Rule | Allowed (measured) | Refused (measured) |
+|---|---|---|---|
+| `\limits` | `bigop_prefix` | `\sum\limits_{i=1}^{n} a_i` → no report, converts | `\sum_{i=1}^{n}\limits a_i` → reported (the character before it is `}`) |
+| `\nolimits` | `bigop_prefix` | `\sum\nolimits_{i=1}^{n} a_i` → no report | `x\nolimits` → reported, `m:t` `['x', '\nolimits']` |
+| `\middle` | `left_right` | `\left(a \middle\| b \right)` → no report | `a \middle\| b` → reported (and the raw library raised with an empty message) |
+| `\def` | `macro_use` | `\def\foo{1}\foo` → `['1']` | `\def\foo{1}` alone → reported, empty formula |
+| `\newcommand` | `macro_use` | `\newcommand{\x}{1}\x` → `['1']` | `\newcommand{\x}{1}` alone → reported, empty formula |
+
+The rule bodies are in `_rule_bigop_prefix` (`scripts/math_omml.py:679`),
+`_rule_left_right` (`:690`) and `_rule_macro_use` (`:702`); `BIG_OPERATORS`
+(`:557`) is the 25-name set the first two consult. `\limits` and `\nolimits` have
+no effect on the output at all — the OMML structure places limits itself — so
+dropping them is always correct.
+
+### Boundaries, measured rather than assumed away
+
+Six shapes are wrong in the output and invisible to at least one layer. They are
+pinned by tests so they are not mistaken for a regression later.
+
+| # | Shape | Measured result | Which layer misses it |
+|---|---|---|---|
+| 1 | `\rule{1em}{2pt}` (takes two arguments) | empty `m:t`; `a \rule{1em}{2pt} b` → `['a','b']` | both — distortion, not a leak |
+| 2 | `a \hspace{1em} b` | `['a','b']`, the space is swallowed | both — no residue to find |
+| 3 | `\text{a\zzz b}` (backslash glued to a word) | one token `a\zzz`, residue `[]` | both |
+| 4 | `\text{a \zzz, b}`, `\text{a (\zzz) b}`, `\text{where \zzz{x}}` | residue `[]` | both — punctuation and braces glue to the token |
+| 5 | `\limits` at top level vs inside `\text{}` | `x\limits` → `['x']` (eaten); `\text{a\limits}` → `['a\limits']` (leaks) | layer 2 for the second form |
+| 6 | bare `\middle` | `ExtraLeftOrMissingRightError`, `str(e) == ''`, `e.args == ()` | not a miss — an unreadable message, now replaced by layer 1 |
+
+Boundary 3 is the deliberate trade. Catching a backslash glued to a word requires
+substring matching, and substring matching is exactly what flags every Windows
+path (row 2 of the criteria table). Layer 1 still refuses every name it knows in
+that position, so the hole is only for commands nobody has catalogued — and for
+those there is no replacement advice to give anyway.
+
+Boundary 4 is the same trade seen through punctuation: splitting on punctuation as
+well was tried and fixed none of the three forms (the brace form still lands as
+`\zzz{x`), while it would start splitting path content. The rule stays
+"whitespace-separated token" because that is the spelling `latex2mathml` actually
+produces in text mode.
+
+Boundary 5 is why `\limits` is on layer 1's list even though top-level use is
+harmless: the text-mode spelling is `a\limits`, which layer 2 cannot see, so the
+name has to be caught before conversion.
+
+### Which entry point the name list defends
+
+`\label`, `\eqref` and `\ref` are removed before analysis in the whole-document
+chain: `_mark_commands` (`scripts/docx_mathify.py:498`) runs ahead of `_analyze`
+and turns them into numbering atoms, so they never reach `latex_to_omml_lxml`.
+On that path the guard is neither reached nor needed. The single-formula entry
+points — `insert_formula`, and a `latex` block in `docx_create` — have no such
+pre-pass, and there a `\label` goes all the way to the converter as literal text.
+That is what those three names defend. Whole-document numbering belongs to the
+numbering segment or `\tag`; cross-references belong to `docx_crossref`.
+
+### On the validate side
+
+`docx_validate` reports the same shape as a `warning` issue and never changes `ok`
+or the exit code, because "this document already shipped residue" is not "this
+run failed". It iterates `<m:t>` only (`scripts/docx_validate.py:701`) — a
+backslash in `<w:t>` is legitimate body text — and a clean document does not grow
+the key at all. Measured issue:
+
+```json
+{"severity": "warning", "code": "omml_latex_residue", "count": 2, "samples": ["\\zzz", "\\eqno"]}
+```
+
+`count` is the number of `<m:t>` runs at fault, `samples` the first three distinct
+command names in document order. One issue per document rather than one per run: a
+40-command formula would otherwise bury every other finding.
+
+One false-positive class is accepted with this criterion: a path fragment that
+stands alone as its own word. `\text{见 \Users 目录}` yields the token `\Users` and is
+reported. It is a warning, and the alternative — substring matching — produces a
+false positive on every path that contains one.
+
 ## Two defects fixed in this round
 
 Both live in `linear_to_latex.py` and both are about source-text shapes that the
