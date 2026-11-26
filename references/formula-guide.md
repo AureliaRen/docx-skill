@@ -877,7 +877,7 @@ and may only warn.
 
 | Layer | Function | Criterion | Failure mode it can have |
 |---|---|---|---|
-| pre-emptive | `assert_no_unsupported_commands` (`scripts/math_omml.py:793`) | closed list of 48 names + 5 position rules | a name nobody has met yet |
+| pre-emptive | `assert_no_unsupported_commands` (`scripts/math_omml.py:793`) | closed list of 54 names + 5 position rules | a name nobody has met yet |
 | residue | `assert_no_latex_residue` (`scripts/math_omml.py:897`) | whitespace token that *is* a command | a command glued to its neighbour |
 | health check | `docx_validate`, code `omml_latex_residue` | same token shape, warning only | same as residue |
 
@@ -930,7 +930,7 @@ after it is written. What differs is the consequence, not the test.
 
 ### The commands layer 1 refuses by name
 
-All 48, grouped the way `LATEX_ONLY_COMMANDS` (`scripts/math_omml.py:570`) groups
+All 54, grouped the way `LATEX_ONLY_COMMANDS` (`scripts/math_omml.py:570`) groups
 them. The right-hand column is the replacement that ships in the error message.
 
 | Command | Write instead |
@@ -986,6 +986,17 @@ them. The right-hand column is the replacement that ships in the error message.
 
 | Command | Write instead |
 |---|---|
+| `\rule` | a paragraph or table border; `\frac` for a fraction, `\overline{…}` for an overline |
+| `\hspace` | nothing for hand-written spacing — OMML cannot hold it (no `mspace` template, the whole formula is swallowed); `\quad` (1em), `\,` (3/18em), `\;`, `\:`, `\!` or the control space, the only six that live |
+| `\hskip` | TeX's raw horizontal skip (`\hskip 1em`) has no OMML node and swallows the formula; `\quad` / `\,` / `\;` / `\:` / `\!` / the control space |
+| `\kern` | TeX's raw kerning adjustment (`\kern 1pt`) is swallowed the same way; kern with `\,` / `\!`, step spacing with `\quad` |
+| `\mspace` | the MathML spelling (`\mspace{1mu}`) this chain does not know; `\quad` / `\,` / `\;` / `\:` / `\!` / the control space |
+| `\enspace` | a fixed half-em space with nowhere to go in the XSL; `\,` (3/18em) or `\:` for half a step, `\quad` for a full one |
+
+`\hspace*{1em}` needs no row: `_CMD_RE`'s `(\*?)` eats the star and the name is still `hspace`.
+
+| Command | Write instead |
+|---|---|
 | `\makebox` | a table, or `\text{}` |
 | `\raisebox` | a sub/superscript structure |
 
@@ -1022,25 +1033,42 @@ both directions on the same build.
 | `\def` | `macro_use` | `\def\foo{1}\foo` → `['1']` | `\def\foo{1}` alone → reported, empty formula |
 | `\newcommand` | `macro_use` | `\newcommand{\x}{1}\x` → `['1']` | `\newcommand{\x}{1}` alone → reported, empty formula |
 
-The rule bodies are in `_rule_bigop_prefix` (`scripts/math_omml.py:679`),
-`_rule_left_right` (`:690`) and `_rule_macro_use` (`:702`); `BIG_OPERATORS`
-(`:557`) is the 25-name set the first two consult. `\limits` and `\nolimits` have
-no effect on the output at all — the OMML structure places limits itself — so
-dropping them is always correct.
+The rule bodies are in `_rule_bigop_prefix` (`scripts/math_omml.py:743`),
+`_rule_left_right` (`:754`) and `_rule_macro_use` (`:766`); `BIG_OPERATORS`
+(`:606`) is the 25-name set the first two consult. `\limits` is **not** a no-op:
+on a big operator it flips `m:limLoc` from `subSup` to `undOvr`, stacking the
+limits above and below, and on a function name (`\max`, `\lim`, `\sup`, `\inf`,
+`\det`, `\gcd`, `\Pr`) it swaps `m:sSub` for `m:limLow`. `\nolimits` is the one
+that matches writing nothing at all. Note that with no `\limits` you get `subSup`
+even in display mode, which is *not* what LaTeX display style does by habit —
+write `\limits` explicitly when you want the limits stacked.
 
 ### Boundaries, measured rather than assumed away
 
-Six shapes are wrong in the output and invisible to at least one layer. They are
-pinned by tests so they are not mistaken for a regression later.
+Six shapes came out wrong and were invisible to at least one layer. Rows 1 and 2
+are closed as of P29; the other four are still pinned by tests so they are not
+mistaken for a regression later.
 
 | # | Shape | Measured result | Which layer misses it |
 |---|---|---|---|
-| 1 | `\rule{1em}{2pt}` (takes two arguments) | empty `m:t`; `a \rule{1em}{2pt} b` → `['a','b']` | both — distortion, not a leak |
-| 2 | `a \hspace{1em} b` | `['a','b']`, the space is swallowed | both — no residue to find |
+| 1 | `\rule{1em}{2pt}` (takes two arguments) | **before P29** empty `m:t`; `a \rule{1em}{2pt} b` → `['a','b']`; **now** layer 1 refuses it and exits `1` | neither — `rule` is in `LATEX_ONLY_COMMANDS` |
+| 2 | `a \hspace{1em} b`, and the five siblings | **before P29** `['a','b']`, the space swallowed; **now** layer 1 refuses it and exits `1` | neither — `hspace`, `hskip`, `kern`, `mspace`, `enspace` are in the same table |
 | 3 | `\text{a\zzz b}` (backslash glued to a word) | one token `a\zzz`, residue `[]` | both |
 | 4 | `\text{a \zzz, b}`, `\text{a (\zzz) b}`, `\text{where \zzz{x}}` | residue `[]` | both — punctuation and braces glue to the token |
 | 5 | `\limits` at top level vs inside `\text{}` | `x\limits` → `['x']` (eaten); `\text{a\limits}` → `['a\limits']` (leaks) | layer 2 for the second form |
 | 6 | bare `\middle` | `ExtraLeftOrMissingRightError`, `str(e) == ''`, `e.args == ()` | not a miss — an unreadable message, now replaced by layer 1 |
+
+Rows 1 and 2 are one family: `latex2mathml` maps `\rule` / `\hspace` / `\hskip` /
+`\kern` / `\mspace` / `\enspace` to `<mspace>`, `MML2OMML.XSL` carries no template for
+it, and the whole math element comes out empty — or, with the starred form
+`\hspace*{1em}`, with the argument printed into the formula as text. Layer 1 now
+refuses all six before conversion starts: exit `1`, the message naming the command
+and the replacement to write (spacing as `\quad` / `\,` / `\;` / `\:` / `\!` / `\`, a
+rule as a paragraph or table border, a fraction as `\frac`, an overline as
+`\overline`). They are wrong in every position, so they are name-based and need no
+context rule. For documents that already contain the shape, `docx_validate`'s
+`omml_empty_omath` check reports it as a `warning` and leaves `ok` and the exit code
+alone — the converter treats the cause, the health check reads the history.
 
 Boundary 3 is the deliberate trade. Catching a backslash glued to a word requires
 substring matching, and substring matching is exactly what flags every Windows

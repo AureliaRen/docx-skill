@@ -240,7 +240,8 @@ def test_a_broken_equation_exits_three_and_the_document_is_still_written(
     assert len(failures) == 1, failures
     assert failures[0]["block"] == 3
     assert failures[0]["latex"] == BROKEN_LATEX
-    assert "RuntimeError" in failures[0]["error"]
+    err = failures[0]["error"]
+    assert err.startswith("LatexSyntaxError:"), err
 
     # 好的三条真的成了 OMML，坏的那条以原文留在段落里。
     counts = omml_counts(out)

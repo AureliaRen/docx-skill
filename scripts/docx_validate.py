@@ -30,6 +30,19 @@ Checks (health-check tier, NOT full XSD schema validation):
     scan is limited to ``m:t`` on purpose — a backslash in ``w:t`` is ordinary
     body text such as ``C:\Users\me`` — and a run must *equal* a command, not
     merely contain a backslash, so text-mode paths in ``m:t`` stay clean.
+  - **OMML formulas with nothing inside them**: an ``<m:oMath>`` with **zero
+    children**, where the source did have a formula.  ``latex2mathml`` turns
+    ``\rule`` / ``\hspace`` and friends into ``<mspace>``, and
+    ``MML2OMML.XSL`` has no template for it, so the whole math element comes
+    out empty; Word then shows nothing (or an empty placeholder) at that spot.
+    The conversion side has refused that whole family since P29, before it can
+    become OMML, so this shape now only arrives from an older chain or a
+    hand-built package - which is what the check is for.
+    Reported as ``omml_empty_omath`` (**warning** for the same reason as the
+    two OMML scans around it: Word opens the file — it merely draws a blank — so
+    this must not move ``ok`` or the exit code).  It is a different question
+    from the empty-*slot* scan below: that one is content inside a delimiter
+    group, this one is the formula as a whole.
   - **restricted run-property values** in every ``word/*.xml`` part: the
     enumerated children of ``<w:rPr>`` whose ``w:val`` comes from a closed
     value list.  Two severities, **decided by what Word 16.0 actually does with
@@ -100,9 +113,9 @@ PR = "http://schemas.openxmlformats.org/package/2006/relationships"
 # not required for a legal drawing (charts, shapes, text boxes).
 WP = ("http://schemas.openxmlformats.org/drawingml/2006/"
       "wordprocessingDrawing")
-# ``m:`` — the Office Math namespace.  Used by the two OMML text scans below
-# (empty delimiter slots, leftover LaTeX commands); every other check in this
-# file is about the package or about ``w:`` markup.
+# ``m:`` — the Office Math namespace.  Used by the three OMML scans below
+# (empty delimiter slots, empty formulas, leftover LaTeX commands); every other
+# check in this file is about the package or about ``w:`` markup.
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 #: Children a ``<w:p>`` / ``<w:tbl>`` may never sit directly inside a run.
@@ -655,6 +668,68 @@ def validate(path: str) -> dict:
                        f"read as the slot separator (``m:sepChr``) by "
                        f"MML2OMML.XSL."),
             "count": empty_slots,
+        })
+
+    # --- OMML formulas that are empty as a whole ---------------------------
+    # A different question from the ``<m:d>`` scan just above, and the two must
+    # not be folded into one code: that one asks "is a *slot* inside a delimiter
+    # group blank" (the formula has content, one box inside it draws empty);
+    # this one asks "is the *formula itself* empty" — an ``<m:oMath>`` with
+    # **zero children**, where Word then draws nothing at all in the body.
+    #
+    # The cause is the same class of gap as the residue scan below, one layer
+    # earlier: ``latex2mathml`` maps ``\rule``, ``\hspace`` and their family
+    # (also ``\vspace``, ``\hphantom``) to ``<mspace>``, and
+    # ``MML2OMML.XSL`` carries no template for ``mspace`` — the node is dropped
+    # and the surrounding math element is left with nothing inside it.  An empty
+    # group ``{}`` and a ``\def`` that is defined but never used produce the
+    # same shape.  Measured with ``work/p28c/docx/out-rule-bare.docx``: this
+    # check used to come back ``{"ok": true, "issues": []}``, exit 0.
+    #
+    # P29 note: the converter refuses ``\rule`` / ``\hspace`` and the rest of
+    # that family before conversion, so the current chain cannot produce this
+    # shape any more - see the division of labour a few lines below.
+    #
+    # Severity is **warning** for exactly the reason spelled out above the
+    # empty-slot scan: this report feeds pass/fail decisions downstream, Word
+    # opens these documents (it only draws a blank where the formula should be),
+    # and a health check must not reject a file that opens.  So ``ok`` and the
+    # exit code do not move, and a document with no empty math element gets no
+    # issue at all — no key, no ``count: 0`` noise.
+    #
+    # Division of labour with the converter side: ``math_omml`` refuses these
+    # control sequences **before** they become OMML, which treats the cause;
+    # this scan is for documents that already exist — produced by an older
+    # skill, by another tool, or before that refusal shipped.  Same reason as
+    # the residue scan for staying a local implementation with no import from
+    # ``math_omml``: this script must run where the conversion chain (and
+    # Office's XSL) is absent.
+    empty_omaths = 0
+    for omath in doc_root.iter(f"{{{M}}}oMath"):
+        if len(omath) == 0:
+            empty_omaths += 1
+    if empty_omaths:
+        # Same shape as every other issue in this file (severity / code / detail),
+        # plus ``count``: how many empty formulas there are, which a caller acts on
+        # and cannot recover from the prose.
+        # The ``Fix`` line below leans on the converter side, which has refused
+        # this whole family of commands since P29; this scan is the after-the-fact
+        # half for documents that already exist (see the block above).
+        issues.append({
+            "severity": "warning",
+            "code": "omml_empty_omath",
+            "detail": (f"document.xml: {empty_omaths} ``<m:oMath>`` element(s) "
+                       f"have no children at all; Word shows nothing (or an "
+                       f"empty placeholder) where the formula should be. "
+                       f"Cause: latex2mathml turns ``\\rule`` / ``\\hspace`` "
+                       f"(and the rest of that family) into ``<mspace>``, for "
+                       f"which MML2OMML.XSL has no template, so the whole math "
+                       f"element comes out empty; an empty group ``{{}}`` or a "
+                       f"``\\def`` that is never used leaves the same shape. "
+                       f"Fix: re-convert the source with the current chain "
+                       f"(it refuses these commands) or delete the empty "
+                       f"formula."),
+            "count": empty_omaths,
         })
 
     # --- OMML text carrying leftover LaTeX commands -----------------------

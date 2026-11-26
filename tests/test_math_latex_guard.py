@@ -162,7 +162,7 @@ OK = [
     r"\left( a \middle| b \right)",
     r"\left\{ x \middle| x>0 \right\}",
     r"\frac{a}{b}",
-    r"a \hspace{1em} b",                 # 间距被吞（边界），但不该被拒
+    r"a \quad b",                      # 能活的间距（P29-A 起 \hspace 已进表）
     r"a \strut b",
     r"\def\foo{1}\foo",                  # 宏定义了**并且**用了：上游会展开
     r"\sum\limits_{i=1}^{n} a_i",
@@ -671,27 +671,36 @@ def test_stats_none_does_not_crash():
 
 
 # ===========================================================================
-# 判据 9：已知边界 —— 本轮不修，但现状必须被钉住（防「以为修了」）
+# 判据 9：曾经的「已知边界」—— P29-A 起已修，断言必须翻面
 # ===========================================================================
-@needs_omml
-def test_boundary_hspace_still_swallowed():
-    r"""`\hspace{1em}` 的间距仍被吞（不泄漏、也不报错）—— 本轮不修。
+# 这两条原先是 test_boundary_hspace_still_swallowed /
+# test_boundary_rule_still_produces_empty_formula，断言「间距仍被吞 / 仍产空
+# 公式，本轮不修」。P29-A 把 \hspace 一族加进层 1 表、并给 assert_legal 加了
+# 「空 m:oMath」第 4 类，旧断言于是变成**钉住 bug**（旧行为在、测试就绿，谁也
+# 发现不了修没修好）。现在翻面：它们检查的是修好后的契约，不是放宽。
+#
+# 门控：层 1 的拒收发生在 latex2mathml 之前（math_omml.py:1041 早于 :1043 的
+# keep_spacing 与 :1045 的 lconv.convert），所以这两条**不需要** MML2OMML.XSL —— 标 @needs_l2m，
+# 标成 @needs_omml 会让它们在无 Office 的 runner 上白 skip（P27 首轮教训）。
+@needs_l2m
+def test_hspace_is_now_rejected():
+    r"""`\hspace{1em}` 现在由层 1 拒收（P29-A）。
 
-    它与泄漏是**两种**失真：泄漏有反斜杠可扫，吞间距只能比对源 LaTeX 与 m:t 的
-    文本量。守卫不接这一类，钉在这里是为了让下一个人知道「这不是修好了」。
+    旧行为：间距被静默吞掉、不报错，产物是零子元素的 ``<m:oMath/>``。
+    现在：``LATEX_ONLY_COMMANDS["hspace"]`` 在转换之前就抛，消息里点名该命令。
     """
-    el = convert(r"a \hspace{1em} b")
-    assert _mtexts(el) == ["a", "b"], "间距仍然被吞：本轮不修"
-    assert math_omml.find_latex_residue(el) == []
+    with pytest.raises(math_omml.LatexGuardError) as ei:
+        convert(r"a \hspace{1em} b")
+    assert r"\hspace" in str(ei.value)
 
 
-@needs_omml
-def test_boundary_rule_still_produces_empty_formula():
-    r"""`\rule{1em}{2pt}` 仍退化成空公式（dropped）—— 本轮不修。
+@needs_l2m
+def test_rule_is_now_rejected():
+    r"""`\rule{1em}{2pt}` 现在由层 1 拒收（P29-A）。
 
-    没人能扫出「本该有内容却空着」：空 m:oMath 是合法 XML，Word 打开也不报错。
-    要抓它得比对源 LaTeX 与产物文本量，属另一类问题。
+    旧行为：整条公式退化成空 ``<m:oMath/>``（dropped），四环全沉默。
+    现在：``LATEX_ONLY_COMMANDS["rule"]`` 在转换之前就抛。
     """
-    el = convert(r"\rule{1em}{2pt}")
-    assert [t for t in _mtexts(el) if t.strip()] == [], "仍然是一条空公式：本轮不修"
-    assert math_omml.find_latex_residue(el) == []
+    with pytest.raises(math_omml.LatexGuardError) as ei:
+        convert(r"\rule{1em}{2pt}")
+    assert r"\rule" in str(ei.value)

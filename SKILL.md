@@ -496,7 +496,7 @@ whose third formula is `\frac`:
  "output": "…/out.docx",
  "blocks": 4,
  "formula_failures": [{"block": 2, "latex": "\\frac",
-                       "error": "RuntimeError: latex2mathml 转换失败: '\\\\frac' -> "}]}
+                       "error": "LatexSyntaxError: latex2mathml 转换失败: '\\\\frac' -> "}]}
 ```
 
 (Shown decoded: in the bytes on the wire every non-ASCII character inside a JSON
@@ -820,6 +820,23 @@ misfire rather than to be polite:
 
 A marker that matches nothing exits `1` and names the range it searched — the
 0-based body paragraph range plus the table-cell count.
+
+**Exit codes.** The four tiers below are the toolkit-wide ones, read for a single
+insert: the dividing line is *whose problem the failure is*, not how far the
+conversion got.
+
+| Code | Meaning here |
+|---|---|
+| `0` | the equation went in, or `--dump` printed it |
+| `1` | the input was legal and the content could not be converted — an unsupported control sequence such as `\eqno`, a `latex2mathml` syntax error, illegal OMML structure, an XSL application failure |
+| `2` | a usage error, or an unusable conversion environment — `--dump` together with `--after`, an empty marker, `MML2OMML_XSL` naming a file that does not exist or is not valid XSLT |
+| `3` | not produced here: `3` means the document was written while a formula stayed unconverted, and a single insert that cannot convert writes nothing, so there is no partial product to report (that tier belongs to `docx_mathify`, a `docx_create` `latex` block, and `docx_template apply --fix-formulas`) |
+
+**Stderr contract.** A `2` prints exactly one line, prefixed `error: `, with no
+traceback: the caller has to be able to read the whole diagnostic in one line,
+and a stack trace is a bug report rather than a usage message. A `1` carries no
+such limit — the guard names every offending command together with the
+replacement to write, so several lines are the intended shape there.
 
 `linear_to_latex.py` decides *what counts as a formula*. It deliberately stays
 conservative so ordinary prose survives: `[0, 1]`, `f(x, y)`, and CJK headings
@@ -1291,7 +1308,7 @@ this round is about: a silent delivery defect, not a missing feature.
 
 | Layer | Where it runs | What it covers | What it does |
 |---|---|---|---|
-| 1. Pre-emptive rejection | `scripts/math_omml.py:975`, before `keep_spacing` | the 48 known LaTeX-only names, plus 5 position-dependent ones | raises, naming each command with the replacement to write |
+| 1. Pre-emptive rejection | `scripts/math_omml.py:975`, before `keep_spacing` | the 54 known LaTeX-only names, plus 5 position-dependent ones | raises, naming each command with the replacement to write |
 | 2. Post-conversion residue | `scripts/math_omml.py:1021`, after `split_runs_for_upright` | **any** command, including ones it has never heard of | raises, quoting the command it found in the output |
 | 3. After-the-fact health check | `scripts/docx_validate.py`, code `omml_latex_residue` | documents already on disk | adds a warning; `ok` and the exit code stay put |
 
@@ -1303,7 +1320,7 @@ token. Layer 3 runs where neither converter-side layer can reach: a file written
 last month by an older build, opened today. It must not move any exit code,
 because "this archive has residue" is not "this run failed".
 
-**The 48 names, grouped the way the source groups them.** Layer 1 matches the
+**The 54 names, grouped the way the source groups them.** Layer 1 matches the
 command name exactly, so every name below is refused wherever it appears. The
 right-hand column is the advice the error message prints.
 
@@ -1368,6 +1385,19 @@ Table rules and column merge — border settings, not formula content:
 | `\vrule` | Drop it; a vertical rule is a table border |
 | `\multicolumn` | Drop it; merging cells is `docx_edit`'s `merge_cells` |
 
+Spacing and rules — `MML2OMML.XSL` has no `mspace` template, so this family swallows the whole formula into an empty `<m:oMath/>`:
+
+| Command | Write instead |
+|---|---|
+| `\rule` | Drop it; a horizontal rule is a paragraph or table border, a fraction is `\frac`, an overline is `\overline{…}` |
+| `\hspace` | Drop it; hand-written spacing cannot survive OMML (no `mspace` template, the whole formula is swallowed) — use `\quad` (1em), `\,` (3/18em), `\;`, `\:`, `\!` or the control space, the only six that live |
+| `\hskip` | Drop it; TeX's raw horizontal skip (`\hskip 1em`) has no OMML node and swallows the formula — use `\quad` / `\,` / `\;` / `\:` / `\!` / the control space |
+| `\kern` | Drop it; TeX's raw kerning adjustment (`\kern 1pt`, one stretch component fewer than `\hskip`) is swallowed the same way — kern with `\,` / `\!`, step spacing with `\quad` |
+| `\mspace` | Drop it; that is the MathML spelling (`\mspace{1mu}`) and this chain only knows the LaTeX family — use `\quad` / `\,` / `\;` / `\:` / `\!` / the control space |
+| `\enspace` | Drop it; a fixed half-em space (0.5em) has nowhere to go in the XSL — use `\,` (3/18em) or `\:` for half a step, `\quad` for a full one |
+
+`\hspace*{1em}` needs no row of its own: `_CMD_RE`'s `(\*?)` eats the star and the name is still `hspace`, so it hits the same row (measured, not read off the regex).
+
 Boxes — no OMML structure exists:
 
 | Command | Write instead |
@@ -1421,8 +1451,15 @@ Two details worth knowing before you edit a formula:
 - The rule reads the text **immediately** before the command, so a later
   `\nolimits` after the subscript also trips: `\sum_{i=1}^{n}`+`\nolimits`+` a_i` is reported,
   because the character before the command is a closing brace, not an operator
-  name. Write it straight after the operator, or drop it — the OMML structure
-  places limits by itself, so `\limits` and `\nolimits` change nothing in the output.
+  name. Write it straight after the operator, or drop it — dropping is simpler,
+  **not the same thing**: `\limits` really does change the structure that comes
+  out. For a big operator (`\sum` and the rest of its family) it flips `m:limLoc`
+  from `subSup` to `undOvr`, stacking the limits above and below; for a function
+  name (`\max`, `\lim`, `\sup`, `\inf`, `\det`, `\gcd`, `\Pr`) it swaps `m:sSub` for
+  `m:limLow`. `\nolimits` is the one that matches writing nothing at all. And note
+  that with no `\limits` you get `subSup` even in display mode, which is *not* what
+  LaTeX display style does by habit — write `\limits` explicitly when you want the
+  limits stacked above and below.
 - At top level `\limits` is silently eaten (`x`+`\limits` becomes `['x']`, no leak), but inside
   `\text{}` it survives in one token with its neighbour — `\text{a\limits}` gives
   `['a\limits']` — which layer 2 cannot see. That is exactly why the name stays in
@@ -1438,14 +1475,29 @@ there `\label` would go all the way to the converter as literal text. For number
 a whole document use the numbering segment or `\tag`; for a cross-reference use
 `docx_crossref`.
 
-**Six boundaries, measured with both layers off.** None of these is fixed by this
+**Six boundaries: the first two closed in P29, the other four still stand.** All
+six were measured with both layers off; the last four are still not fixed by this
 round, and each is pinned by a test so it does not read as a new bug:
 
-1. **A rule that takes arguments converts into nothing.** `\rule{1em}{2pt}` alone gives
-   an empty `m:t` and no error; `a \rule{1em}{2pt} b` gives `['a','b']` — the rule simply
-   vanishes. That is conversion distortion, not a leak, so neither layer reports it.
-2. **Spacing commands are swallowed.** `a \hspace{1em} b` gives `['a','b']`. No leak, so
-   `\hspace` is in neither the command table nor the context rules.
+1. **`\rule` and hand-written spacing are refused before conversion now.**
+   `\rule{1em}{2pt}` alone used to give an empty `m:t`, and `a \rule{1em}{2pt} b` used to
+   give `['a','b']` — the rule simply vanished; `a \hspace{1em} b` likewise came back
+   `['a','b']` with the space gone. All of it was conversion distortion rather than a
+   leak, so neither layer reported it, and `\hspace` was in neither the command table
+   nor the context rules. Since P29 the six names `\rule`, `\hspace`, `\hskip`,
+   `\kern`, `\mspace` and `\enspace` sit in layer 1's refusal table: conversion never
+   starts, the exit code is `1`, and the message names the command together with what
+   to write instead (spacing as `\quad` / `\,` / `\;` / `\:` / `\!` / `\`, rules as a
+   paragraph or table border, fractions as `\frac`, an overline as `\overline`). They
+   are wrong in every position, so they stay name-based and need no context rule. The
+   starred form goes the same way: `_CMD_RE`'s `(\*?)` eats the star and the name is
+   still `hspace`.
+2. **Documents already carrying the damage are caught by `docx_validate`.** A new
+   check, `omml_empty_omath`, reports one `warning` (with `count`) for every `<m:oMath>`
+   that has zero children; `ok` and the exit code do not move, because Word opens these
+   files and merely draws a blank where the formula should be. Same division of labour
+   as `omml_latex_residue`: the converter refuses the cause, the health check inspects
+   documents that already exist.
 3. **A backslash glued to the previous word is missed by both layers.**
    `\text{a\zzz b}` becomes the single token `a\zzz` and `find_latex_residue` returns
    empty. Catching it would mean substring matching, and that fires on ordinary
@@ -2425,13 +2477,19 @@ probe that must observe what the file says, not what Word would make of it.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception |
-| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package, an `image` block whose `path` points at nothing on disk or is not a string |
+| `1` | expected failure — a marker that did not match, an unknown or duplicate bookmark name, "the document does not contain what you asked for", a runtime exception, a formula whose content cannot be converted (an unsupported control sequence, a `latex2mathml` syntax error, illegal OMML structure, an XSL application failure) |
+| `2` | usage error — argparse, an unknown key or unknown block type in a spec, more `--widths` values than columns, a `--pages` count that does not match the entry count, mutually exclusive flags passed together (including `width_frac` with `width_mm`), an `--index` / `--insert-at` outside the legal range (or negative), an input path that is missing, a directory, or not a Word package, an `image` block whose `path` points at nothing on disk or is not a string — and, for `insert_formula`, an unusable conversion environment: `latex2mathml` missing, or `MML2OMML_XSL` naming a file that does not exist or is not valid XSLT |
 | `3` | the document was written, but at least one formula did not convert — `docx_create` (a `latex` block, listed in `formula_failures`), `docx_mathify`, and `docx_template apply --fix-formulas`, which passes mathify's code through |
 
 A usage error is a **refusal, not a repair**: it is decided before anything is read
 or written, the input file is byte-for-byte untouched, the message is one
 `error: …` line on stderr, and stdout stays empty.
+
+`insert_formula` is where the `1` / `2` line is drawn by **content versus
+environment**: a formula the converter cannot express is `1` although every
+argument was legal, while an unusable conversion environment is `2`. Each side is
+spelled out with examples in that script's own section, and the `2` side keeps
+the one-line `error:` promise stated here.
 
 The input-path clause in row `2` is scoped to the CLIs that open a document, and it
 is not a claim that the whole tree answers the same way: `docx_validate` is the

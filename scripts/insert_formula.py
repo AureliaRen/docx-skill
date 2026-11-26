@@ -27,21 +27,30 @@ Usage
    （pandoc issue #11674 的官方修法）。
 3. ``\quad \, \; \: \!`` 与普通空格都会被 XSLT 丢弃 → 默认改写成 ``\ ``（NBSP）。
 
-退出码契约（P6-FIX-C2 起明确，此前是隐含行为；P9-D 修订 ``1``/``2`` 的边界）
-----------------------------------------------------------------------------
+退出码契约（P6-FIX-C2 起明确；P9-D 修订 ``1``/``2`` 边界；P28-A 重分派内容类失败）
+--------------------------------------------------------------------------------
 * **0** —— 成功（写入分支或 ``--dump`` 打印）。
-* **2** —— **用法错误 / 输入不可用**：``--dump`` 与 ``--after``/``--before`` 同时给、
-  ``--after``/``--before`` 给了空串、``--after`` 与 ``--before`` 同时给、
-  LaTeX 转换环境缺失，以及 **``unpacked_dir`` 不可用**（目录不存在 / 里面没有
-  ``word/document.xml`` / 那个 ``word/document.xml`` 不是良构 XML）。
-  全部**在任何写盘之前**判定，文档一个字节都不动。
-  ⚠️ P9-D 之前后三档（``word/document.xml`` 不存在、XML 不良构）报 **1**，
-  其中 XML 不良构那条还是裸 traceback。它们是「你给的东西不是一个可用的解包
-  .docx 目录」，与 `docx_edit` / `docx_read` / `docx_validate` 等兄弟 CLI 的
-  输入错误同义，所以统一提到 2（全仓口径：输入不对 = 2）。
-* **1** —— **文档是真实的、但内容有问题**：``<w:body>`` 缺失、marker 在文档里
-  找不到。这两档都要求 ``word/document.xml`` 已经被成功解析，属于「合并/插入
-  做不下去」，不再是「输入给错了」。
+* **2** —— **用法错误 / 输入不可用 / 转换环境不可用**：``--dump`` 与
+  ``--after``/``--before`` 同时给、``--after``/``--before`` 给了空串、``--after``
+  与 ``--before`` 同时给、**``unpacked_dir`` 不可用**（目录不存在 / 里面没有
+  ``word/document.xml`` / 那个 ``word/document.xml`` 不是良构 XML），以及
+  **LaTeX→OMML 的转换环境不可用**（缺 ``latex2mathml``、``MML2OMML.XSL``
+  找不到或加载不了）。
+  全部**在任何写盘之前**判定，文档一个字节都不动，stderr **恰好一行** ``error:``
+  前缀。报 2 时该查的是**参数与环境**，不是公式。
+* **1** —— **文档是真实的、命令也合法，但内容处理不下去**：``<w:body>`` 缺失、
+  marker 在文档里找不到；以及 **公式内容转不了** —— 源文本含 OMML 表达不了的
+  控制序列（含未识别命令的残留兜底）、``latex2mathml`` 语法错、``MML2OMML.XSL``
+  应用失败、生成的 OMML 结构非法。
+  这一档**没有**「stderr 恰好一行」的约束：守卫拒收要给出四段文案（症状 / 成因 /
+  替代写法 / 怎么做），压成一行等于把修法一起砍掉。
+  ⚠️ P9-D 之前「``word/document.xml`` 不存在 / XML 不良构」报 **1**，其中后者还是
+  裸 traceback。它们是「你给的东西不是一个可用的解包 .docx 目录」，与 `docx_edit` /
+  `docx_read` / `docx_validate` 等兄弟 CLI 的输入错误同义，所以 P9-D 统一提到 2
+  （全仓口径：输入不对 = 2）。
+  ⚠️ P28-A 之前内容类失败（守卫拒收 / 语法错 / 结构非法）与用法错**共用 2**，
+  守卫那 6 行文案还顺手把那 2 的单行契约破掉。现在按 ``math_omml`` 抛出的**异常
+  类型**分派：环境类 → 2，内容类 → 1。判据是类型，不是文案正则。
 
 不静默说谎的两条硬约束（P6-FIX-C2，依据 P5-AUDIT-QUALITY §5.7）
 --------------------------------------------------------------
@@ -76,7 +85,14 @@ from docx_utils import (
     write,
     wtag,
 )
-from math_omml import M_NS, latex_to_omml_lxml
+from math_omml import (
+    M_NS,
+    LatexGuardError,
+    LatexSyntaxError,
+    MathEnvError,
+    OMMLStructureError,
+    latex_to_omml_lxml,
+)
 from fix_phasor_dot import fix_phasor_dots
 
 # 上一次 _omml_stdlib() 修掉的相量点数（CLI 用来打印，库调用方也可直接读）。
@@ -244,9 +260,24 @@ def main(argv: list[str] | None = None) -> int:
             print("error: <w:body> not found", file=sys.stderr)
             return 1
 
+    # ---- 白名单分派（P28-A）：按 math_omml 的**异常类型**定退出码 ----
+    # 内容类 → 1（输入合法、内容转不了；多行四段文案在这一档合法）
+    # 环境类 → 2（拒绝先于任何读写，D-024 要求 stderr 恰好一行）
+    #
+    # ★ 为什么**不能**拿基类异常一刀切退 2：那正是原来的病根 ——
+    #   新加一个抛点忘了分类，就静默落回「你用法错了」，用户永远看不到真实原因。
+    #   结构性防线在 tests/test_insert_formula_exit_codes.py：AST 扫 math_omml.py，
+    #   断言 `raise RuntimeError(...)` 命中数 = 0（全部必须换成子类）。
+    # ★ 未预期异常（不是 MathOmmlError 的子类）= 代码 bug：不在这里捕获，让它自然
+    #   掀栈 + exit 1。压成单行 `error:` 会把缺陷藏起来（P9 消灭的是**可预期**失败
+    #   被裸抛，不是把 bug 也一起美化）。
     try:
         para = build_para(args.formula, args.display, args.raw_spacing)
-    except (RuntimeError, FileNotFoundError) as exc:
+    except (LatexGuardError, LatexSyntaxError, OMMLStructureError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (MathEnvError, FileNotFoundError) as exc:
+        # FileNotFoundError 来自 find_xslt()：缺 XSL 文件本身，属环境前置缺失。
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

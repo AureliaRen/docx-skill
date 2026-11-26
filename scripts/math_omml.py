@@ -24,6 +24,35 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 # 内容模型：这些容器只接受「数学项」，不接受嵌套 <m:oMath>
 ARG_TAGS = {"num", "den", "e", "sub", "sup", "deg", "fName", "lim"}
 
+
+# ── 异常类型分层（P28-A） ────────────────────────────────────────────────────
+# 为什么要分层：`insert_formula` 早先只写 `except (RuntimeError, FileNotFoundError)`
+# 一刀切退 2，于是「公式内容转不了」和「你参数写错了」共用一个码，而 D-024 对 2 的
+# 判据是「拒绝先于任何读写 + stderr 恰好一行」—— 守卫的四段多行文案直接把后半条破掉。
+# 判据**不能**靠正则匹配文案（文案改一次就静默打歪），所以改成结构化信号：抛点按
+# 性质落到下面的子类，调用方按类型分派退出码。
+#
+# 全部继承 RuntimeError：既有 `except RuntimeError` / `pytest.raises(RuntimeError)`
+# 的行为一字不变（`docx_mathify` / `docx_create` 的兜底分支正是这么写的）。
+class MathOmmlError(RuntimeError):
+    """LaTeX→OMML 全部可预期失败的基类；本身不直接抛，只用于类型归组与兜底识别。"""
+
+
+class LatexGuardError(MathOmmlError):
+    """层 1 硬拒 / 层 2 残留（源文本含 OMML 表达不了的控制序列）→ `insert_formula` 退 1。"""
+
+
+class LatexSyntaxError(MathOmmlError):
+    """`latex2mathml` 语法错 / `MML2OMML.XSL` 应用失败（公式本身过不去）→ `insert_formula` 退 1。"""
+
+
+class OMMLStructureError(MathOmmlError):
+    """`assert_legal` 判四类结构非法 / XSLT 没产出 OMML 根元素 → `insert_formula` 退 1。"""
+
+
+class MathEnvError(MathOmmlError):
+    """转换环境不可用（缺 `latex2mathml` / `MML2OMML.XSL` 找不到或加载不了）→ `insert_formula` 退 2。"""
+
 # ── 公式字体 ─────────────────────────────────────────────────────────────────
 # Word 的数学区默认落 Cambria Math。主人要求默认 Times New Roman。
 # 做法：给每个 <m:r> 补 <w:rPr><w:rFonts .../></w:rPr>。
@@ -511,12 +540,32 @@ _XSLT = None
 
 
 def xslt():
-    """编译并缓存 XSLT → (transform, path)。"""
+    r"""编译并缓存 XSLT → (transform, path)。
+
+    环境类失败一律转成 :class:`MathEnvError`（``insert_formula`` 退 2，stderr 单行）：
+    ``MML2OMML.XSL`` 存在但**不是合法 XML** 时，裸 ``etree.parse`` 会掀
+    ``lxml.etree.XMLSyntaxError`` 的 29 行 traceback（P28 探针 5 实测）。
+
+    实现选择：**一个 try 同时包住** ``etree.parse`` 与 ``etree.XSLT``（两处失败性质
+    相同 —— 都是「这份 XSL 加载不了」；分成两个 try 只会重复同一段转换逻辑）。
+    消息里带原始 lxml 原因，并压成**单行**（2 档要求 stderr 恰好一行）。
+
+    ⚠️ ``find_xslt()`` 的 ``FileNotFoundError`` **不进**这个 try：它是「文件不存在」，
+    探针 4 已合规（rc=2 + 单行），吞进来会改掉既有语义与文案。
+    """
     global _XSLT
     if _XSLT is None:
         from lxml import etree
-        path = find_xslt()
-        _XSLT = (etree.XSLT(etree.parse(str(path))), str(path))
+        path = find_xslt()          # FileNotFoundError 原样冒出，不包进下面
+        try:
+            transform = etree.XSLT(etree.parse(str(path)))
+        except (etree.XMLSyntaxError, etree.XSLTParseError, OSError) as exc:
+            # 只取首行：lxml 的多行报错会把上下文一起打出来，破「stderr 恰好一行」。
+            first = (str(exc).splitlines() or [""])[0]
+            raise MathEnvError(
+                f"MML2OMML.XSL 无法加载（{path}）: {type(exc).__name__}: {first}"
+            ) from exc
+        _XSLT = (transform, str(path))
     return _XSLT
 
 
@@ -561,9 +610,13 @@ BIG_OPERATORS = (
     "max", "min", "det", "gcd", "Pr",
 )
 
-# 每条命令一行中文替代写法。**只收实测会泄漏的**（P27-PROBE-CONTROLSEQ \② 的 25
-# 条 + work/p27a/probe*.py 复核过的同族扩展）；\hspace（吞间距）、\rule（产空
-# m:oMath）属「转换失真但不泄漏」，另有边界，不进此表（见报告 \8）。
+# 每条命令一行中文替代写法。**只收实测会出事的**：P27-PROBE-CONTROLSEQ \② 的 25
+# 条泄漏 + work/p27a/probe*.py 复核过的同族扩展；**本轮（P29-A）另加 6 条「静默
+# 失真」族**（\rule / \hspace / \hskip / \kern / \mspace / \enspace）—— 它们不
+# 泄漏反斜杠，但经 latex2mathml 变成 <mspace> 之后，MML2OMML.XSL（全文无 mspace
+# 模板）会把整条公式吞成**零子元素的 <m:oMath/>**，Word 里什么都不显示。取证见
+# docs/reports/P29-A-GUARD.md \1（\rule{10pt}{2pt} / \hspace{1em} 实测 0 子元素，
+# \hspace*{1em} 实测泄漏 <m:t>1em</m:t>）。
 # \def / \newcommand **也不进**：latex2mathml 会展开简单宏
 # （\def\foo{1}\foo 实测正常），硬拒会误伤；它们由 CONTEXT_RULES 的 macro_use
 # 判据处理（定义了却没用 = 静默产出空公式，那种才拒）。
@@ -614,6 +667,15 @@ LATEX_ONLY_COMMANDS: dict[str, str] = {
     "cline": r"去掉 \cline{}：表格加边框用表框设置",
     "hrule": r"去掉 \hrule：横线用段落边框或表格边框",
     "vrule": r"去掉 \vrule：竖线用表格边框",
+    # —— 间距 / 画线：XSL 没有 mspace 模板，这一族会把整条公式吞成空 <m:oMath/> ——
+    # 星号变体（\hspace*{1em}）不需要单独一条：_CMD_RE 的 (\*?) 把星号吃掉，
+    # 命令名仍是 hspace（P29-A 实测：同样命中本表、同样被拒）。
+    "rule": r"去掉 \rule：公式里不画横线 —— 横线用段落边框或表格边框；分数用 \frac；要上划线用 \overline{…}",
+    "hspace": r"去掉 \hspace：手写间距在 OMML 里存不住（XSL 没有 mspace 模板，整条公式会被吞空）；要间距就用 \quad（1em）/ \,（3/18em）/ \; / \: / \! / \ （控制空格）—— 这六个是本链路唯一能活下来的间距",
+    "hskip": r"去掉 \hskip：它是 TeX 原始的「水平跳距」命令（\hskip 1em），OMML 里没有对应节点、还会把整条公式吞空；改用 \quad / \, / \; / \: / \! / \ 这六个能活的间距",
+    "kern": r"去掉 \kern：它是 TeX 原始的「字距微调」命令（\kern 1pt，比 \hskip 少一个可拉伸量），同样会被吞成空公式；微调用 \, / \! ，整档间距用 \quad",
+    "mspace": r"去掉 \mspace：它是 MathML 风格的间距写法（\mspace{1mu}），本链路只认 LaTeX 那一族；改用 \quad / \, / \; / \: / \! / \ 控制空格",
+    "enspace": r"去掉 \enspace：它是「半个 em」的固定间距（0.5em），XSL 侧同样无处安放；要半档间距就用 \,（3/18em）或 \: ，整档用 \quad",
     "multicolumn": r"去掉 \multicolumn{}：单元格合并用 docx_edit 的 merge_cells",
     # —— 盒子：OMML 无对应结构 ——
     "makebox": r"去掉 \makebox：定宽内容用表格，或改用 \text{}",
@@ -646,7 +708,9 @@ CONTEXT_RULES: dict[str, dict[str, str]] = {
         # 所以「\limits 在本链路上从不泄漏」只对顶层成立；有层 2 的盲区就需要层 1。
         # 必要性由 test_limits_rule_is_necessary 用「临时摘掉本条 → 静默泄漏」钉死。
         "reason": r"\limits 只对大算符有意义；非大算符位置会静默失效，在 \text{} 里则会被当字面量印进公式",
-        "suggestion": r"去掉 \limits：上下限摆位由 OMML 的 m:limUpp / m:limLow 结构自动决定，写不写 \limits 结果一样",
+        "suggestion": r"去掉 \limits：\limits 只对大算符有意义；在大算符上也只有想让上下限"
+                      r"上下排列时才写（写了 \sum\limits 得到 m:limLoc=undOvr，不写默认是"
+                      r" subSup；\max\limits 得到 m:limLow）",
     },
     "nolimits": {
         "rule": "bigop_prefix",
@@ -758,7 +822,7 @@ def find_unsupported_commands(latex: str) -> list[dict]:
             reason, suggestion = info["reason"], info["suggestion"]
         else:
             reason = ("LaTeX 排版专属命令（编号 / 引用 / 版面尺寸 / 断行 / 表格线 / "
-                      "宏），OMML 里没有对应结构，必然无处安放")
+                      "间距 / 宏），OMML 里没有对应结构，必然无处安放")
             suggestion = LATEX_ONLY_COMMANDS[name]
         hits.append({
             "command": "\\" + name,
@@ -822,7 +886,7 @@ def assert_no_unsupported_commands(latex: str, stats: dict | None = None) -> Non
                 % "、".join("\\" + n for n in numbering))
     else:
         tail = ""
-    raise RuntimeError(
+    raise LatexGuardError(
         "LaTeX 含 OMML 表达不了的控制序列（%r）：%s。\n"
         "症状：换成 Word 公式时，命令名可能被当字面量印进公式（例如 \\eqno 原样"
         "出现在公式末尾，回读 document.xml 能搜到以反斜杠开头的 m:t）；也可能直接"
@@ -904,7 +968,7 @@ def assert_no_latex_residue(omml, latex: str, stats: dict | None = None) -> None
     if not residue:
         return
     _guard_hit(stats, "residue", latex, residue)
-    raise RuntimeError(
+    raise LatexGuardError(
         "OMML 产物里残留了 LaTeX 控制序列（%r）：%s。\n"
         "症状：公式里印着反斜杠命令名（例如 \\zzz 整串出现），Word 里就是一串带"
         "反斜杠的怪字符，交付物上直接看得到。\n"
@@ -962,9 +1026,11 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
     try:
         import latex2mathml.converter as lconv
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "LaTeX→OMML 需要 latex2mathml（纯 Python、零依赖）：\n"
-            "  python -m pip install latex2mathml"
+        # 2 档要求 stderr 恰好一行（D-024），所以这条文案压成单行：
+        # 原来的两行写法在新分派下会破契约。
+        raise MathEnvError(
+            "LaTeX→OMML 需要 latex2mathml（纯 Python、零依赖）："
+            "python -m pip install latex2mathml"
         ) from exc
 
     from lxml import etree
@@ -978,7 +1044,7 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
     try:
         mathml = lconv.convert(src)
     except Exception as exc:
-        raise RuntimeError(f"latex2mathml 转换失败: {latex!r} -> {exc}") from exc
+        raise LatexSyntaxError(f"latex2mathml 转换失败: {latex!r} -> {exc}") from exc
 
     # 兜底：latex2mathml 偶尔会让裸 & 漏进 MathML（& 对齐符没被环境吃掉时），
     # 裸 & 会让 lxml 抛 XMLSyntaxError —— 转成 &amp; 保证文档不炸
@@ -1004,9 +1070,9 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
     try:
         out = transform(mml_root).getroot()
     except Exception as exc:
-        raise RuntimeError(f"MML2OMML.XSL 应用失败（{xsl_path}）: {exc}") from exc
+        raise LatexSyntaxError(f"MML2OMML.XSL 应用失败（{xsl_path}）: {exc}") from exc
     if out is None:
-        raise RuntimeError(f"XSLT 未产出 OMML: {latex!r}")
+        raise OMMLStructureError(f"XSLT 未产出 OMML: {latex!r}")
 
     assert_legal(out, latex)
 
@@ -1033,7 +1099,7 @@ def latex_to_omml_string(latex: str, display: bool = False,
 
 
 def assert_legal(omml, latex: str) -> None:
-    r"""结构自检：抓三类会让 Word 判文档「可能已经损坏」或画错的错误。
+    r"""结构自检：抓四类会让 Word 判文档「可能已经损坏」或画错的错误。
 
     1. :data:`ARG_TAGS` 里内嵌 ``<m:oMath>`` —— Word 报「文件可能已经损坏」；
     2. ``<m:rad>`` 缺 ``<m:e>`` —— 根号没有内容，同样报损坏；
@@ -1044,11 +1110,28 @@ def assert_legal(omml, latex: str) -> None:
        这里兜的是它修不到的两类：本来就空的组（``\left(\right)`` / ``()``
        组内 0 个项，没有可包的第二项），以及绕过 ``math_omml`` 正常链路、
        由别处手搓出来的 OMML（不会经过那次 MathML 层修复）。
+    4. ``<m:oMath>`` 自身**一个子元素都没有** —— 整条公式是空的。Word 里什么都不
+       显示（或画成一个空方块），而这条链路上没有任何一环会响：XML 合法、
+       ``docx_validate`` 的 OPC/结构检查过、``docx_mathify`` 的 ``failed`` 只数异常。
+       成因见 :func:`latex_to_omml_lxml` 上游：``latex2mathml`` 把 ``\rule`` /
+       ``\hspace`` 一族转成 ``<mspace>``，而 ``MML2OMML.XSL`` 全文没有 ``mspace``
+       模板，于是整条公式被吞掉；空组 ``{}`` 与「定义了却没用的 ``\def``」同样落空。
+       层 1（:data:`LATEX_ONLY_COMMANDS`）已经在转换前拦掉间距/画线那一族，
+       本条是它拦不到的那部分（空组、绕开正常链路的 OMML）的最后一道。
+
+    **第 4 类与第 3 类不是一件事**，别合并：第 3 类查的是 ``m:d`` 组里的一个
+    **槽**空着（公式还有别的内容，只是某个定界组缺一项）；第 4 类查的是**整条
+    公式**空着（一个字都没有）。判据一个是 ``m:d`` 的直接子 ``m:e``，一个是
+    ``m:oMath`` 自身 —— 前者远、后者近，混在一起就必然误伤。
 
     第 3 条**只**看 ``m:d`` 直接子元素里的 ``m:e``。``m:e`` 在
     ``m:num`` / ``m:den`` / ``m:fName`` 里也合法、也常为空（那是别的语义），
     一律不能判非法 —— 顺手收成「任何空 m:e」会把大量正常公式打成错误。
     ``ARG_TAGS`` 里虽然也含 ``e``，那里查的是「内嵌 m:oMath」，与本条无关。
+    第 4 条同理**只**看 ``m:oMath`` 本身：``\sqrt{}`` 产的 ``<m:rad><m:e/>``、
+    ``\frac{}{}`` 产的 ``<m:num/>``/``<m:den/>`` 都是「别的语义下的空」，
+    ``m:oMath`` 仍有子元素（``m:rad`` / ``m:f``），不会被本条打倒 ——
+    ``tests/test_math_delim_slots.py:322-341`` 正钉着这条不许误伤。
     """
 
     def local(el):
@@ -1060,17 +1143,17 @@ def assert_legal(omml, latex: str) -> None:
         if name in ARG_TAGS:
             for child in el:
                 if local(child) == "oMath":
-                    raise RuntimeError(
+                    raise OMMLStructureError(
                         f"OMML 非法：<m:{name}> 内嵌了 <m:oMath>（{latex!r}）。"
                         "这会让 Word 报「文件可能已经损坏」。"
                     )
         elif name == "rad":
             if not any(local(c) == "e" for c in el):
-                raise RuntimeError(f"OMML 非法：<m:rad> 缺少 <m:e>（{latex!r}）。")
+                raise OMMLStructureError(f"OMML 非法：<m:rad> 缺少 <m:e>（{latex!r}）。")
         elif name == "d":
             for child in el:
                 if local(child) == "e" and len(child) == 0:
-                    raise RuntimeError(
+                    raise OMMLStructureError(
                         f"OMML 非法：<m:d> 下出现了空槽 <m:e/>（{latex!r}）。"
                         "症状：定界组里有一个空的槽，Word 把它画成一个空方块。"
                         "成因 A：组首的一元正负号被 MML2OMML.XSL 误判成槽分隔符"
@@ -1083,6 +1166,23 @@ def assert_legal(omml, latex: str) -> None:
                         "怎么做：先把公式补全；补全之后仍然报这个错，再检查这条公式"
                         "是不是绕过了 math_omml。"
                     )
+        elif name == "oMath":
+            # 第 4 类：整条公式空着。只看 m:oMath 自身**没有子元素**这一件事，
+            # 绝不外扩成「任何空 m:e 都非法」（那会误伤 \sqrt{} / \frac{}{}）。
+            if len(el) == 0:
+                raise OMMLStructureError(
+                    f"OMML 非法：这是一条空公式 —— <m:oMath/> 一个子元素都没有（{latex!r}）。"
+                    "症状：Word 里这条公式什么都不显示，或画成一个空方块；文档结构"
+                    "本身合法，所以 docx_validate 与转换环节都不会报错。"
+                    "成因：latex2mathml 把间距 / 画线命令（\\rule、\\hspace、\\hskip、"
+                    "\\kern、\\mspace、\\enspace）转成 <mspace>，而 MML2OMML.XSL "
+                    "全文没有 mspace 模板，整条公式被吞掉；空组 {} 与「定义了却没用的 "
+                    "\\def / \\newcommand」同样落成空公式。"
+                    "怎么做：把公式补全再转；要间距就用 \\quad（1em）/ \\,（3/18em）"
+                    "/ \\; / \\: / \\! / \\ （控制空格）—— 这六个是本链路唯一能"
+                    "活下来的间距；要横线用段落边框或表格边框；\\def / \\newcommand "
+                    "要么删掉，要么确保后面真的引用了它。"
+                )
 
 
 def latex_to_omml_safe(latex: str, display: bool = False,

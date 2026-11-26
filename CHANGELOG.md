@@ -5,7 +5,58 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.3] - 2026-11-27
+
+### Added
+
+- **`docx_validate` reports `omml_empty_omath`.** `<m:oMath>` elements with no
+  children are counted into one `warning` issue carrying `count`. This is a
+  document that already shipped, not this run's output: `ok` and the exit code
+  stay put, and a clean document does not grow the key. It answers a different
+  question from `omml_empty_slot` - that one is a single blank slot inside a
+  delimiter group, this one is the formula as a whole.
+
+### Changed
+
+- **`insert_formula` returns `1` for content-level conversion failures.** An
+  unsupported control sequence, a `latex2mathml` syntax error, illegal OMML
+  structure and an XSL application failure all say the input was legal and the
+  content could not be converted; they used to share exit `2` with argument
+  mistakes. Usage errors and an unusable conversion environment (missing
+  `latex2mathml`, a missing or malformed `MML2OMML_XSL`) still exit `2`, and that
+  path guarantees a single `error:` line on stderr with no traceback.
+
+- **`\rule`, `\hspace`, `\hskip`, `\kern`, `\mspace` and `\enspace` are
+  refused before conversion.** `latex2mathml` turns the whole family into
+  `<mspace>`, `MML2OMML.XSL` carries no template for it, and the math element was
+  swallowed: `\rule{10pt}{2pt}` on its own produced an empty `<m:oMath/>`,
+  `a \hspace{1em} b` came back as `['a','b']` with the gap gone, and
+  `\hspace*{1em}` printed `1em` into the formula. Every one of them reported
+  success and exited `0`. They are on layer 1's refusal table now, so the exit
+  code is `1` and the message names the command together with the spacing that
+  does survive (`\quad`, `\,`, `\;`, `\:`, `\!`, the control space). The starred
+  form needs no separate entry: `_CMD_RE`'s `(\*?)` eats the star and the name is
+  still `hspace`.
+
+- **`assert_legal()` gained a fourth kind: an empty formula.** An `<m:oMath>` with
+  zero children is now structural illegality. The package is valid XML, Word
+  opens it, `docx_validate` passed it and `docx_mathify` counted no failure - the
+  whole defect lived in what the reader saw on the page, which is nothing. The
+  class is deliberately narrow: only `m:oMath` itself is measured, so the empty
+  `<m:e/>` that `\sqrt{}` and `\frac{}{}` legitimately produce still passes. An
+  empty group `{}` and a `\def` that is never used land here too.
+
+### Fixed
+
+- **A malformed `MML2OMML_XSL` no longer dumps a raw lxml traceback.** The
+  `etree.parse` / `etree.XSLT` failure is reported as one `error:` line and exits
+  `2`, instead of raising through the CLI.
+
+- **`CONTEXT_RULES["limits"]["suggestion"]` no longer claims `\limits` makes no
+  difference.** The message said the OMML structure places limits by itself, so
+  the modifier changed nothing; measured, `\sum\limits` yields `m:limLoc=undOvr`
+  against `subSup` without it, and `\max\limits` yields `m:limLow` against
+  `m:sSub`. The advice now says when writing it is worth doing.
 
 ## [1.3.2] - 2026-11-26
 
@@ -820,6 +871,7 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 - An existing `X.bak` is overwritten on the next in-place apply. The command
   says so on stdout; it does not rotate backups.
 
+[1.3.3]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.3
 [1.3.2]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.2
 [1.3.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.1
 [1.3.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.0
