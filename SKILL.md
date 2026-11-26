@@ -20,8 +20,9 @@ Output convention differs by script and is deliberate:
   `docx_crossref`, `docx_toc`. Parse these.
 - **Human-readable text** — `docx_mathify`, `table_width`, `insert_formula`,
   `docx_template` (except `fill`, which emits JSON on stdout), `fix_fonts`,
-  `fix_zoom`, `merge_docs`, `pdf_export`, `docx_pack` (a bare run prints how to
-  import it), and `docx_common --api` (a name-plus-signature listing). These
+  `fix_zoom`, `merge_docs`, `pdf_export.ps1` (**PowerShell, not Python** — run it
+  with `pwsh`; there is no `pdf_export.py`), `docx_pack` (a bare run prints how
+  to import it), and `docx_common --api` (a name-plus-signature listing). These
   report progress and are meant to be read.
 - **Either, on request** — `docx_preview` prints human-readable lines by default
   and one JSON object with `--json`. It never mixes the two on one run.
@@ -1129,6 +1130,137 @@ Measured baselines:
 
 Self-check: `python scripts/fix_phasor_dot.py`.
 
+### A leading sign inside a delimiter group
+
+A bracketed group whose **first item is a unary `±` and which holds no other
+operator** arrives as a delimiter with an empty first slot:
+
+```
+<m:d><m:dPr><m:sepChr m:val="−"/></m:dPr><m:e/><m:e>…</m:e></m:d>
+```
+
+Word draws that empty `m:e` as an empty box **inside** the brackets. Nothing else
+is wrong, which is why it survives review: the formula is right, the fraction is a
+real fraction, `docx_mathify` prints a clean summary and exits `0`, and before
+this round `docx_validate` had no OMML check at all — a document with ten empty
+boxes validated `{"ok": true}`.
+
+Two corrections to the obvious reading of the bug:
+
+1. **Not a round-bracket problem.** `\left[-x\right]`, `\left|-x\right|` and
+   `\left\{-x\right\}` each produce one empty `m:e`.
+2. **Not a `\left`/`\right` problem either.** A bare `(-\frac{y}{x})` produces
+   `m:d` and the empty slot just the same — only `\left…\right` sets
+   `fence="true"` on the `mo`, and the XSL does not read that attribute. So
+   there is no bracket style to switch to: both spellings broke, and the single
+   pass described below clears both. No group has to be rewritten by hand.
+
+Measured on the 1.3.0 pipeline (`latex_to_omml_safe`, counting `m:d` / empty `m:e`
+/ `m:sepChr`):
+
+| LaTeX | empty `m:e` | `sepChr` |
+|---|---|---|
+| `\left(x\right)` / `\left(x+y\right)` / `\left(\frac{a}{b}\right)` | 0 | `''` / `'+'` / `''` |
+| `\left(-x\right)` | **1** | `'−'` |
+| `\left(-x y\right)` | **1** | `'−'` |
+| `\left(-1\right)` | **1** | `'−'` |
+| `\left(-\frac{y}{x}\right)` | **1** | `'−'` |
+| `\left(+\frac{a}{b}\right)` | **1** | `'+'` |
+| `\left(\mp x\right)` | **1** | `'∓'` |
+| `\left[-x\right]` / `\left\{-x\right\}` | **1** | `'−'` |
+| `(-\frac{y}{x})` / `(-x)` / `[-x]` / `\{-x\}` | **1** | `'−'` |
+| `\left(\right)` | **1** (and now rejected by `assert_legal`) | `''` |
+| `\left(-x+y\right)` | 0 | `'+'` |
+| `(-\frac{a}{b}+1)` | 0 | `'+'` |
+| `(-x,\ y)` | 0 | `','` |
+| `\left(-1+2\right)` / `\left(-\infty\right)` / `\left(\pm x\right)` | 0 | `''` |
+| `\left[-(a+b)\right]` / `\left(\frac{-y}{x}\right)` | 0 | `''` |
+
+The `sepChr` column is the **post-pass** value. Three of the clean rows —
+`\left(-x+y\right)`, `(-\frac{a}{b}+1)` and `(-x,\ y)` — held a single slot and an
+empty `sepChr` before the pass; the readings above are what they become after it.
+
+Absolute-value groups are no exception: `\left| -x \right|` and the bare
+`|-x|` each produce one empty `m:e`. The double-bar spellings behave the same
+way — `\left\|-x\right\|`, `\|-x\|` and `\left\Vert -x\right\Vert` all measure
+`['', 'x']` with `sepChr='−'` before the pass and `['−x']` with `''` after it.
+(The pipe character splits a Markdown table cell, so these live here rather than in
+the table above.) Groups that do not produce an `m:d` at all —
+`\left.\frac{a}{b}\right|` and `\left\langle -x\right\rangle` — are outside this
+entirely.
+
+The last five rows explain why the trigger is narrower than "a leading sign":
+with a `+` (or `,`) further along, the XSL takes **that** as the separator and the
+minus stays in the first slot — `(-\frac{a}{b}+1)` measures `sepChr='+'`,
+`(-x,\ y)` measures `','`, and both keep zero empty slots.
+
+`\left(\right)` is the one shape the wrap pass cannot help: there is no second
+item to pair a sign with. It does not ship silently either — `assert_legal()` now
+raises on the empty slot, so the conversion fails loudly instead of writing a box
+into the document.
+
+**So there is nothing to change at the keyboard.** After the upgrade, a
+`\left(…\right)` group and a plain `(…)` group both convert with **zero** empty
+slots: keep writing whichever reads better, and do not add braces or strip
+`\left`/`\right` to dodge it. The only shape the check still rejects is a group
+that is genuinely empty — `()` or `\left(\right)` — and there the repair is content,
+not a different bracket.
+
+**The cause is in the stylesheet, not in this skill.** Feed the MathML that
+`latex2mathml` produces straight into Microsoft's `MML2OMML.XSL`, with no skill
+code in the path, and the same broken `m:d` comes out:
+
+```python
+from lxml import etree
+import latex2mathml.converter as lconv
+from math_omml import xslt
+
+mml = etree.fromstring(lconv.convert(r'\left(-\frac{y}{x}\right)').encode('utf-8'))
+out = xslt()[0](mml).getroot()
+print(etree.tostring(out, encoding='unicode').count('<m:e/>'))   # 1
+```
+
+**The fix is upstream of the XSL.** `wrap_leading_unary_in_delim()`
+(`scripts/math_omml.py`) walks the MathML tree before the transform: when a group
+opens with a unary `−` / `-` / `+` / `±` / `∓` and holds at least one more item, it
+wraps that sign and the item after it into a single `mrow`. The XSL then sees one
+item where it saw two, emits no separator, and a group that was broken becomes a
+single non-empty `m:e`. Both spellings go through the pass, so both reach zero empty
+slots; the count accumulates in `stats["delim_wraps"]`.
+
+Groups the pass never touches come out byte-identical: `\left(a+b\right)` was
+`sepChr='+'` with two slots and still is, `\left(a,\ b\right)` was `','` and still is.
+Three other clean groups **do** get rewrapped, and only their structure moves:
+before the pass each was one slot holding the whole body with an empty
+`sepChr`; after it each is two slots with the group's real operator as the
+separator — `\left(-x+y\right)` `['−x+y'], ''` → `['−x','y'], '+'`,
+`(-\frac{a}{b}+1)` `['−a/b+1'], ''` → `['−a/b','1'], '+'`,
+`(-x,\ y)` `['−x, y'], ''` → `['−x',' y'], ','`. Word draws all three the same
+either way; the empty separator was never a rendering feature, just the shape the
+transform defaults to when no slot boundary exists yet.
+
+**To check a document you already shipped**, count `m:d` elements that own an
+empty `m:e`:
+
+```python
+import zipfile
+from lxml import etree
+
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+with zipfile.ZipFile("report.docx") as z:
+    root = etree.fromstring(z.read("word/document.xml"))
+bad = [d for d in root.iter("{%s}d" % M)
+       if any(len(e) == 0 for e in d.findall("{%s}e" % M))]
+print(len(bad))          # 0 is what you want
+```
+
+`docx_validate` now reports the same condition as an `omml_empty_slot` issue
+(reported, never fatal: `ok` and the exit code are unchanged), and
+`assert_legal()` treats an empty `m:e` inside `m:d` as a third structural error
+alongside the `m:oMath`-nesting and `m:rad` cases, so a freshly converted formula
+cannot reach a document unnoticed. Full mechanism, the wider matrix and the
+adjacent traps:
+[formula-guide](references/formula-guide.md#a-unary-sign-at-the-head-of-a-delimiter-group).
 ## Editing a table cell without destroying its formatting
 
 `set-cell` writes a *flat string* into a cell. Templates are rarely flat: one
@@ -1883,7 +2015,7 @@ lists, schema quotes — lives in `references/`, loaded only when you need it.
 scripts/     flat, imported by bare module name — 28 .py + 1 .ps1 = 29 files (27 CLIs, 1 pure library)
 references/  longer how-to notes, loaded on demand — 7 files
 tools/       Word COM acceptance helper; --page-probe lives here, in word_accept.py
-tests/       pytest suite — 83 .py (82 test_*.py + _omml.py helper)
+tests/       pytest suite — 84 .py (83 test_*.py + _omml.py helper)
 ```
 
 ## Where a write lands, and what protects it

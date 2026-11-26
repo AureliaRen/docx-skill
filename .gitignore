@@ -55,3 +55,10 @@ desktop.ini
 # with a leading slash so a future `docs/work/` (if one is ever wanted) is not
 # swallowed by accident.
 /work/
+
+# Internal round reports (P19 onward live here).  They carry machine-local
+# paths, the account name, and real coursework filenames, so they stay out of
+# the published tree -- by rule, not by remembering to type an explicit
+# `git add` list.  Anchored so a future `docs/` product directory would not be
+# swallowed silently.
+/docs/

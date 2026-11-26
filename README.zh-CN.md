@@ -329,13 +329,13 @@ python -X utf8 -m pytest tests -q
 
 | 环境 | 结果 |
 |---|---|
-| 开发机，本机装了 Office，2026-11-25 实跑 | **2539 passed / 239 skipped / 0 failed**（collected 2778） |
-| GitHub Actions，ubuntu-latest（py3.10 与 py3.12 同值），2026-11-25 在 PR #6 上实测 | **2233 passed / 545 skipped / 0 failed**（collected 2778） |
+| 开发机，本机装了 Office，2026-11-26 实跑 | **2607 passed / 239 skipped / 0 failed**（collected 2846） |
+| GitHub Actions，ubuntu-latest（py3.10 与 py3.12 同值），2026-11-25 在 PR #6 上实测，早于本轮 68 条新用例 | **2233 passed / 545 skipped / 0 failed**（collected 2778） |
 | GitHub Actions，windows-latest（py3.10 与 py3.12 同值），同一次跑 | **2236 passed / 542 skipped / 0 failed**（collected 2778） |
 
 开发机那一行与两条 runner 行**不是同一次跑**：runner 那两行是上表标注日期下的历史读数，开发机那行每轮都在动，两者相减没有意义。差别确实来自那一批「需要 `latex2mathml` **加** `MML2OMML.XSL`」以及「要读 `_smoke/` 基线」的用例，但只有同一次运行的两个数才谈得上条数。任何一行都不是拿来改常数追平的——`ci.yml` 的门禁是 `passed >= 2233`（取两条 runner 腿里低的那个）与 `skipped <= collected / 4`。门禁数是实测量，只有新用例真的在 runner 上**跑起来**才会抬；在 runner 上 skip 的用例不改变它。
 
-`tests/` 里是 82 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
+`tests/` 里是 83 个 `test_*.py` 模块加一个共享助手 `_omml.py`。`pypdfium2` 用于导出 PDF 后断言文本层，`pytest` 是测试运行器，两者都不是运行期依赖。没有 Word 的机器上，涉及 COM 的用例同样自动 skip。
 
 ## 授权
 

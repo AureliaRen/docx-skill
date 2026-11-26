@@ -601,6 +601,268 @@ a `cases` produced two `mtable`s in MathML but only one `m:m` in OMML — the ou
 matrix was folded into `m:d` + `m:eqArr`. Compare counts of "tables with two or
 more columns", not of all tables.
 
+## A unary sign at the head of a delimiter group
+
+A `\left…\right` pair, and a plain bracketed group too, are converted by the
+stylesheet into `m:d` — a delimiter object whose content is a sequence of `m:e`
+slots, with `m:sepChr` naming the character that separates them. Those slots are
+built by reading operators as separators, and that rule has one failure mode worth
+knowing by heart: **a group whose first item is a unary sign, with no other
+operator behind it, gets an empty first slot.**
+
+```
+\left(-\frac{y}{x}\right)
+→ <m:d><m:dPr><m:sepChr m:val="−"/></m:dPr><m:e/><m:e><m:f>…</m:f></m:e></m:d>
+                                  ^^^^^^ empty slot
+```
+
+Word renders that empty `m:e` as an empty box **inside** the brackets. Everything
+else about the equation is correct — the fences stretch, the fraction is a real
+fraction, the text layer survives — and that is exactly why it ships. Through
+`pdf_export.ps1` the box is in the PDF as well: it is OMML content, not a
+Word-only artefact.
+
+### Why every existing check stayed green
+
+| Layer | What it reports | Why that is not enough |
+|---|---|---|
+| the conversion call | returns an element | an empty `m:e` is schema-legal OMML |
+| `docx_mathify` summary | `失败 0`, exit `0` | nothing failed; the formula *converted* |
+| `assert_legal()` before this round | passes | it checked `m:oMath` nesting and `m:rad` only |
+| `docx_validate` before this round | `{"ok": true, "issues": []}` | it carried no OMML check at all |
+| `docx_preview` / LibreOffice | a rendered page | an empty slot is nearly invisible at preview DPI |
+
+The only reliable witness is the OMML itself: count `m:d` elements that own an
+empty `m:e`. See [Checking a document for empty slots](#checking-a-document-for-empty-slots).
+
+### The trigger, measured
+
+Run through the 1.3.0 pipeline (`latex_to_omml_safe`, then count `m:d`, empty
+`m:e` children and any `m:sepChr` value in the serialised OMML):
+
+| LaTeX | `m:d` | empty `m:e` | `sepChr` |
+|---|---|---|---|
+| `\left(x\right)` | 1 | 0 | `''` |
+| `\left(x+y\right)` | 1 | 0 | `'+'` |
+| `\left(\frac{a}{b}\right)` | 1 | 0 | `''` |
+| `\left(-x\right)` | 1 | **1** | `'−'` |
+| `\left(-x y\right)` | 1 | **1** | `'−'` |
+| `\left(-1\right)` | 1 | **1** | `'−'` |
+| `\left(-\frac{y}{x}\right)` | 1 | **1** | `'−'` |
+| `\left(+\frac{a}{b}\right)` | 1 | **1** | `'+'` |
+| `\left(\mp x\right)` | 1 | **1** | `'∓'` |
+| `\left[-x\right]` | 1 | **1** | `'−'` |
+| `\left\{-x\right\}` | 1 | **1** | `'−'` |
+| `\left(\right)` | 1 | **1** | `''` |
+| `\left(-x+y\right)` | 1 | 0 | `'+'` |
+| `\left(-1+2\right)` | 1 | 0 | `''` |
+| `\left(-\infty\right)` | 1 | 0 | `''` |
+| `\left(\pm x\right)` | 1 | 0 | `''` |
+| `\left[-(a+b)\right]` | 1 | 0 | `''` |
+| `\left(\frac{-y}{x}\right)` | 1 | 0 | `''` |
+| `\left.\frac{a}{b}` + right-dot | 0 | 0 | — |
+| `\left\langle -x\right\rangle` | 0 | 0 | — |
+
+Two rows carry the corrections that matter more than the table itself.
+
+**It is not a round-bracket problem.** Change the fence and nothing changes:
+square brackets and braces break the same way, because the stylesheet keys on the
+*operator*, not on the fence character. A report that clears `[…]` and `|…|` of
+blame is wrong on that point.
+
+**It is not a `\left`/`\right` problem either.** The `fence="true"` attribute
+`\left…\right` puts on its `<mo>` is never read by the stylesheet; a bare
+`(-\frac{y}{x})` becomes the same `m:d` with the same empty slot. So there is no
+bracket style to switch to: "just write ordinary parentheses" was never an escape —
+both spellings take this path, and both are cleared by the one MathML pass described
+below. What the bare forms do document is the reach of the stylesheet rule:
+
+| LaTeX | `m:d` | empty `m:e` | `sepChr` |
+|---|---|---|---|
+| `(-\frac{y}{x})` | 1 | **1** | `'−'` |
+| `(-x)` | 1 | **1** | `'−'` |
+| `(-1)` | 1 | **1** | `'−'` |
+| `(-x y)` | 1 | **1** | `'−'` |
+| `(-\sin x)` | 1 | **1** | `'−'` |
+| `(-\sqrt{2})` | 1 | **1** | `'−'` |
+| `(-a^{2})` | 1 | **1** | `'−'` |
+| `[-x]` | 1 | **1** | `'−'` |
+| `\{-x\}` | 1 | **1** | `'−'` |
+| `(-\frac{a}{b}+1)` | 1 | 0 | `'+'` |
+| `(-x,\ y)` | 1 | 0 | `','` |
+| `(-x)(-y)` | 1 | 0 | `''` |
+| `(-x)-(-y)` | 1 | 0 | `''` |
+
+Absolute-value groups belong to the same family. A pipe character splits a
+Markdown cell, so the pipe rows below are escaped the way the rest of this guide
+does it (`\|`), and two rows use the `\vert` / `\Vert` aliases to show they
+behave identically. Every one of the double-bar spellings measured
+`['', 'x']` with `sepChr='−'` before the pass and `['−x']` with an empty
+`sepChr` after it — the alias changes nothing.
+
+| LaTeX | `m:d` | empty `m:e` | `sepChr` |
+|---|---|---|---|
+| `\left\| -x \right\|` | 1 | **1** | `'−'` |
+| `\|-x\|` (no `\left`/`\right`) | 1 | **1** | `'−'` |
+| `\left\vert -x \right\vert` | 1 | **1** | `'−'` |
+| `\left\Vert -x\right\Vert` | 1 | **1** | `'−'` |
+| `\vert -x \vert` (no `\left`/`\right`) | 0 | 0 | — |
+
+The condition is narrower than "a leading sign", and the reason is mechanical:
+the stylesheet takes the *first operator it meets* as the slot separator. Put a
+`+` or a `,` behind the sign and **that** becomes the separator, leaving the minus
+where it belongs, inside the first slot. Every `sepChr` cell above is a **post-pass**
+reading, which matters for the clean rows: `\left(-x+y\right)`,
+`(-\frac{a}{b}+1)` and `(-x,\ y)` had no empty slot before the pass either, but
+each was a *single* slot holding the whole body with an empty `sepChr`; the pass
+turns them into two slots separated by the group's real operator. Rendering is
+unaffected — an empty separator is not a rendering feature. Adjacent groups cancel
+out for the same reason: in `(-x)(-y)` the second group's opener is not an
+operator, so the whole body lands in one slot (measured: `sepChr=''` before and
+after, zero empty slots).
+
+### The cause is in `MML2OMML.XSL`, not in this skill
+
+This is the part worth internalising, because it decides where a fix belongs.
+Feed the MathML that `latex2mathml` produces straight into the stylesheet — no
+skill code anywhere in the path — and the broken `m:d` comes out unchanged:
+
+```python
+from lxml import etree
+import latex2mathml.converter as lconv
+from math_omml import xslt            # cached (transform, path) pair
+
+mml = etree.fromstring(lconv.convert(r'\left(-\frac{y}{x}\right)').encode('utf-8'))
+out = xslt()[0](mml).getroot()
+s = etree.tostring(out, encoding='unicode')
+print(s.count('<m:e/>'), 'empty slot(s)')     # 1 empty slot(s)
+print('sepChr' in s)                           # True, m:val is U+2212
+```
+
+If that snippet reproduces the empty slot, no Python in this repository is
+responsible, and no post-processing *after* the transform can claim the bug was
+never there. The stylesheet ships with Office; it is not patched here.
+
+### The fix: wrap the sign and its operand in the MathML tree
+
+`wrap_leading_unary_in_delim()` (`scripts/math_omml.py`, called from
+`latex_to_omml_lxml()` before the transform) walks the MathML tree. For a group
+whose first item is `−` / ASCII `-` / `+` / `±` / `∓` and which holds at least one
+more item, it wraps that sign plus the next sibling into a fresh `mrow`:
+
+```
+before:  ( − frac(y,x) )        three items; the sign reads as a separator
+after:   ( [− frac(y,x)] )      two items; the sign is inside a group
+```
+
+The stylesheet now sees one item where it saw two, emits no separator, and a
+group that was broken becomes a single non-empty `m:e`. Because the pass runs upstream,
+nothing downstream rebuilds runs, re-copies a `w:rPr`, or re-runs the upright
+split: `split_runs_for_upright` and `align_cases_left` receive the OMML they always
+received. The count accumulates in `stats["delim_wraps"]`, next to
+`upright_split` and `cases_aligned`.
+
+Measured, byte-for-byte on the serialised OMML:
+
+| LaTeX | before | after |
+|---|---|---|
+| `\left(-x\right)` | 1 empty slot | **0** |
+| `\left(-\frac{y}{x}\right)` | 1 | **0** |
+| `\left(+\frac{a}{b}\right)` | 1 | **0** |
+| `\left(-1\right)^{n}` | 1 | **0** |
+| `\left[-x\right]` | 1 | **0** |
+| `\left\| -x \right\|` | 1 | **0** |
+| `\left\{-\frac{y}{x}\right\}` | 1 | **0** |
+| `\left(-\frac{1}{2}\right)\left(+\frac{a}{b}\right)` | 2 | **0** |
+| `(-\frac{y}{x})` | 1 | **0** |
+| `\left(a+b\right)` | 0, `sep='+'` | 0, `sep='+'` unchanged |
+| `\left(a,\ b\right)` | 0, `sep=','` | 0, `sep=','` unchanged |
+| `\left(-x+y\right)` | 0 empty, **1 slot** holding `−x+y`, `sep=''` | 0, **2 slots** `['−x','y']`, `sep='+'` |
+| `(-\frac{a}{b}+1)` | 0 empty, 1 slot, `sep=''` | 0, 2 slots `['−a/b','1']`, `sep='+'` |
+| `(-x,\ y)` | 0 empty, 1 slot, `sep=''` | 0, 2 slots `['−x',' y']`, `sep=','` |
+| `\left(\right)` | 1 | **1** — nothing inside to group, and `assert_legal` now rejects it |
+
+Two things to read off that table carefully.
+
+**A clean row is not necessarily an untouched row.** The three `sep` rows were
+never broken — zero empty slots — but the pass still rewraps them, because their
+first item *is* a unary sign. What moves is structure only: one slot holding the
+whole body with an empty `sepChr` becomes two slots separated by the group's real
+operator. Word draws `(−x+y)`, `(−a/b+1)` and `(−x, y)` identically either way;
+an empty `sepChr` is not a rendering feature, just what the transform defaults to
+when no slot boundary exists yet. `\left(a+b\right)` and `\left(a,\ b\right)` open
+with an ordinary symbol, so the pass never sees them: byte-identical before and
+after, `sep` included.
+
+**The last row is the honest boundary.** A genuinely empty `\left(\right)` has no
+second item to pair the sign with, and no unary sign to pair either; the slot rule
+still empties it. The pass skips it and the checks below report it.
+
+### Checking a document for empty slots
+
+An older copy cannot repair, but it can still be audited. Open
+`word/document.xml` and count the `m:d` elements that own an empty `m:e`:
+
+```python
+import zipfile
+from lxml import etree
+
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+def empty_slots(path):
+    with zipfile.ZipFile(path) as z:
+        root = etree.fromstring(z.read("word/document.xml"))
+    return [d for d in root.iter("{%s}d" % M)
+            if any(len(e) == 0 for e in d.findall("{%s}e" % M))]
+
+for delim in empty_slots("report.docx"):
+    print(etree.tostring(delim, encoding="unicode")[:160])
+```
+
+A count of `0` is the clean answer. Anything else names the group to fix. Note
+that *empty* here means structurally empty (`<m:e/>`, no children): a slot holding
+a single space is not what Word draws as a box.
+
+Two built-in readers now report the same condition:
+
+- **`assert_legal()`** raises `RuntimeError` when an `m:d` holds an empty `m:e`, as
+  a third structural check beside the `m:oMath`-nesting and `m:rad` cases. Every
+  conversion path runs through it, so a formula cannot reach a document unnoticed.
+  The message splits the diagnosis in two, and neither branch is "write it with a
+  different bracket". **The sign-at-head shape** (`wrap_leading_unary_in_delim`'s
+  own case): on the normal path it is already repaired, so seeing it means the
+  formula bypassed `math_omml` — hand-built OMML from somewhere else, which no
+  MathML pass could have touched. **A genuinely empty group** (`()` with nothing
+  between the delimiters, or `\left(\right)`): there is no content to place, and the
+  toolkit does not invent any. Both branches end in the same advice — complete the
+  formula, and if it still trips, check whether it went around `math_omml`.
+- **`docx_validate`** reports it as an `omml_empty_slot` issue. Reported, never
+  fatal: `ok` and the exit code are unchanged, and a document with no equations
+  never grows the key.
+
+### Escaping it on an older copy
+
+On a copy that predates the pass, in order of preference:
+
+1. **Upgrade.** The pass runs inside `latex_to_omml_lxml()`, so every entry point
+   inherits it — `docx_mathify`, `insert_formula`, and `docx_create` `latex`
+   blocks alike. No spec changes.
+2. **Audit what you already shipped** with the snippet above and re-convert only
+   the offending paragraphs. Re-saving a document does not heal it: the empty
+   `m:e` survives every edit of the surrounding prose.
+3. **Do not rewrite your way out of it, and on an upgraded copy there is nothing
+   to rewrite.** Ordinary parentheses take the same stylesheet path (`(-\frac{y}{x})`
+   measured one empty slot too), so changing bracket style changes nothing; braces or
+   a hand-wrapped sign are just as pointless, since the pass already does that
+   regrouping. A literal `\vert` pair is not a substitute for the group you wrote
+   either — `\vert -x \vert` happens to produce no `m:d` at all, so it changes
+   the rendering (no stretchy fences) rather than fixing anything. Upgrade, and both
+   `\left…\right` and bare groups come out with zero empty slots.
+
+None of these is a substitute for upgrading: they narrow the damage, they do not
+remove the rule.
+
+
 ## Two defects fixed in this round
 
 Both live in `linear_to_latex.py` and both are about source-text shapes that the

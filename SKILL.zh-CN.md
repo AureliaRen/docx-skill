@@ -12,7 +12,7 @@ license: MIT
 输出约定按脚本而异，这是刻意的：
 
 - **stdout 给 JSON** —— `docx_create`、`docx_read`、`docx_edit`、`docx_validate`、`docx_comments`、`docx_revisions`、`docx_section`、`docx_numbering`、`docx_crossref`、`docx_toc`。这些拿去解析。
-- **人类可读文本** —— `docx_mathify`、`table_width`、`insert_formula`、`docx_template`（`fill` 除外，它往 stdout 写 JSON）、`fix_fonts`、`fix_zoom`、`merge_docs`、`pdf_export`、`docx_pack`（裸跑会告诉你该怎么 import）、以及 `docx_common --api`（函数名 + 签名清单）。这些是给你看的进度。
+- **人类可读文本** —— `docx_mathify`、`table_width`、`insert_formula`、`docx_template`（`fill` 除外，它往 stdout 写 JSON）、`fix_fonts`、`fix_zoom`、`merge_docs`、`pdf_export.ps1`（**是 PowerShell，不是 Python**，用 `pwsh` 调；没有 `pdf_export.py`）、`docx_pack`（裸跑会告诉你该怎么 import）、以及 `docx_common --api`（函数名 + 签名清单）。这些是给你看的进度。
 - **两者按需给** —— `docx_preview` 默认打人类可读的行，加 `--json` 打一个 JSON 对象；同一次运行两种格式不会混。
 
 退出码是可依赖的：`0` 成功、`1` 预期内的失败、`2` 用法错误。完整表与唯一的「部分成功」码 `3` 见[退出码](#退出码)。
@@ -670,6 +670,82 @@ def _add_mixed(p, text):
 
 自检：`python scripts/fix_phasor_dot.py`。
 
+### 定界组组首的一元正负号
+
+一个定界组，**组内首项是一元 ±（`−`/`+`/`±`/`∓`）且组内没有别的运算符**时，出来是一个首位为空槽的定界符：
+
+```
+<m:d><m:dPr><m:sepChr m:val="−"/></m:dPr><m:e/><m:e>…</m:e></m:d>
+```
+
+Word 把这个空的 `m:e` 画成**括号里**的一个空方块。别的地方全对，所以它特别能躲过检查：公式本身是对的、分式是真分式、`docx_mathify` 摘要行干净、退出码 `0`；而本轮之前 `docx_validate` 根本没有 OMML 检查——一份带十个空方块的文档照样返回 `{"ok": true}`。
+
+先纠正两个想当然的读法：
+
+1. **不是圆括号专属。** `\left[-x\right]`、`\left|-x\right|`、`\left\{-x\right\}` 各产一个空 `m:e`。
+2. **也不是 `\left`/`\right` 专属。** 裸写的 `(-\frac{y}{x})` 一样产 `m:d`、一样空槽——只有 `\left…\right` 才会给 `mo` 打 `fence="true"`，而 XSL 根本不读这个属性。也就是说**没有哪种括号写法可以换**：两种写法都坏，也由下面同一道 pass 一起修好——没有任何组需要手改写。
+
+实测（1.3.0 管线，`latex_to_omml_safe`，数 `m:d` / 空 `m:e` / `m:sepChr`）：
+
+| LaTeX | 空 `m:e` | `sepChr` |
+|---|---|---|
+| `\left(x\right)` / `\left(x+y\right)` / `\left(\frac{a}{b}\right)` | 0 | `''` / `'+'` / `''` |
+| `\left(-x\right)` | **1** | `'−'` |
+| `\left(-x y\right)` | **1** | `'−'` |
+| `\left(-1\right)` | **1** | `'−'` |
+| `\left(-\frac{y}{x}\right)` | **1** | `'−'` |
+| `\left(+\frac{a}{b}\right)` | **1** | `'+'` |
+| `\left(\mp x\right)` | **1** | `'∓'` |
+| `\left[-x\right]` / `\left\{-x\right\}` | **1** | `'−'` |
+| `(-\frac{y}{x})` / `(-x)` / `[-x]` / `\{-x\}` | **1** | `'−'` |
+| `\left(\right)` | **1**（现在会被 `assert_legal` 拦下） | `''` |
+| `\left(-x+y\right)` | 0 | `'+'` |
+| `(-\frac{a}{b}+1)` | 0 | `'+'` |
+| `(-x,\ y)` | 0 | `','` |
+| `\left(-1+2\right)` / `\left(-\infty\right)` / `\left(\pm x\right)` | 0 | `''` |
+| `\left[-(a+b)\right]` / `\left(\frac{-y}{x}\right)` | 0 | `''` |
+
+`sepChr` 这一列是 **pass 之后**的值。三行「本来不坏」的——`\left(-x+y\right)`、`(-\frac{a}{b}+1)`、`(-x,\ y)`——pass 之前是「一个槽装全部、`sepChr` 为空」，表里写的是 pass 之后读到的值。
+
+绝对值组不例外：`\left| -x \right|` 与裸写的 `|-x|` 各产一个空 `m:e`；双竖线写法一样——`\left\|-x\right\|`、`\|-x\|`、`\left\Vert -x\right\Vert` 在 pass 之前都是 `['', 'x']` + `sepChr='−'`，pass 之后都是 `['−x']` + `''`。竖线会把 Markdown 表格的单元格切断，所以这几条写在表外。压根不产 `m:d` 的形态——`\left.\frac{a}{b}\right|` 与 `\left\langle -x\right\rangle`——不在此列。
+
+表里最后五行说明判据比「组首有一元符号」要窄：只要组内后面还有 `+`（或 `,`），XSL 就把它当分隔符，负号正常留在第一个槽里——`(-\frac{a}{b}+1)` 实测 `sepChr='+'`、`(-x,\ y)` 实测 `','`，两者都是 0 空槽。
+
+`\left(\right)` 是 wrap pass 唯一救不了的形态：组内没有第二项可以跟符号配对。但它也不会再静默落地——`assert_legal()` 现在会因这个空槽直接抛错，转换当场失败，而不是把空方块写进文档。
+
+**所以键盘上不用改任何东西。** 升级之后，`\left(…\right)` 组与普通 `(…)` 组都是 **0** 空槽：哪种读着顺就写哪种，不必为了绕坑去套花括号、也不必把 `\left`/`\right` 拆掉。唯一仍会被拦下的，是**本来就空**的组——`()` 或 `\left(\right)`——那个要补的是内容，不是换括号。
+
+**根因在样式表，不在本 skill。** 把 `latex2mathml` 产出的 MathML 直接喂微软的 `MML2OMML.XSL`，中间不经过任何 skill 代码，出来的还是同一个坏 `m:d`：
+
+```python
+from lxml import etree
+import latex2mathml.converter as lconv
+from math_omml import xslt
+
+mml = etree.fromstring(lconv.convert(r'\left(-\frac{y}{x}\right)').encode('utf-8'))
+out = xslt()[0](mml).getroot()
+print(etree.tostring(out, encoding='unicode').count('<m:e/>'))   # 1
+```
+
+**修法在 XSL 上游。** `wrap_leading_unary_in_delim()`（`scripts/math_omml.py`）在转换之前走一遍 MathML 树：某个定界组以一元 `−` / `-` / `+` / `±` / `∓` 开头、且组内还有第二项时，把这个符号和它后面那一项一起包进一个 `mrow`。XSL 于是只看到一个项（原来是两个）、不产生分隔符，本来坏掉的那一组就变成一个非空 `m:e`。`\left…\right` 与裸括号两种写法都走这道 pass，所以本轮都归零；次数累进 `stats["delim_wraps"]`。
+
+pass 碰不到的组逐字节不变：`\left(a+b\right)` 原本就是 `sepChr='+'` 两槽，现在还是；`\left(a,\ b\right)` 原本是 `','`，现在还是。另有三个「没有空槽」的组**会**被重新分组，动的只是结构：pass 之前是一个槽装下整段、`sepChr` 为空；pass 之后是两个槽、分隔符是组内真正的运算符——`\left(-x+y\right)` `['−x+y'], ''` → `['−x','y'], '+'`，`(-\frac{a}{b}+1)` `['−a/b+1'], ''` → `['−a/b','1'], '+'`，`(-x,\ y)` `['−x, y'], ''` → `['−x',' y'], ','`。三者 Word 画出来一样，空分隔符不是渲染特性，只是转换在还没有槽边界时的默认形态。
+
+**查一份已经交付出去的文档**，数 `m:d` 底下带空 `m:e` 的：
+
+```python
+import zipfile
+from lxml import etree
+
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+with zipfile.ZipFile("report.docx") as z:
+    root = etree.fromstring(z.read("word/document.xml"))
+bad = [d for d in root.iter("{%s}d" % M)
+       if any(len(e) == 0 for e in d.findall("{%s}e" % M))]
+print(len(bad))          # 0 才是干净的
+```
+
+`docx_validate` 现在把同一件事报成 `omml_empty_slot` issue（只报不崩：`ok` 与退出码都不变），`assert_legal()` 也把「`m:d` 里的空 `m:e`」列为第三类结构错误，与 `m:oMath` 嵌套、`m:rad` 缺 `m:e` 并列，所以刚转出来的公式不可能再无声无息地落进文档。完整机制、更宽矩阵与相邻的坑见 [formula-guide](references/formula-guide.md#a-unary-sign-at-the-head-of-a-delimiter-group)。
 ## 改表格单元格而不毁掉它的格式
 
 `set-cell` 塞进单元格的是**一段平字符串**。模板里的格很少是平的：一个格里常有
@@ -1146,7 +1222,7 @@ top_margin_mm + head_gap_mm == 正文首行的 y（mm）
 scripts/     平铺，按裸模块名 import —— 28 个 .py + 1 个 .ps1 = 29 个文件（27 个 CLI，1 个纯库）
 references/  较长的做法笔记，按需加载 —— 7 篇
 tools/       Word COM 验收辅助；--page-probe 在这里，即 word_accept.py
-tests/       pytest 套件 —— 83 个 .py（82 个 test_*.py + _omml.py 辅助）
+tests/       pytest 套件 —— 84 个 .py（83 个 test_*.py + _omml.py 辅助）
 ```
 
 ## 写到哪儿去，以及有什么保护

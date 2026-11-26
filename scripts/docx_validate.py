@@ -91,6 +91,9 @@ PR = "http://schemas.openxmlformats.org/package/2006/relationships"
 # not required for a legal drawing (charts, shapes, text boxes).
 WP = ("http://schemas.openxmlformats.org/drawingml/2006/"
       "wordprocessingDrawing")
+# ``m:`` — the Office Math namespace.  Only used by the empty-slot scan below;
+# every other check in this file is about the package or about ``w:`` markup.
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 #: Children a ``<w:p>`` / ``<w:tbl>`` may never sit directly inside a run.
 #: ``w:r`` holds run content (``w:t``, ``w:drawing``, ``w:br``, ``w:tab`` …);
@@ -564,6 +567,40 @@ def validate(path: str) -> dict:
     # the package's part list only, so it works even when document.xml parsed
     # but a header did not (those parts are skipped individually above).
     _check_run_property_values(zf, names, issues)
+
+    # --- OMML delimiters with an empty slot -------------------------------
+    # A ``<m:d>`` (delimiter group) holding an empty ``<m:e/>`` is drawn by Word
+    # as a blank square.  It comes from ``MML2OMML.XSL``: a leading unary sign
+    # inside ``\left( … \right)`` is read as the slot separator (``m:sepChr``),
+    # so the slot in front of it stays empty.  ``scripts/math_omml.py`` repairs
+    # the MathML before the XSLT runs, and ``assert_legal`` rejects what it
+    # cannot repair — this check is for documents that were produced before
+    # that repair existed, or by another tool entirely.
+    #
+    # Severity is **warning** on purpose: this report feeds *pass/fail*
+    # decisions downstream, and a document that opens (Word does open these; it
+    # just draws an empty box) must not be rejected by a health check.  So the
+    # exit code never changes, and a document with no ``<m:d>`` at all gets no
+    # issue at all — no key, no noise.
+    empty_slots = 0
+    for delim in doc_root.iter(f"{{{M}}}d"):
+        for child in delim:
+            if child.tag == f"{{{M}}}e" and len(child) == 0:
+                empty_slots += 1
+    if empty_slots:
+        # Same shape as every other issue in this file (severity / code / detail),
+        # plus ``count``: that number is what a caller acts on ("how many squares"),
+        # and it is not recoverable from the prose.
+        issues.append({
+            "severity": "warning",
+            "code": "omml_empty_slot",
+            "detail": (f"document.xml: {empty_slots} ``<m:d>`` slot(s) with an "
+                       f"empty ``<m:e/>``; Word draws each as a blank square. "
+                       f"Cause: a leading unary sign in a delimiter group is "
+                       f"read as the slot separator (``m:sepChr``) by "
+                       f"MML2OMML.XSL."),
+            "count": empty_slots,
+        })
 
     # --- footer semantics -------------------------------------------------
     # Everything above asks "does this name resolve to a part" and "is this

@@ -357,6 +357,116 @@ def align_cases_left(mathml_root, omml, stats: dict | None = None) -> int:
         stats["cases_aligned"] = stats.get("cases_aligned", 0) + changed
     return changed
 
+def wrap_leading_unary_in_delim(mathml_root, stats: dict | None = None) -> int:
+    r"""把定界组里「组首一元正负号 + 紧随其后的那一项」包成一个 mrow。
+
+    ## 为什么在 MathML 层修，而不是修 XSL 的产物
+
+    定界组经 ``latex2mathml`` → ``MML2OMML.XSL`` 之后，XSL 会把组首的一元
+    ``-`` / ``+`` / ``±`` / ``∓`` 当成**槽分隔符**（``m:sepChr``），产出
+    ``<m:d><m:dPr><m:sepChr m:val="−"/></m:dPr><m:e/><m:e>…</m:e></m:d>`` ——
+    第一个 ``m:e`` 是空的，Word 把它画成一个空方块。这不是本仓库任何一行的错，
+    已实测：把 ``latex2mathml`` 的 MathML 直接喂 ``math_omml.xslt()`` 就复现，
+    连 skill 代码都不经过。
+
+    所以修在**上游**（XML 树进 XSLT 之前），而不是去重建 XSL 的 OMML 产物：
+    OMML 侧的定界组是 ``m:d`` + 多个 ``m:e``，要在那一层合并得先判断「谁是槽、
+    谁是真内容」，还得重建 run 与字体注入，动一处错一片；而在 MathML 侧这只是一
+    次 ``mrow`` 重新分组，XSLT 之后自然得到**单个**非空 ``m:e``，Word 不再画方块。
+
+    ## 怎么认出「一个定界组」（**不是**看 ``fence`` 属性）
+
+    ``\left( … \right)`` 产的 ``<mo>`` 带 ``fence="true"``，但**普通括号不带**
+    （只有 ``stretchy="false"``）。而正文里 ``(-\frac{y}{x})`` 这种普通括号写法
+    同样会踩这个坑（实测同样 1 个空 ``m:e`` + ``sepChr="−"``），所以判据不能挂在
+    ``fence`` 上，否则最常见的一半完全修不到。
+
+    改用**平衡深度**：该 ``mrow`` 的首元素是开定界符、末元素是对应的闭定界符，
+    且从首元素往后数到（不含）末元素为止，深度**从不归零**。归零就说明中途已经
+    闭合过，那不是一个组而是并排的几个（``(-x)(-y)`` 就是这样，它本来也不坏，
+    但语义上不能当成一个组去包）。
+
+    ## 命中后怎么改
+
+    去掉首尾定界符之后的 body 长度 ≥ 2，且 ``body[0]`` 是 ``<mo>``、其文本
+    ``.strip()`` 属于 ``−``(U+2212) / ``-`` / ``+`` / ``±`` / ``∓``（第一个是
+    U+2212 MINUS SIGN，不是 ASCII 连字符，两者都要收），命中则把 ``body[0]`` 与
+    ``body[1]`` 一起包进新的 ``<mrow>``，插回 ``body[0]`` 原来的位置。
+
+    **``\left(a+b\right)`` 这类正常分隔符不动**：组首不是一元正负号，一条都命中
+    不了。``(-x+y)`` / ``(-\frac{a}{b}+1)`` / ``(-x,\ y)`` 这三条**会**命中 1 次
+    wrap（组首确实是一元负号），但 body[1] 只把「−x」包起来，后面那个 ``+`` /
+    ``,`` 仍在组内 —— 它们本来就产 0 个空槽，wrap 之后 ``sepChr`` 由**空**变成
+    组内真正的 ``"+"`` / ``","``、槽由一个变两个，Word 渲染等价（测试专门钉这三
+    条，钉的是「空槽数为 0 且 sepChr 是变后的真值」）。
+
+    **已知不修**：``\left(\right)`` / ``()`` 这种空组，组内 0 个项、没有
+    ``body[1]`` 可包，仍会留 1 个空 ``m:e`` —— 那属于「用户写了个空括号」，
+    交给 :func:`assert_legal` 的新检查报错，不替它编造内容。
+
+    返回包装次数；``stats`` 非 None 时累进 ``stats["delim_wraps"]``（整型累加，
+    与 ``upright_split`` / ``cases_aligned`` 同风格）。
+    """
+    from lxml import etree
+
+    mrow_tag = "{%s}mrow" % MATHML_NS
+    mo_tag = "{%s}mo" % MATHML_NS
+    pairs = {"(": ")", "[": "]", "{": "}", "|": "|",
+             "‖": "‖", "⟨": "⟩",
+             "⌈": "⌉", "⌊": "⌋"}
+    opens = set(pairs)
+    closes = set(pairs.values())
+    unary = {"−", "-", "+", "±", "∓"}
+
+    def is_single_group(kids) -> bool:
+        """首尾是一对匹配定界符、中间深度不归零 → 这是一个完整的定界组。"""
+        if len(kids) < 3:
+            return False
+        first, last = kids[0], kids[-1]
+        if first.tag != mo_tag or last.tag != mo_tag:
+            return False
+        o = (first.text or "").strip()
+        c = (last.text or "").strip()
+        if o not in opens or pairs[o] != c:
+            return False
+        depth = 0
+        for k in kids[:-1]:
+            if k.tag != mo_tag:
+                continue
+            t = (k.text or "").strip()
+            if t in opens:
+                depth += 1
+            elif t in closes:
+                depth -= 1
+            if depth == 0:
+                # 中途闭合：并排的好几个组（(-x)(-y)），不是一个组
+                return False
+        return True
+
+    wrapped = 0
+    for mrow in list(mathml_root.iter(mrow_tag)):
+        kids = [c for c in mrow if isinstance(c.tag, str)]
+        if not is_single_group(kids):
+            continue
+        body = kids[1:-1]
+        if len(body) < 2:
+            continue
+        head = body[0]
+        if head.tag != mo_tag:
+            continue
+        if (head.text or "").strip() not in unary:
+            continue
+
+        group = etree.Element(mrow_tag)
+        mrow.insert(mrow.index(head), group)
+        group.append(head)          # append 会自动从旧的 mrow 摘除
+        group.append(body[1])
+        wrapped += 1
+
+    if stats is not None:
+        stats["delim_wraps"] = stats.get("delim_wraps", 0) + wrapped
+    return wrapped
+
 def find_xslt() -> Path:
     """定位 MML2OMML.XSL。"""
     env = os.environ.get("MML2OMML_XSL")
@@ -428,11 +538,16 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
       否则 Word 里函数名和微分算子全是斜体（见 :func:`split_runs_for_upright`）；
     * **cases 左对齐** —— ``\begin{cases}`` 转出来的 ``m:m`` 与矩阵同构，XSLT 统一给
       ``mcJc=center``；按 MathML 层的 ``columnalign`` 判出谁是 cases，只改那一个
-      （见 :func:`align_cases_left`）。
+      （见 :func:`align_cases_left`）；
+    * **定界组空槽** —— ``\left(-\frac{y}{x}\right)`` 与普通括号的 ``(-\frac{y}{x})``
+      这两类写法，只要组首是一元正负号，XSL 都会把那个符号判成槽分隔符，产出一个
+      空的 ``m:e``（Word 画成空方块）；在 MathML 侧把「符号 + 紧随的一项」重新分组，
+      XSLT 之后就只有单个非空槽（见 :func:`wrap_leading_unary_in_delim`）。
 
     ``stats`` 非 None 时累进这些键：``upright_split``（拆了几个 run）、
     ``upright_runs``（补了几段 ``m:sty``）、``cases_aligned``（改了几个 cases）、
-    ``cases_align_skipped``（放弃原因列表）。不传 stats 行为完全一样，只是不留痕。
+    ``cases_align_skipped``（放弃原因列表）、``delim_wraps``（包了几处一元符号）。
+    不传 stats 行为完全一样，只是不留痕。
 
     ⚠️ **本函数仍不修相量点。**
 
@@ -481,6 +596,12 @@ def latex_to_omml_lxml(latex: str, display: bool = False,
         # 关键：XSLT 只在 @display="block" 时才产出 m:oMathPara
         mml_root.set("display", "block")
 
+    # 定界组空槽：必须在 XSLT **之前**改 MathML 树。XSL 会把 \left(…\right) 组首的
+    # 一元正负号当成槽分隔符（m:sepChr），产出一个空的 m:e —— Word 里是空方块，
+    # 而 OMML 侧的 assert_legal 只能事后抓到它、抓不到就无法还原原意。见
+    # wrap_leading_unary_in_delim 的 docstring。
+    wrap_leading_unary_in_delim(mml_root, stats)
+
     transform, xsl_path = xslt()
     try:
         out = transform(mml_root).getroot()
@@ -511,7 +632,23 @@ def latex_to_omml_string(latex: str, display: bool = False,
 
 
 def assert_legal(omml, latex: str) -> None:
-    """结构自检：抓两类会让 Word 判文档「可能已经损坏」的错误。"""
+    r"""结构自检：抓三类会让 Word 判文档「可能已经损坏」或画错的错误。
+
+    1. :data:`ARG_TAGS` 里内嵌 ``<m:oMath>`` —— Word 报「文件可能已经损坏」；
+    2. ``<m:rad>`` 缺 ``<m:e>`` —— 根号没有内容，同样报损坏；
+    3. ``<m:d>``（定界组）下出现**空的** ``<m:e>`` —— Word 不报错，而是画成一个
+       空方块。这一条来自 ``MML2OMML.XSL``：组首的一元正负号被它当成槽分隔符
+       （``m:sepChr``），于是前面空出一个槽。
+       :func:`wrap_leading_unary_in_delim` 在 MathML 层已经修掉绝大多数形态，
+       这里兜的是它修不到的两类：本来就空的组（``\left(\right)`` / ``()``
+       组内 0 个项，没有可包的第二项），以及绕过 ``math_omml`` 正常链路、
+       由别处手搓出来的 OMML（不会经过那次 MathML 层修复）。
+
+    第 3 条**只**看 ``m:d`` 直接子元素里的 ``m:e``。``m:e`` 在
+    ``m:num`` / ``m:den`` / ``m:fName`` 里也合法、也常为空（那是别的语义），
+    一律不能判非法 —— 顺手收成「任何空 m:e」会把大量正常公式打成错误。
+    ``ARG_TAGS`` 里虽然也含 ``e``，那里查的是「内嵌 m:oMath」，与本条无关。
+    """
 
     def local(el):
         t = getattr(el, "tag", "")
@@ -529,6 +666,22 @@ def assert_legal(omml, latex: str) -> None:
         elif name == "rad":
             if not any(local(c) == "e" for c in el):
                 raise RuntimeError(f"OMML 非法：<m:rad> 缺少 <m:e>（{latex!r}）。")
+        elif name == "d":
+            for child in el:
+                if local(child) == "e" and len(child) == 0:
+                    raise RuntimeError(
+                        f"OMML 非法：<m:d> 下出现了空槽 <m:e/>（{latex!r}）。"
+                        "症状：定界组里有一个空的槽，Word 把它画成一个空方块。"
+                        "成因 A：组首的一元正负号被 MML2OMML.XSL 误判成槽分隔符"
+                        "（m:sepChr 变成 − / + / ± / ∓），于是它前面空出一个槽 —— "
+                        "正常路径上 wrap_leading_unary_in_delim 已经在 MathML 层把它"
+                        "修掉了，所以还看到这一条，说明公式没走 math_omml 的正常链路"
+                        "（例如别处手搓的 OMML 不会经过这层修复）。"
+                        "成因 B：组里本来就是空的（() 或 \\left(\\right)），没有"
+                        "内容可放 —— 工具不替它编造内容。"
+                        "怎么做：先把公式补全；补全之后仍然报这个错，再检查这条公式"
+                        "是不是绕过了 math_omml。"
+                    )
 
 
 def latex_to_omml_safe(latex: str, display: bool = False,

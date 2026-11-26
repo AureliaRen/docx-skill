@@ -476,8 +476,8 @@ runs, same commit, different machines; the numbers differ only because the skips
 
 | Where | Result |
 |---|---|
-| Developer machine, local Office installed, measured 2026-11-25 | **2539 passed / 239 skipped / 0 failed** (2778 collected) |
-| GitHub Actions, ubuntu-latest (py3.10 and py3.12 alike), measured 2026-11-25 on PR #6 | **2233 passed / 545 skipped / 0 failed** (2778 collected) |
+| Developer machine, local Office installed, measured 2026-11-26 | **2607 passed / 239 skipped / 0 failed** (2846 collected) |
+| GitHub Actions, ubuntu-latest (py3.10 and py3.12 alike), measured 2026-11-25 on PR #6, before this round's 68 tests | **2233 passed / 545 skipped / 0 failed** (2778 collected) |
 | GitHub Actions, windows-latest (py3.10 and py3.12 alike), same run | **2236 passed / 542 skipped / 0 failed** (2778 collected) |
 
 The developer row and the two runner rows are **not from the same run**: the runner
@@ -490,7 +490,7 @@ both numbers come from one run. No row is a number to chase by editing a constan
 `skipped <= collected / 4`. The floor is a measured value, so it moves only when a
 new test actually *runs* on a runner — a test that skips there changes nothing.
 
-`tests/` holds 82 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
+`tests/` holds 83 `test_*.py` modules plus one shared helper, `_omml.py`. `pypdfium2`
 backs the PDF text-layer assertions and `pytest` is the runner; neither is a runtime
 dependency. Word COM tests skip exactly the same way when Word is absent.
 

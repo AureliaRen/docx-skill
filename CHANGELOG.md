@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-26
+
+A delimiter round. A bracket group whose first item is a unary sign —
+`\left(-\frac{y}{x}\right)`, and its bare-bracket twin `(-\frac{y}{x})` —
+converted into an `m:d` with an empty first slot, which Word draws as an empty box
+inside the brackets while every check in the toolkit stayed green. The cause sits
+in Microsoft's `MML2OMML.XSL`, so the repair went in upstream of it: a MathML pass
+that regroups the sign with its operand before the transform. Both structural
+readers now see the condition, and the manual gained the section that was missing.
+
+### Added
+
+- **`assert_legal()` refuses a delimiter with an empty slot.** A third structural
+  check next to the `m:oMath`-nesting and `m:rad` cases: an `m:d` owning an empty
+  `m:e` now raises `RuntimeError` instead of shipping a blank square into the
+  document. The message splits the diagnosis in two: the sign-at-head shape, which
+  `wrap_leading_unary_in_delim` already repairs on the normal path (so hitting it
+  means the formula bypassed `math_omml`), and a genuinely empty group
+  (`()` with nothing between the delimiters), which needs content — never a
+  different bracket spelling. Every conversion path runs through `assert_legal()`,
+  so a formula cannot reach a document unnoticed.
+- **`docx_validate` reports `omml_empty_slot`.** Delimiter groups in
+  `word/document.xml` that own an empty `m:e` are counted and reported as one
+  issue carrying `count`. Severity is `warning` on purpose: the report feeds
+  pass/fail decisions downstream, and a document Word opens happily must not be
+  rejected by a health check, so `ok` and the exit code are unchanged and a
+  document with no `m:d` at all never grows the key. This is what catches work
+  produced before the repair existed, or by another tool entirely.
+- **`stats["delim_wraps"]`** — the number of groups the MathML pass rewrapped,
+  accumulated through `latex_to_omml_lxml` → `latex_to_omml_safe` next to
+  `upright_split` and `cases_aligned`. `insert_formula --dump` still prints no
+  stats at all; its stdout stays parseable markup.
+
+### Changed
+
+- **`SKILL.md`'s output-convention list now names `pdf_export.ps1`, not
+  `pdf_export`.** The list sits beside a dozen pure-Python CLIs, so a bare name
+  read as `python scripts/pdf_export.py` — a file that does not exist, and the
+  run dies on `can't open file`. It now carries the extension and says it is
+  PowerShell (`pwsh`), matching the four other places in both manuals that
+  already spell out `pwsh scripts/pdf_export.ps1`. `SKILL.zh-CN.md` carries the
+  same list and the same fix. The file counts are untouched: `scripts/` is still
+  28 `.py` + 1 `.ps1` = 29 files.
+- **The README test readings were refreshed, and the test-module counts were
+  corrected.** The developer row is this round's run (2607 passed / 239 skipped,
+  2846 collected, 2026-11-26); the two runner rows keep their measured PR #6
+  figures and now say they predate this round's 68 new tests, since no runner has
+  run them yet. `tests/` is **84 `.py`** (83 `test_*.py` plus the `_omml.py`
+  helper) after this round added `test_math_delim_slots.py` — `README.md`,
+  `README.zh-CN.md`, both `SKILL` files and `THIRD-PARTY-NOTICES.md` all said
+  83/82 and now agree with the tree.
+- **`/docs/` is ignored by rule, not by habit.** Round reports carry machine-local
+  paths, the account name and real coursework filenames; every release so far kept
+  them out by typing an explicit `git add` list. `.gitignore` now anchors
+  `/docs/` next to `/work/`, so `git add -A` cannot pick them up by accident.
+
+### Fixed
+
+- **A unary sign at the head of a delimiter group produced an empty `m:e` — an
+  empty box inside the brackets in Word, and in the PDF exported through
+  `pdf_export.ps1`.** `\left(-\frac{y}{x}\right)` converts to
+  `<m:d><m:dPr><m:sepChr m:val="−"/></m:dPr><m:e/><m:e>…</m:e></m:d>`: the
+  stylesheet reads the leading sign as the slot separator, so the slot in front of
+  it stays empty. The equation is otherwise correct — which is why it survived
+  review: `docx_mathify` reported `失败 0` and exit `0`, and
+  `docx_validate` returned `{"ok": true, "issues": []}`.
+  **The cause is in `MML2OMML.XSL`, not in this skill**: feeding
+  `latex2mathml`'s MathML straight into `math_omml.xslt()`, with no skill code in
+  the path, reproduces the same element. **The fix is therefore upstream of the
+  stylesheet**: `wrap_leading_unary_in_delim()` (`math_omml.py`) walks the MathML
+  tree before the transform and, when a group opens with a unary
+  `−` / `-` / `+` / `±` / `∓` and holds at least one more item, wraps that sign
+  plus the next sibling into a single `mrow`. The transform then sees one item
+  where it saw two, emits no separator, and the group becomes one non-empty
+  `m:e`. Nothing downstream rebuilds runs or re-copies a `w:rPr`.
+  **The trigger is wider than a round bracket, and wider than `\left`:**
+  `\left(-x\right)`, `\left(-x y\right)`, `\left(-1\right)`,
+  `\left(-\frac{y}{x}\right)`, `\left(+\frac{a}{b}\right)`,
+  `\left(\mp x\right)`, `\left[-x\right]`, the `\left\| … \right\|`
+  absolute-value form and `\left\{-x\right\}` all measured one empty slot; the
+  bare-bracket forms `(-x)`, `(-1)`, `(-\frac{y}{x})`, `[-x]`, `\{-x\}` and
+  `\|-x\|` measured the same, because `fence="true"` is never read by the
+  stylesheet. There is no bracket style to switch to, so nothing is rewritten by
+  hand: both spellings broke identically, and the same pass clears both. It is not
+  every leading sign either:
+  `\left(-x+y\right)`, `(-\frac{a}{b}+1)` and `(-x,\ y)` were already free of
+  empty slots, because a `+` or `,` behind the sign becomes the separator instead.
+  **What did not change, and what only changed shape:** `\left(a+b\right)` keeps
+  `sepChr='+'` and two slots and `\left(a,\ b\right)` keeps `','` — the pass never
+  touches a group that opens with an ordinary symbol. The three clean rows above do
+  get rewrapped, structure only: each held one slot with an empty `sepChr` and now
+  holds two separated by `'+'` / `'+'` / `','`. Word draws `(−x+y)`, `(−a/b+1)` and
+  `(−x, y)` identically either way; an empty separator is not a rendering
+  feature. A genuinely empty `\left(\right)` still measures one empty slot, since
+  there is no second item to pair a sign with; it is now rejected by
+  `assert_legal()` rather than shipped.
+  Both manuals carry a new section on the symptom, the trigger matrix, the
+  reproduction, the self-check and the boundaries; `references/formula-guide.md`
+  carries the long form.
+
 ## [1.3.0] - 2026-11-25
 
 A formula-layout round. Word draws letters in a math zone italic because a lone
@@ -644,6 +744,7 @@ closed and the sample data in the tests was replaced with neutral fixtures.
 - An existing `X.bak` is overwritten on the next in-place apply. The command
   says so on stdout; it does not rotate backups.
 
+[1.3.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.1
 [1.3.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.3.0
 [1.2.1]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AureliaRen/docx-skill/releases/tag/v1.2.0
