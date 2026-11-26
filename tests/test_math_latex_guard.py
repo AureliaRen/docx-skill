@@ -93,7 +93,7 @@ LEAKS = [
     (r"\hfill", r"x=y \hfill"),
     (r"\vspace", r"U=IR \vspace{1em}"),
     (r"\textwidth", r"w=0.5\textwidth"),
-    (r"\zzz", r"a \zzz b"),                       # 未知命令：靠层 2
+    (r"\zzz", r"a \zzz b"),                       # 未知命令：只能靠层 2
     (r"\notag", r"a=b \notag"),
     (r"\eqref", r"x=\eqref{eq:one}"),
     (r"\intertext", r"\intertext{and} x"),
@@ -115,9 +115,19 @@ LEAKS = [
 ]
 
 
+# 24 条由层 1 拒收，只要 latex2mathml 就能跑；\zzz 只能靠层 2，而层 2 要真转出
+# OMML（needs_omml = latex2mathml + MML2OMML.XSL）。两条标记分开，否则无 Office 的
+# runner 上 \zzz 会以 FileNotFoundError 变红而不是 skip —— CI 实测踩过（PR #8 四腿）。
+LEAK_PARAMS = [
+    pytest.param(cmd, tex, marks=needs_omml, id=cmd.lstrip(chr(92)) + ":" + tex)
+    if cmd == r"\zzz" else
+    pytest.param(cmd, tex, id=cmd.lstrip(chr(92)) + ":" + tex)
+    for cmd, tex in LEAKS
+]
+
+
 @needs_l2m
-@pytest.mark.parametrize("command,latex", LEAKS,
-                         ids=[c.lstrip(chr(92)) + ":" + s for c, s in LEAKS])
+@pytest.mark.parametrize("command,latex", LEAK_PARAMS)
 def test_every_leak_is_rejected(command, latex):
     r"""每条泄漏都必须抛 RuntimeError，且消息里点名那个命令。
 
@@ -138,6 +148,11 @@ def test_leak_list_is_the_probe_matrix():
     """
     assert len(LEAKS) == 25
     assert len({c for c, _ in LEAKS}) == 24, "\vspace 故意出现两次（带星号变体）"
+    # 参数列表与矩阵同长；\zzz 是唯一带 needs_omml 的那一条。
+    assert len(LEAK_PARAMS) == 25
+    omml_only = [p for p in LEAK_PARAMS if any(m.name == "skipif"
+                                               for m in p.marks)]
+    assert len(omml_only) == 1, "只有 \\zzz 需要 XSL，别的条目标错就会在 runner 上少跑"
 
 
 # ===========================================================================
@@ -344,7 +359,7 @@ def test_ref_commands_pass_through_mathify_end_to_end():
 # ===========================================================================
 # 判据 4c：\limits 的判据**必要性**（摘掉它就静默泄漏）
 # ===========================================================================
-@needs_l2m
+@needs_omml
 def test_limits_rule_is_necessary(monkeypatch):
     r"""把 `limits` 从 CONTEXT_RULES 摘掉，`\text{a\limits}` 就会**静默泄漏**。
 
@@ -381,7 +396,7 @@ def test_limits_rule_is_necessary(monkeypatch):
     assert "limits" in math_omml.CONTEXT_RULES, "复原失败"
 
 
-@needs_l2m
+@needs_omml
 def test_limits_still_allowed_after_bigop():
     r"""`\sum\limits_{i=1}^{n} a_i` 放行（上下文判据的另一半，别只测拒收）。"""
     el = convert(r"\sum\limits_{i=1}^{n} a_i")
