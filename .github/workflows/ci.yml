@@ -392,10 +392,16 @@ jobs:
           python - "$log" "$collect_log" <<'PY'
           import pathlib, re, sys
 
-          MIN_PASSED = 2234                        # monotone floor, measured on a clean clone
-                                                    # 2026-11-26 PR#7 four legs: ubuntu 2234/612
-                                                    # (both pythons), windows 2237/609 (both).
+          MIN_PASSED = 2299                        # monotone floor, measured on a clean clone
+                                                    # 2026-11-26 PR#8 four legs: ubuntu 2299/705
+                                                    # (both pythons), windows 2302/702 (both).
                                                     # The floor is the WEAKEST leg (ubuntu).
+                                                    # PR#7 read 2234/612 ubuntu, 2237/609 windows.
+                                                    # +65 on the weakest leg = 158 new tests minus
+                                                    # 93 of them that skip without Office (the 3 that
+                                                    # failed on the PR#8 first run are among those 93
+                                                    # now that they carry needs_omml). Do NOT read the
+                                                    # +158 local delta as a floor: 93 never run here.
                                                     # PR#6 read 2233/545 ubuntu, 2236/542 windows
                                                     # with collected 2778. PR#7 collected 2846 after
                                                     # 68 new tests; 67 of them need latex2mathml
